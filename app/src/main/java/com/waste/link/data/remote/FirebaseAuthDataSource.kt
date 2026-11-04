@@ -75,7 +75,7 @@ class FirebaseAuthDataSource @Inject constructor(
             .document(uid)
             .addSnapshotListener(MetadataChanges.INCLUDE) { snapshot, error ->
                 if (error != null) {
-                    listener(RemoteDocumentResult.NotFound(isFromCache = false))
+                    listener(RemoteDocumentResult.Error(cause = error))
                     return@addSnapshotListener
                 }
                 if (snapshot == null) return@addSnapshotListener

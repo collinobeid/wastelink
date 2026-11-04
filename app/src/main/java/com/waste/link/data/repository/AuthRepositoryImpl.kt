@@ -165,6 +165,15 @@ class AuthRepositoryImpl(
         }
 
         when (docResult) {
+            is RemoteDocumentResult.Error -> {
+                // Transient listener or transport error.
+                // Critical Security Invariants:
+                // 1. MUST NEVER interpret a listener error as document deletion (DOCUMENT_MISSING).
+                // 2. MUST NEVER promote AuthenticatedCachedOffline to Authenticated.
+                // 3. MUST NEVER reinstate an AuthenticatedRestricted account.
+                // Maintain current session state and await listener retry/reconnection.
+                return
+            }
             is RemoteDocumentResult.NotFound -> {
                 if (docResult.isServerAuthoritative) {
                     _sessionState.value = SessionState.AuthenticatedProfileIncomplete(
@@ -1333,6 +1342,20 @@ class AuthRepositoryImpl(
         }
 
         return when (rawDocResult) {
+            is RemoteDocumentResult.Error -> {
+                val mappedError = FirebaseErrorMapper.toAuthError(
+                    throwable = rawDocResult.cause,
+                    emailContext = resolvedEmail,
+                    uidContext = authUser.uid
+                )
+                val errorState = SessionState.AuthenticatedProfileLoadError(
+                    uid = authUser.uid,
+                    email = resolvedEmail,
+                    error = mappedError
+                )
+                _sessionState.value = errorState
+                errorState
+            }
             is RemoteDocumentResult.NotFound -> {
                 val suggestedDraft = pendingRegistrationState
                     ?.takeIf { it.uid == authUser.uid }
@@ -1687,6 +1710,7 @@ class AuthRepositoryImpl(
         }
 
         return when (docResult) {
+            is RemoteDocumentResult.Error -> Result.failure(docResult.cause)
             is RemoteDocumentResult.NotFound -> Result.failure(
                 IllegalStateException("User profile not found for UID $trimmedUid")
             )

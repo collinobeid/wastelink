@@ -1321,6 +1321,153 @@ class AuthRepositoryImplTest {
         assertTrue("Malformed document must transition to AuthenticatedProfileLoadError", malformedSession is SessionState.AuthenticatedProfileLoadError)
         assertTrue((malformedSession as SessionState.AuthenticatedProfileLoadError).error is AuthError.MalformedProfile)
     }
+
+    // =========================================================================
+    // Scenario 33: Transient listener error while ACTIVE does not transition to DOCUMENT_MISSING
+    // =========================================================================
+    @Test
+    fun `33 - Transient listener error while ACTIVE user is authenticated preserves session and does not mark document missing`() = runBlocking {
+        val userUid = "active-user-33"
+        val userEmail = "active33@wastelink.co.tz"
+
+        fakeRemote.seedAuthAccount(uid = userUid, email = userEmail, password = "Pass123!", isEmailVerified = true)
+        fakeRemote.seedCanonicalResidentProfile(userUid, userEmail)
+        fakeRemote.setActiveSession(userUid)
+
+        val initialSession = repository.restoreSession()
+        assertTrue("Initial session must be Authenticated", initialSession is SessionState.Authenticated)
+
+        // Transient listener error occurs (e.g. transport disconnect, gRPC UNAVAILABLE)
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.Error(
+                cause = java.io.IOException("UNAVAILABLE: Transport disconnected")
+            )
+        )
+
+        // Verify session remains Authenticated and is NOT transitioned to AuthenticatedProfileIncomplete(DOCUMENT_MISSING)
+        val sessionAfterError = repository.sessionState.value
+        assertTrue("Session must remain Authenticated after transient listener error", sessionAfterError is SessionState.Authenticated)
+        assertEquals(userUid, (sessionAfterError as SessionState.Authenticated).user.id)
+        assertTrue(repository.isServerVerifiedSession())
+    }
+
+    // =========================================================================
+    // Scenario 34: Listener error while user is suspended preserves AuthenticatedRestricted
+    // =========================================================================
+    @Test
+    fun `34 - Listener error while user is suspended preserves AuthenticatedRestricted standing`() = runBlocking {
+        val userUid = "suspended-user-34"
+        val userEmail = "suspended34@wastelink.co.tz"
+
+        fakeRemote.seedAuthAccount(uid = userUid, email = userEmail, password = "Pass123!", isEmailVerified = true)
+        fakeRemote.seedCanonicalResidentProfile(
+            uid = userUid,
+            email = userEmail,
+            accountStatus = AccountStatus.SUSPENDED,
+            statusReason = "Compliance violation under investigation"
+        )
+        fakeRemote.setActiveSession(userUid)
+
+        val initialSession = repository.restoreSession()
+        assertTrue("Initial session must be AuthenticatedRestricted", initialSession is SessionState.AuthenticatedRestricted)
+        assertEquals(AccountStatus.SUSPENDED, (initialSession as SessionState.AuthenticatedRestricted).accountStatus)
+
+        // Listener encounters error
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.Error(
+                cause = java.io.IOException("Socket timeout")
+            )
+        )
+
+        // Verify user remains strictly AuthenticatedRestricted with SUSPENDED status
+        val sessionAfterError = repository.sessionState.value
+        assertTrue("Must remain AuthenticatedRestricted", sessionAfterError is SessionState.AuthenticatedRestricted)
+        val restricted = sessionAfterError as SessionState.AuthenticatedRestricted
+        assertEquals(AccountStatus.SUSPENDED, restricted.accountStatus)
+        assertEquals("Compliance violation under investigation", restricted.statusReason)
+        assertFalse(repository.isServerVerifiedSession())
+    }
+
+    // =========================================================================
+    // Scenario 35: Listener error while offline does not promote AuthenticatedCachedOffline
+    // =========================================================================
+    @Test
+    fun `35 - Listener error while user is offline does not promote AuthenticatedCachedOffline to Authenticated`() = runBlocking {
+        val userUid = "offline-user-35"
+        val userEmail = "offline35@wastelink.co.tz"
+
+        fakeRemote.seedAuthAccount(uid = userUid, email = userEmail, password = "Pass123!", isEmailVerified = true)
+        fakeRemote.seedCanonicalResidentProfile(userUid, userEmail)
+        fakeRemote.cachedUserDocuments[userUid] = fakeRemote.serverUserDocuments[userUid]!!
+        fakeRemote.setActiveSession(userUid)
+
+        fakeRemote.alwaysFailFetchServerWith = RemoteAuthException(
+            code = RemoteAuthErrorCode.NETWORK_UNAVAILABLE,
+            message = "Offline"
+        )
+        val initialSession = repository.restoreSession()
+        assertTrue("Initial session must be AuthenticatedCachedOffline", initialSession is SessionState.AuthenticatedCachedOffline)
+
+        // Listener emits error
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.Error(
+                cause = java.io.IOException("Network unreachable")
+            )
+        )
+
+        // Verify session remains AuthenticatedCachedOffline and is NOT promoted
+        val sessionAfterError = repository.sessionState.value
+        assertTrue("Must remain AuthenticatedCachedOffline", sessionAfterError is SessionState.AuthenticatedCachedOffline)
+        assertFalse(repository.isServerVerifiedSession())
+    }
+
+    // =========================================================================
+    // Scenario 36: Recovery after listener connectivity is restored
+    // =========================================================================
+    @Test
+    fun `36 - Recovery after listener connectivity is restored synchronizes updated server profile`() = runBlocking {
+        val userUid = "recovery-user-36"
+        val userEmail = "recovery36@wastelink.co.tz"
+
+        fakeRemote.seedAuthAccount(uid = userUid, email = userEmail, password = "Pass123!", isEmailVerified = true)
+        fakeRemote.seedCanonicalResidentProfile(userUid, userEmail)
+        fakeRemote.setActiveSession(userUid)
+
+        val initialSession = repository.restoreSession()
+        assertTrue(initialSession is SessionState.Authenticated)
+
+        // 1. Transient listener error occurs
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.Error(cause = java.io.IOException("Stream reset"))
+        )
+        assertTrue("Session kept across error", repository.sessionState.value is SessionState.Authenticated)
+
+        // 2. Server profile is updated while listener was reconnecting
+        val updatedServerDoc = fakeRemote.serverUserDocuments[userUid]!!.toMutableMap().apply {
+            put("fullName", "Amina Nyerere Updated")
+            put("name", "Amina Nyerere Updated")
+            put("preferredLanguage", "sw")
+        }
+        fakeRemote.serverUserDocuments[userUid] = updatedServerDoc
+
+        // 3. Listener reconnects and delivers server-authoritative snapshot
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.Found(data = updatedServerDoc, isFromCache = false, hasPendingWrites = false)
+        )
+
+        // 4. Session seamlessly updates to reflected server data
+        val recoveredSession = repository.sessionState.value
+        assertTrue("Session must remain Authenticated", recoveredSession is SessionState.Authenticated)
+        val user = (recoveredSession as SessionState.Authenticated).user
+        assertEquals("Amina Nyerere Updated", user.fullName)
+        assertEquals("sw", user.preferredLanguage)
+        assertTrue(repository.isServerVerifiedSession())
+    }
 }
 
 /**

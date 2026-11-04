@@ -446,6 +446,7 @@ class CollectorVerificationRepositoryImpl(
                     Result.success(submission)
                 }
                 is RemoteDocumentResult.NotFound -> Result.success(null)
+                is RemoteDocumentResult.Error -> Result.failure(res.cause)
             }
         } catch (e: Throwable) {
             Result.failure(e)

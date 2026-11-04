@@ -40,6 +40,14 @@ sealed interface RemoteDocumentResult {
         override val isFromCache: Boolean = false,
         override val hasPendingWrites: Boolean = false
     ) : RemoteDocumentResult
+
+    data class Error(
+        val cause: Throwable,
+        override val isFromCache: Boolean = false,
+        override val hasPendingWrites: Boolean = false
+    ) : RemoteDocumentResult {
+        override val isServerAuthoritative: Boolean get() = false
+    }
 }
 
 /**
