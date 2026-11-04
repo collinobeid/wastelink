@@ -1,6 +1,10 @@
 package com.waste.link.data.repository
 
+import androidx.annotation.VisibleForTesting
 import com.waste.link.data.models.AppUser
+import com.waste.link.domain.model.CollectorSubmission
+import com.waste.link.domain.model.CollectorSubmissionInput
+import com.waste.link.domain.model.CollectorSubmissionOutcome
 import com.waste.link.domain.model.EmailVerificationOutcome
 import com.waste.link.domain.model.LoginOutcome
 import com.waste.link.domain.model.LogoutOutcome
@@ -202,6 +206,54 @@ interface AuthRepository {
         defaultZoneId: String? = null,
         preferredLanguage: String? = null
     ): ProfileUpdateOutcome
+
+    // =========================================================================
+    // 8a. Collector Onboarding & Vetting Operations (Stage 5)
+    // =========================================================================
+
+    /**
+     * Executes atomic WriteBatch for initial Collector KYC onboarding.
+     * Requires server-verified session, role == COLLECTOR, and status == NOT_SUBMITTED.
+     */
+    suspend fun submitCollectorOnboarding(
+        input: CollectorSubmissionInput
+    ): CollectorSubmissionOutcome
+
+    /**
+     * Executes atomic WriteBatch for Collector KYC resubmission after rejection.
+     * Requires server-verified session, role == COLLECTOR, and status == REJECTED.
+     */
+    suspend fun resubmitCollectorOnboarding(
+        input: CollectorSubmissionInput
+    ): CollectorSubmissionOutcome
+
+    /**
+     * Fetches current [CollectorSubmission] for [uid] from `/collector_submissions/{uid}`.
+     */
+    suspend fun getCollectorSubmission(
+        uid: String
+    ): Result<CollectorSubmission?>
+
+    /**
+     * Test-only administrative helper to approve a collector's submission atomically.
+     * Requires custom claim admin == true on caller context.
+     */
+    @VisibleForTesting
+    suspend fun adminApproveCollectorSubmission(
+        collectorUid: String,
+        adminUid: String
+    ): Result<Unit>
+
+    /**
+     * Test-only administrative helper to reject a collector's submission atomically.
+     * Requires custom claim admin == true on caller context.
+     */
+    @VisibleForTesting
+    suspend fun adminRejectCollectorSubmission(
+        collectorUid: String,
+        adminUid: String,
+        rejectionReason: String
+    ): Result<Unit>
 
     // =========================================================================
     // 9. Legacy Compatibility Bridge (Preserved for unmigrated Stage 4+ ViewModels)

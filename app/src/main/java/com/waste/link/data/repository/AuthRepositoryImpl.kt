@@ -9,6 +9,12 @@ import com.waste.link.data.remote.RemoteAuthUser
 import com.waste.link.data.remote.RemoteDocumentResult
 import com.waste.link.domain.model.AccountStatus
 import com.waste.link.domain.model.AuthError
+import androidx.annotation.VisibleForTesting
+import com.waste.link.domain.model.CollectorSubmission
+import com.waste.link.domain.model.CollectorSubmissionInput
+import com.waste.link.domain.model.CollectorSubmissionMapper
+import com.waste.link.domain.model.CollectorSubmissionOutcome
+import com.waste.link.domain.model.CollectorVerificationStatus
 import com.waste.link.domain.model.EmailVerificationOutcome
 import com.waste.link.domain.model.FieldValidationFailure
 import com.waste.link.domain.model.LoginOutcome
@@ -25,6 +31,7 @@ import com.waste.link.domain.model.SessionState
 import com.waste.link.domain.model.User
 import com.waste.link.domain.model.UserRole
 import com.waste.link.domain.validation.AuthValidator
+import com.waste.link.domain.validation.ValidationError
 import com.waste.link.domain.validation.ValidationResult
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -911,7 +918,31 @@ class AuthRepositoryImpl(
         val serverVerifiedProfile = requireServerVerifiedActiveProfile(authUser)
             ?: return ProfileUpdateOutcome.Failure(resolveNonVerifiedProfileUpdateError(authUser))
 
+        if (serverVerifiedProfile.role != UserRole.RESIDENT) {
+            return ProfileUpdateOutcome.Failure(
+                AuthError.ValidationFailed(
+                    listOf(
+                        FieldValidationFailure(
+                            field = "role",
+                            error = ValidationError.ROLE_NOT_SELECTED,
+                            message = "Only resident accounts can complete resident onboarding."
+                        )
+                    )
+                )
+            )
+        }
+
         val normalizedZone = defaultZoneId?.trim()?.takeIf { it.isNotEmpty() }
+        if (normalizedZone != null) {
+            val zoneRes = AuthValidator.validateServiceZoneId(normalizedZone)
+            if (zoneRes is ValidationResult.Invalid) {
+                return ProfileUpdateOutcome.Failure(
+                    AuthError.ValidationFailed(
+                        listOf(FieldValidationFailure("defaultZoneId", zoneRes.error, zoneRes.message))
+                    )
+                )
+            }
+        }
         val updatedAt = maxOf(clock(), serverVerifiedProfile.updatedAtEpochMs + 1L)
 
         val updateFields = mutableMapOf<String, Any?>(
@@ -1006,6 +1037,426 @@ class AuthRepositoryImpl(
                     uidContext = authUser.uid
                 )
             )
+        }
+    }
+
+    // =========================================================================
+    // 8a. Collector Onboarding & Vetting Operations (Stage 5)
+    // =========================================================================
+
+    override suspend fun submitCollectorOnboarding(
+        input: CollectorSubmissionInput
+    ): CollectorSubmissionOutcome {
+        val authUser = remoteDataSource.getCurrentAuthUser()
+            ?: return CollectorSubmissionOutcome.Failure(AuthError.Unauthenticated())
+
+        if (!authUser.isEmailVerified) {
+            return CollectorSubmissionOutcome.Failure(AuthError.EmailNotVerified())
+        }
+
+        val serverVerifiedProfile = requireServerVerifiedActiveProfile(authUser)
+            ?: return CollectorSubmissionOutcome.Failure(resolveNonVerifiedProfileUpdateError(authUser))
+
+        if (serverVerifiedProfile.role != UserRole.COLLECTOR) {
+            return CollectorSubmissionOutcome.Failure(
+                AuthError.UnauthorizedRoleSelection("Only accounts with role COLLECTOR can submit fleet verification.")
+            )
+        }
+
+        if (serverVerifiedProfile.collectorVerificationStatus != CollectorVerificationStatus.NOT_SUBMITTED) {
+            return CollectorSubmissionOutcome.Failure(
+                AuthError.PermissionDenied("Collector fleet verification has already been submitted or processed.")
+            )
+        }
+
+        val failures = mutableListOf<FieldValidationFailure>()
+        val vehicleTypeRes = AuthValidator.validateVehicleType(input.vehicleType)
+        if (vehicleTypeRes is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("vehicleType", vehicleTypeRes.error, vehicleTypeRes.message))
+        }
+        val plateRes = AuthValidator.validateVehiclePlateNumber(input.vehiclePlateNumber)
+        if (plateRes is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("vehiclePlateNumber", plateRes.error, plateRes.message))
+        }
+        val licenseRes = AuthValidator.validateLicenseNumber(input.licenseNumber)
+        if (licenseRes is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("licenseNumber", licenseRes.error, licenseRes.message))
+        }
+        val zoneRes = AuthValidator.validateServiceZoneId(input.serviceZoneId)
+        if (zoneRes is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("serviceZoneId", zoneRes.error, zoneRes.message))
+        }
+
+        if (failures.isNotEmpty()) {
+            return CollectorSubmissionOutcome.Failure(AuthError.ValidationFailed(failures))
+        }
+
+        val normalizedVehicleType = (vehicleTypeRes as ValidationResult.Valid).value
+        val normalizedPlate = (plateRes as ValidationResult.Valid).value
+        val normalizedLicense = (licenseRes as ValidationResult.Valid).value
+        val normalizedZone = (zoneRes as ValidationResult.Valid).value
+
+        val now = maxOf(clock(), serverVerifiedProfile.updatedAtEpochMs + 1L)
+
+        val submissionData = mapOf<String, Any?>(
+            "userId" to authUser.uid,
+            "vehicleType" to normalizedVehicleType,
+            "vehiclePlateNumber" to normalizedPlate,
+            "licenseNumber" to normalizedLicense,
+            "serviceZoneId" to normalizedZone,
+            "status" to "PENDING_REVIEW",
+            "submissionAttempt" to 1,
+            "submittedAtEpochMs" to now,
+            "reviewedByUid" to null,
+            "reviewedAtEpochMs" to null,
+            "rejectionReason" to null,
+            "adminNotes" to null,
+            "lastRejectionReason" to null,
+            "lastReviewedByUid" to null,
+            "lastReviewedAtEpochMs" to null
+        )
+
+        val historyData = mapOf<String, Any?>(
+            "attemptId" to "attempt_1",
+            "userId" to authUser.uid,
+            "eventType" to "SUBMITTED",
+            "vehicleType" to normalizedVehicleType,
+            "vehiclePlateNumber" to normalizedPlate,
+            "licenseNumber" to normalizedLicense,
+            "serviceZoneId" to normalizedZone,
+            "submissionAttempt" to 1,
+            "timestampEpochMs" to now,
+            "actorUid" to authUser.uid,
+            "rejectionReason" to null
+        )
+
+        val userUpdateFields = mapOf<String, Any?>(
+            "collectorVerificationStatus" to "PENDING_REVIEW",
+            "onboardingStatus" to OnboardingStatus.COMPLETED.name,
+            "vehicleType" to normalizedVehicleType,
+            "vehiclePlateNumber" to normalizedPlate,
+            "defaultZoneId" to normalizedZone,
+            "updatedAtEpochMs" to now
+        )
+
+        return try {
+            remoteDataSource.executeCollectorInitialSubmissionBatch(
+                uid = authUser.uid,
+                submissionData = submissionData,
+                historyData = historyData,
+                attemptId = "attempt_1",
+                userUpdateFields = userUpdateFields
+            )
+
+            val updatedUser = serverVerifiedProfile.copy(
+                collectorVerificationStatus = CollectorVerificationStatus.PENDING_REVIEW,
+                onboardingStatus = OnboardingStatus.COMPLETED,
+                vehicleType = normalizedVehicleType,
+                vehiclePlateNumber = normalizedPlate,
+                defaultZoneId = normalizedZone,
+                updatedAtEpochMs = now
+            )
+            applyServerVerifiedUserToSessionState(updatedUser, authUser)
+
+            val submission = CollectorSubmission(
+                userId = authUser.uid,
+                vehicleType = normalizedVehicleType,
+                vehiclePlateNumber = normalizedPlate,
+                licenseNumber = normalizedLicense,
+                serviceZoneId = normalizedZone,
+                status = CollectorVerificationStatus.PENDING_REVIEW,
+                submissionAttempt = 1,
+                submittedAtEpochMs = now
+            )
+            CollectorSubmissionOutcome.Success(submission, updatedUser)
+        } catch (e: Throwable) {
+            CollectorSubmissionOutcome.Failure(
+                FirebaseErrorMapper.toAuthError(
+                    throwable = e,
+                    emailContext = authUser.email,
+                    uidContext = authUser.uid
+                )
+            )
+        }
+    }
+
+    override suspend fun resubmitCollectorOnboarding(
+        input: CollectorSubmissionInput
+    ): CollectorSubmissionOutcome {
+        val authUser = remoteDataSource.getCurrentAuthUser()
+            ?: return CollectorSubmissionOutcome.Failure(AuthError.Unauthenticated())
+
+        if (!authUser.isEmailVerified) {
+            return CollectorSubmissionOutcome.Failure(AuthError.EmailNotVerified())
+        }
+
+        val serverVerifiedProfile = requireServerVerifiedActiveProfile(authUser)
+            ?: return CollectorSubmissionOutcome.Failure(resolveNonVerifiedProfileUpdateError(authUser))
+
+        if (serverVerifiedProfile.role != UserRole.COLLECTOR) {
+            return CollectorSubmissionOutcome.Failure(
+                AuthError.UnauthorizedRoleSelection("Only accounts with role COLLECTOR can resubmit fleet verification.")
+            )
+        }
+
+        if (serverVerifiedProfile.collectorVerificationStatus != CollectorVerificationStatus.REJECTED) {
+            return CollectorSubmissionOutcome.Failure(
+                AuthError.PermissionDenied("Resubmission is only permitted for REJECTED applications.")
+            )
+        }
+
+        val existingResult = remoteDataSource.fetchCollectorSubmission(authUser.uid)
+        val existingData = (existingResult as? RemoteDocumentResult.Found)?.data
+            ?: return CollectorSubmissionOutcome.Failure(
+                AuthError.PermissionDenied("Previous submission record not found.")
+            )
+
+        if ((existingData["status"] as? String) != "REJECTED") {
+            return CollectorSubmissionOutcome.Failure(
+                AuthError.PermissionDenied("Existing submission status is not REJECTED.")
+            )
+        }
+
+        val failures = mutableListOf<FieldValidationFailure>()
+        val vehicleTypeRes = AuthValidator.validateVehicleType(input.vehicleType)
+        if (vehicleTypeRes is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("vehicleType", vehicleTypeRes.error, vehicleTypeRes.message))
+        }
+        val plateRes = AuthValidator.validateVehiclePlateNumber(input.vehiclePlateNumber)
+        if (plateRes is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("vehiclePlateNumber", plateRes.error, plateRes.message))
+        }
+        val licenseRes = AuthValidator.validateLicenseNumber(input.licenseNumber)
+        if (licenseRes is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("licenseNumber", licenseRes.error, licenseRes.message))
+        }
+        val zoneRes = AuthValidator.validateServiceZoneId(input.serviceZoneId)
+        if (zoneRes is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("serviceZoneId", zoneRes.error, zoneRes.message))
+        }
+
+        if (failures.isNotEmpty()) {
+            return CollectorSubmissionOutcome.Failure(AuthError.ValidationFailed(failures))
+        }
+
+        val normalizedVehicleType = (vehicleTypeRes as ValidationResult.Valid).value
+        val normalizedPlate = (plateRes as ValidationResult.Valid).value
+        val normalizedLicense = (licenseRes as ValidationResult.Valid).value
+        val normalizedZone = (zoneRes as ValidationResult.Valid).value
+
+        val previousAttempt = (existingData["submissionAttempt"] as? Number)?.toInt() ?: 1
+        val newAttempt = previousAttempt + 1
+        val attemptId = "attempt_$newAttempt"
+        val now = maxOf(clock(), serverVerifiedProfile.updatedAtEpochMs + 1L)
+
+        val submissionUpdateData = mapOf<String, Any?>(
+            "userId" to authUser.uid,
+            "vehicleType" to normalizedVehicleType,
+            "vehiclePlateNumber" to normalizedPlate,
+            "licenseNumber" to normalizedLicense,
+            "serviceZoneId" to normalizedZone,
+            "status" to "PENDING_REVIEW",
+            "submissionAttempt" to newAttempt,
+            "submittedAtEpochMs" to now,
+            "reviewedByUid" to null,
+            "reviewedAtEpochMs" to null,
+            "rejectionReason" to null,
+            "adminNotes" to existingData["adminNotes"],
+            "lastRejectionReason" to existingData["rejectionReason"],
+            "lastReviewedByUid" to existingData["reviewedByUid"],
+            "lastReviewedAtEpochMs" to existingData["reviewedAtEpochMs"]
+        )
+
+        val historyData = mapOf<String, Any?>(
+            "attemptId" to attemptId,
+            "userId" to authUser.uid,
+            "eventType" to "RESUBMITTED",
+            "vehicleType" to normalizedVehicleType,
+            "vehiclePlateNumber" to normalizedPlate,
+            "licenseNumber" to normalizedLicense,
+            "serviceZoneId" to normalizedZone,
+            "submissionAttempt" to newAttempt,
+            "timestampEpochMs" to now,
+            "actorUid" to authUser.uid,
+            "rejectionReason" to null
+        )
+
+        val userUpdateFields = mapOf<String, Any?>(
+            "collectorVerificationStatus" to "PENDING_REVIEW",
+            "collectorRejectionReason" to null,
+            "vehicleType" to normalizedVehicleType,
+            "vehiclePlateNumber" to normalizedPlate,
+            "defaultZoneId" to normalizedZone,
+            "updatedAtEpochMs" to now
+        )
+
+        return try {
+            remoteDataSource.executeCollectorResubmissionBatch(
+                uid = authUser.uid,
+                submissionUpdateData = submissionUpdateData,
+                historyData = historyData,
+                attemptId = attemptId,
+                userUpdateFields = userUpdateFields
+            )
+
+            val updatedUser = serverVerifiedProfile.copy(
+                collectorVerificationStatus = CollectorVerificationStatus.PENDING_REVIEW,
+                collectorRejectionReason = null,
+                vehicleType = normalizedVehicleType,
+                vehiclePlateNumber = normalizedPlate,
+                defaultZoneId = normalizedZone,
+                updatedAtEpochMs = now
+            )
+            applyServerVerifiedUserToSessionState(updatedUser, authUser)
+
+            val submission = CollectorSubmission(
+                userId = authUser.uid,
+                vehicleType = normalizedVehicleType,
+                vehiclePlateNumber = normalizedPlate,
+                licenseNumber = normalizedLicense,
+                serviceZoneId = normalizedZone,
+                status = CollectorVerificationStatus.PENDING_REVIEW,
+                submissionAttempt = newAttempt,
+                submittedAtEpochMs = now,
+                lastRejectionReason = existingData["rejectionReason"] as? String,
+                lastReviewedByUid = existingData["reviewedByUid"] as? String,
+                lastReviewedAtEpochMs = (existingData["reviewedAtEpochMs"] as? Number)?.toLong()
+            )
+            CollectorSubmissionOutcome.Success(submission, updatedUser)
+        } catch (e: Throwable) {
+            CollectorSubmissionOutcome.Failure(
+                FirebaseErrorMapper.toAuthError(
+                    throwable = e,
+                    emailContext = authUser.email,
+                    uidContext = authUser.uid
+                )
+            )
+        }
+    }
+
+    override suspend fun getCollectorSubmission(uid: String): Result<CollectorSubmission?> {
+        return try {
+            when (val res = remoteDataSource.fetchCollectorSubmission(uid)) {
+                is RemoteDocumentResult.Found -> {
+                    val submission = CollectorSubmissionMapper.fromFirestoreMap(res.data)
+                    Result.success(submission)
+                }
+                is RemoteDocumentResult.NotFound -> Result.success(null)
+            }
+        } catch (e: Throwable) {
+            Result.failure(e)
+        }
+    }
+
+    @VisibleForTesting
+    override suspend fun adminApproveCollectorSubmission(
+        collectorUid: String,
+        adminUid: String
+    ): Result<Unit> {
+        return try {
+            val subResult = remoteDataSource.fetchCollectorSubmission(collectorUid)
+            val subData = (subResult as? RemoteDocumentResult.Found)?.data
+                ?: return Result.failure(IllegalStateException("No submission found for $collectorUid"))
+
+            val attempt = (subData["submissionAttempt"] as? Number)?.toInt() ?: 1
+            val attemptId = "attempt_${attempt}_approved"
+            val now = clock()
+
+            val historyData = mapOf<String, Any?>(
+                "attemptId" to attemptId,
+                "userId" to collectorUid,
+                "eventType" to "APPROVED",
+                "vehicleType" to (subData["vehicleType"] as? String ?: ""),
+                "vehiclePlateNumber" to (subData["vehiclePlateNumber"] as? String ?: ""),
+                "licenseNumber" to (subData["licenseNumber"] as? String ?: ""),
+                "serviceZoneId" to (subData["serviceZoneId"] as? String ?: ""),
+                "submissionAttempt" to attempt,
+                "timestampEpochMs" to now,
+                "actorUid" to adminUid,
+                "rejectionReason" to null
+            )
+
+            val submissionUpdateData = mapOf<String, Any?>(
+                "status" to "APPROVED",
+                "reviewedByUid" to adminUid,
+                "reviewedAtEpochMs" to now,
+                "rejectionReason" to null
+            )
+
+            val userUpdateFields = mapOf<String, Any?>(
+                "collectorVerificationStatus" to "APPROVED",
+                "isVerified" to true,
+                "status" to "ACTIVE",
+                "collectorRejectionReason" to null,
+                "updatedAtEpochMs" to now
+            )
+
+            remoteDataSource.executeAdminCollectorApprovalBatch(
+                uid = collectorUid,
+                attemptId = attemptId,
+                historyData = historyData,
+                submissionUpdateData = submissionUpdateData,
+                userUpdateFields = userUpdateFields
+            )
+            Result.success(Unit)
+        } catch (e: Throwable) {
+            Result.failure(e)
+        }
+    }
+
+    @VisibleForTesting
+    override suspend fun adminRejectCollectorSubmission(
+        collectorUid: String,
+        adminUid: String,
+        rejectionReason: String
+    ): Result<Unit> {
+        return try {
+            val subResult = remoteDataSource.fetchCollectorSubmission(collectorUid)
+            val subData = (subResult as? RemoteDocumentResult.Found)?.data
+                ?: return Result.failure(IllegalStateException("No submission found for $collectorUid"))
+
+            val attempt = (subData["submissionAttempt"] as? Number)?.toInt() ?: 1
+            val attemptId = "attempt_${attempt}_rejected"
+            val now = clock()
+
+            val historyData = mapOf<String, Any?>(
+                "attemptId" to attemptId,
+                "userId" to collectorUid,
+                "eventType" to "REJECTED",
+                "vehicleType" to (subData["vehicleType"] as? String ?: ""),
+                "vehiclePlateNumber" to (subData["vehiclePlateNumber"] as? String ?: ""),
+                "licenseNumber" to (subData["licenseNumber"] as? String ?: ""),
+                "serviceZoneId" to (subData["serviceZoneId"] as? String ?: ""),
+                "submissionAttempt" to attempt,
+                "timestampEpochMs" to now,
+                "actorUid" to adminUid,
+                "rejectionReason" to rejectionReason
+            )
+
+            val submissionUpdateData = mapOf<String, Any?>(
+                "status" to "REJECTED",
+                "reviewedByUid" to adminUid,
+                "reviewedAtEpochMs" to now,
+                "rejectionReason" to rejectionReason
+            )
+
+            val userUpdateFields = mapOf<String, Any?>(
+                "collectorVerificationStatus" to "REJECTED",
+                "isVerified" to false,
+                "collectorRejectionReason" to rejectionReason,
+                "updatedAtEpochMs" to now
+            )
+
+            remoteDataSource.executeAdminCollectorRejectionBatch(
+                uid = collectorUid,
+                attemptId = attemptId,
+                historyData = historyData,
+                submissionUpdateData = submissionUpdateData,
+                userUpdateFields = userUpdateFields
+            )
+            Result.success(Unit)
+        } catch (e: Throwable) {
+            Result.failure(e)
         }
     }
 

@@ -23,6 +23,8 @@ class FirebaseAuthDataSource @Inject constructor(
 
     companion object {
         const val USERS_COLLECTION = "users"
+        const val COLLECTOR_SUBMISSIONS_COLLECTION = "collector_submissions"
+        const val HISTORY_SUBCOLLECTION = "history"
     }
 
     private val simulatedNextWriteFailure = AtomicReference<Throwable?>(null)
@@ -180,6 +182,114 @@ class FirebaseAuthDataSource @Inject constructor(
             .document(uid)
             .update(fields)
             .await()
+    }
+
+    override suspend fun fetchCollectorSubmission(uid: String): RemoteDocumentResult {
+        return try {
+            val snapshot = firestore.collection(COLLECTOR_SUBMISSIONS_COLLECTION)
+                .document(uid)
+                .get(Source.SERVER)
+                .await()
+
+            if (snapshot.exists() && snapshot.data != null) {
+                RemoteDocumentResult.Found(
+                    data = snapshot.data!!,
+                    isFromCache = false
+                )
+            } else {
+                RemoteDocumentResult.NotFound(isFromCache = false)
+            }
+        } catch (_: Exception) {
+            try {
+                val cached = firestore.collection(COLLECTOR_SUBMISSIONS_COLLECTION)
+                    .document(uid)
+                    .get(Source.CACHE)
+                    .await()
+                if (cached.exists() && cached.data != null) {
+                    RemoteDocumentResult.Found(data = cached.data!!, isFromCache = true)
+                } else {
+                    RemoteDocumentResult.NotFound(isFromCache = true)
+                }
+            } catch (_: Exception) {
+                RemoteDocumentResult.NotFound(isFromCache = true)
+            }
+        }
+    }
+
+    override suspend fun executeCollectorInitialSubmissionBatch(
+        uid: String,
+        submissionData: Map<String, Any?>,
+        historyData: Map<String, Any?>,
+        attemptId: String,
+        userUpdateFields: Map<String, Any?>
+    ) {
+        val batch = firestore.batch()
+        val submissionRef = firestore.collection(COLLECTOR_SUBMISSIONS_COLLECTION).document(uid)
+        val historyRef = firestore.collection(COLLECTOR_SUBMISSIONS_COLLECTION).document(uid)
+            .collection(HISTORY_SUBCOLLECTION).document(attemptId)
+        val userRef = firestore.collection(USERS_COLLECTION).document(uid)
+
+        batch.set(submissionRef, submissionData)
+        batch.set(historyRef, historyData)
+        batch.update(userRef, userUpdateFields)
+        batch.commit().await()
+    }
+
+    override suspend fun executeCollectorResubmissionBatch(
+        uid: String,
+        submissionUpdateData: Map<String, Any?>,
+        historyData: Map<String, Any?>,
+        attemptId: String,
+        userUpdateFields: Map<String, Any?>
+    ) {
+        val batch = firestore.batch()
+        val submissionRef = firestore.collection(COLLECTOR_SUBMISSIONS_COLLECTION).document(uid)
+        val historyRef = firestore.collection(COLLECTOR_SUBMISSIONS_COLLECTION).document(uid)
+            .collection(HISTORY_SUBCOLLECTION).document(attemptId)
+        val userRef = firestore.collection(USERS_COLLECTION).document(uid)
+
+        batch.update(submissionRef, submissionUpdateData)
+        batch.set(historyRef, historyData)
+        batch.update(userRef, userUpdateFields)
+        batch.commit().await()
+    }
+
+    override suspend fun executeAdminCollectorApprovalBatch(
+        uid: String,
+        attemptId: String,
+        historyData: Map<String, Any?>,
+        submissionUpdateData: Map<String, Any?>,
+        userUpdateFields: Map<String, Any?>
+    ) {
+        val batch = firestore.batch()
+        val submissionRef = firestore.collection(COLLECTOR_SUBMISSIONS_COLLECTION).document(uid)
+        val historyRef = firestore.collection(COLLECTOR_SUBMISSIONS_COLLECTION).document(uid)
+            .collection(HISTORY_SUBCOLLECTION).document(attemptId)
+        val userRef = firestore.collection(USERS_COLLECTION).document(uid)
+
+        batch.update(submissionRef, submissionUpdateData)
+        batch.set(historyRef, historyData)
+        batch.update(userRef, userUpdateFields)
+        batch.commit().await()
+    }
+
+    override suspend fun executeAdminCollectorRejectionBatch(
+        uid: String,
+        attemptId: String,
+        historyData: Map<String, Any?>,
+        submissionUpdateData: Map<String, Any?>,
+        userUpdateFields: Map<String, Any?>
+    ) {
+        val batch = firestore.batch()
+        val submissionRef = firestore.collection(COLLECTOR_SUBMISSIONS_COLLECTION).document(uid)
+        val historyRef = firestore.collection(COLLECTOR_SUBMISSIONS_COLLECTION).document(uid)
+            .collection(HISTORY_SUBCOLLECTION).document(attemptId)
+        val userRef = firestore.collection(USERS_COLLECTION).document(uid)
+
+        batch.update(submissionRef, submissionUpdateData)
+        batch.set(historyRef, historyData)
+        batch.update(userRef, userUpdateFields)
+        batch.commit().await()
     }
 
     @VisibleForTesting

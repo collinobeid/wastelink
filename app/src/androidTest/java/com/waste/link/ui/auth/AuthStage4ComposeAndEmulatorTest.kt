@@ -583,6 +583,12 @@ class AuthStage4ComposeAndEmulatorTest {
                             launchSingleTop = true
                         }
                     }
+                    is AuthNavigationEvent.NavigateToCollectorVerificationStatus -> {
+                        navController.navigate(Destinations.COLLECTOR_VERIFICATION_STATUS) {
+                            popUpTo(0) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    }
                     is AuthNavigationEvent.NavigateToDestination -> {
                         navController.navigate(event.route) {
                             popUpTo(0) { inclusive = true }

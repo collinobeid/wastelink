@@ -25,7 +25,11 @@ enum class ValidationError {
     PASSWORD_MISSING_DIGIT,
     PASSWORD_CONFIRMATION_MISMATCH,
     ROLE_NOT_SELECTED,
-    ROLE_NOT_ALLOWED_FOR_SELF_REGISTRATION
+    ROLE_NOT_ALLOWED_FOR_SELF_REGISTRATION,
+    VEHICLE_TYPE_INVALID,
+    VEHICLE_PLATE_INVALID,
+    LICENSE_NUMBER_INVALID,
+    SERVICE_ZONE_INVALID
 }
 
 /**
@@ -531,6 +535,163 @@ object AuthValidator {
             )
         }
         return ValidationResult.Valid(role)
+    }
+
+    // =========================================================================
+    // Stage 5: Role-Specific Onboarding & Collector KYC Validation
+    // =========================================================================
+
+    const val MIN_VEHICLE_TYPE_LENGTH = 2
+    const val MAX_VEHICLE_TYPE_LENGTH = 40
+    const val MIN_VEHICLE_PLATE_LENGTH = 3
+    const val MAX_VEHICLE_PLATE_LENGTH = 20
+    const val MIN_LICENSE_NUMBER_LENGTH = 4
+    const val MAX_LICENSE_NUMBER_LENGTH = 40
+    const val MIN_SERVICE_ZONE_LENGTH = 2
+    const val MAX_SERVICE_ZONE_LENGTH = 60
+
+    val STANDARD_VEHICLE_TYPES = listOf(
+        "Compactor Truck",
+        "Flatbed Truck",
+        "Waste Tricycle",
+        "Skip Loader"
+    )
+
+    data class MunicipalServiceZone(
+        val id: String,
+        val displayName: String,
+        val regionDescription: String
+    )
+
+    val MUNICIPAL_SERVICE_ZONES = listOf(
+        MunicipalServiceZone("zone_kinondoni", "Kinondoni Municipality", "Dar es Salaam - North & Coastal"),
+        MunicipalServiceZone("zone_ilala", "Ilala Municipality", "Dar es Salaam - Central Business District"),
+        MunicipalServiceZone("zone_temeke", "Temeke Municipality", "Dar es Salaam - South & Industrial"),
+        MunicipalServiceZone("zone_ubungo", "Ubungo Municipality", "Dar es Salaam - West & Transit Hub"),
+        MunicipalServiceZone("zone_kigamboni", "Kigamboni Municipality", "Dar es Salaam - South Coast"),
+        MunicipalServiceZone("zone_arusha", "Arusha City", "Northern Tourism & Commercial Hub"),
+        MunicipalServiceZone("zone_dodoma", "Dodoma Capital", "National Capital & Government Zone")
+    )
+
+    /**
+     * Validates vehicle type selection/input for Collector onboarding.
+     * Enforces length bounds ([MIN_VEHICLE_TYPE_LENGTH]..[MAX_VEHICLE_TYPE_LENGTH]).
+     */
+    fun validateVehicleType(rawType: String?): ValidationResult<String> {
+        val required = validateRequired(rawType, "Vehicle type")
+        if (required is ValidationResult.Invalid) return required
+
+        val trimmed = required.getOrNull()!!
+        if (trimmed.length < MIN_VEHICLE_TYPE_LENGTH) {
+            return ValidationResult.Invalid(
+                error = ValidationError.VEHICLE_TYPE_INVALID,
+                message = "Vehicle type must be at least $MIN_VEHICLE_TYPE_LENGTH characters."
+            )
+        }
+        if (trimmed.length > MAX_VEHICLE_TYPE_LENGTH) {
+            return ValidationResult.Invalid(
+                error = ValidationError.VEHICLE_TYPE_INVALID,
+                message = "Vehicle type must not exceed $MAX_VEHICLE_TYPE_LENGTH characters."
+            )
+        }
+        return ValidationResult.Valid(trimmed)
+    }
+
+    /**
+     * Validates vehicle registration / license plate number.
+     * Enforces length bounds ([MIN_VEHICLE_PLATE_LENGTH]..[MAX_VEHICLE_PLATE_LENGTH])
+     * and normalizes to uppercase.
+     */
+    fun validateVehiclePlateNumber(rawPlate: String?): ValidationResult<String> {
+        val required = validateRequired(rawPlate, "Vehicle plate number")
+        if (required is ValidationResult.Invalid) return required
+
+        val normalized = required.getOrNull()!!.uppercase()
+        if (normalized.length < MIN_VEHICLE_PLATE_LENGTH) {
+            return ValidationResult.Invalid(
+                error = ValidationError.VEHICLE_PLATE_INVALID,
+                message = "Plate number must be at least $MIN_VEHICLE_PLATE_LENGTH characters."
+            )
+        }
+        if (normalized.length > MAX_VEHICLE_PLATE_LENGTH) {
+            return ValidationResult.Invalid(
+                error = ValidationError.VEHICLE_PLATE_INVALID,
+                message = "Plate number must not exceed $MAX_VEHICLE_PLATE_LENGTH characters."
+            )
+        }
+        val plateRegex = Regex("^[A-Z0-9 -]+$")
+        if (!plateRegex.matches(normalized)) {
+            return ValidationResult.Invalid(
+                error = ValidationError.VEHICLE_PLATE_INVALID,
+                message = "Plate number may only contain letters, digits, spaces, and hyphens."
+            )
+        }
+        return ValidationResult.Valid(normalized)
+    }
+
+    /**
+     * Validates driver license number for Collector onboarding.
+     * Enforces length bounds ([MIN_LICENSE_NUMBER_LENGTH]..[MAX_LICENSE_NUMBER_LENGTH]).
+     */
+    fun validateLicenseNumber(rawLicense: String?): ValidationResult<String> {
+        val required = validateRequired(rawLicense, "Driver license number")
+        if (required is ValidationResult.Invalid) return required
+
+        val normalized = required.getOrNull()!!.uppercase()
+        if (normalized.length < MIN_LICENSE_NUMBER_LENGTH) {
+            return ValidationResult.Invalid(
+                error = ValidationError.LICENSE_NUMBER_INVALID,
+                message = "License number must be at least $MIN_LICENSE_NUMBER_LENGTH characters."
+            )
+        }
+        if (normalized.length > MAX_LICENSE_NUMBER_LENGTH) {
+            return ValidationResult.Invalid(
+                error = ValidationError.LICENSE_NUMBER_INVALID,
+                message = "License number must not exceed $MAX_LICENSE_NUMBER_LENGTH characters."
+            )
+        }
+        val licenseRegex = Regex("^[A-Z0-9 -]+$")
+        if (!licenseRegex.matches(normalized)) {
+            return ValidationResult.Invalid(
+                error = ValidationError.LICENSE_NUMBER_INVALID,
+                message = "License number may only contain letters, digits, spaces, and hyphens."
+            )
+        }
+        return ValidationResult.Valid(normalized)
+    }
+
+    /**
+     * Validates service zone selection for Resident or Collector onboarding.
+     * Enforces length bounds ([MIN_SERVICE_ZONE_LENGTH]..[MAX_SERVICE_ZONE_LENGTH]).
+     */
+    fun validateServiceZoneId(rawZoneId: String?): ValidationResult<String> {
+        val required = validateRequired(rawZoneId, "Service zone")
+        if (required is ValidationResult.Invalid) return required
+
+        val trimmed = required.getOrNull()!!
+        if (trimmed.length < MIN_SERVICE_ZONE_LENGTH) {
+            return ValidationResult.Invalid(
+                error = ValidationError.SERVICE_ZONE_INVALID,
+                message = "Service zone identifier is too short."
+            )
+        }
+        if (trimmed.length > MAX_SERVICE_ZONE_LENGTH) {
+            return ValidationResult.Invalid(
+                error = ValidationError.SERVICE_ZONE_INVALID,
+                message = "Service zone identifier must not exceed $MAX_SERVICE_ZONE_LENGTH characters."
+            )
+        }
+        val matchedZone = MUNICIPAL_SERVICE_ZONES.firstOrNull {
+            it.id.equals(trimmed, ignoreCase = true) ||
+            it.displayName.contains(trimmed, ignoreCase = true)
+        }
+        if (matchedZone == null) {
+            return ValidationResult.Invalid(
+                error = ValidationError.SERVICE_ZONE_INVALID,
+                message = "Selected service zone is not recognized."
+            )
+        }
+        return ValidationResult.Valid(matchedZone.id)
     }
 }
 

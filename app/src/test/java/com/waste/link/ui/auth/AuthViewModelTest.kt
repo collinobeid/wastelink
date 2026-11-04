@@ -4,6 +4,9 @@ import com.waste.link.data.models.AppUser
 import com.waste.link.data.repository.AuthRepository
 import com.waste.link.domain.model.AccountStatus
 import com.waste.link.domain.model.AuthError
+import com.waste.link.domain.model.CollectorSubmission
+import com.waste.link.domain.model.CollectorSubmissionInput
+import com.waste.link.domain.model.CollectorSubmissionOutcome
 import com.waste.link.domain.model.CollectorVerificationStatus
 import com.waste.link.domain.model.EmailVerificationOutcome
 import com.waste.link.domain.model.LoginOutcome
@@ -175,7 +178,7 @@ class AuthViewModelTest {
             id = "uid-collector-1",
             role = UserRole.COLLECTOR,
             onboardingStatus = OnboardingStatus.COMPLETED,
-            collectorVerificationStatus = CollectorVerificationStatus.NOT_SUBMITTED
+            collectorVerificationStatus = CollectorVerificationStatus.APPROVED
         )
         fakeRepo.nextLoginOutcome = LoginOutcome.Authenticated(
             user = collector,
@@ -829,6 +832,281 @@ class AuthViewModelTest {
     }
 
     // =========================================================================
+    // 15. Stage 5: Resident Onboarding Workflows
+    // =========================================================================
+
+    @Test
+    fun `15a Resident onboarding zone selection and completion navigates to ResidentHome`() = runTest {
+        val residentPending = buildUser(
+            role = UserRole.RESIDENT,
+            onboardingStatus = OnboardingStatus.NOT_STARTED
+        )
+        fakeRepo.resolvedUser = residentPending
+
+        val vm = createViewModel()
+        vm.onResidentZoneChanged("zone_ilala")
+        vm.onResidentAddressChanged("Plot 42 Samora Avenue")
+
+        assertEquals("zone_ilala", vm.uiState.value.residentSelectedZone)
+        assertEquals("Plot 42 Samora Avenue", vm.uiState.value.residentAddress)
+        assertNull(vm.uiState.value.residentZoneError)
+
+        val completedResident = residentPending.copy(
+            onboardingStatus = OnboardingStatus.COMPLETED,
+            defaultZoneId = "zone_ilala"
+        )
+        fakeRepo.completeResidentOnboardingOutcome = ProfileUpdateOutcome.Success(completedResident)
+
+        vm.completeResidentOnboarding()
+        runCurrent()
+
+        assertFalse(vm.uiState.value.isCompletingOnboarding)
+        assertEquals(completedResident, vm.uiState.value.currentUser)
+        assertEquals(
+            AuthNavigationEvent.NavigateToDestination(
+                route = Destinations.RESIDENT_HOME,
+                clearBackStack = true
+            ),
+            vm.navigationEvents.first()
+        )
+    }
+
+    @Test
+    fun `15b Resident onboarding network failure sets error state without crash`() = runTest {
+        val residentPending = buildUser(
+            role = UserRole.RESIDENT,
+            onboardingStatus = OnboardingStatus.NOT_STARTED
+        )
+        fakeRepo.resolvedUser = residentPending
+        fakeRepo.completeResidentOnboardingOutcome = ProfileUpdateOutcome.Failure(AuthError.NetworkFailure())
+
+        val vm = createViewModel()
+        vm.completeResidentOnboarding()
+        runCurrent()
+
+        assertFalse(vm.uiState.value.isCompletingOnboarding)
+        assertNotNull(vm.uiState.value.onboardingError)
+    }
+
+    // =========================================================================
+    // 16. Stage 5: Collector Onboarding KYC & Atomic Submission
+    // =========================================================================
+
+    @Test
+    fun `16a Collector onboarding KYC form validates plate and license and gates review step`() = runTest {
+        val vm = createViewModel()
+
+        // Invalid plate
+        vm.onCollectorPlateNumberChanged("12")
+        assertNotNull(vm.uiState.value.collectorPlateNumberError)
+
+        // Invalid license
+        vm.onCollectorLicenseNumberChanged("AB")
+        assertNotNull(vm.uiState.value.collectorLicenseNumberError)
+
+        // Attempting review toggle fails
+        vm.onCollectorReviewToggled(true)
+        assertFalse(vm.uiState.value.isCollectorReviewStep)
+
+        // Fix plate and license
+        vm.onCollectorVehicleTypeChanged("Compactor Truck")
+        vm.onCollectorPlateNumberChanged("T 123 ABC")
+        vm.onCollectorLicenseNumberChanged("DL-987654321")
+        vm.onCollectorServiceZoneChanged("zone_kinondoni")
+
+        assertNull(vm.uiState.value.collectorPlateNumberError)
+        assertNull(vm.uiState.value.collectorLicenseNumberError)
+
+        // Review toggle succeeds
+        vm.onCollectorReviewToggled(true)
+        assertTrue(vm.uiState.value.isCollectorReviewStep)
+    }
+
+    @Test
+    fun `16b Collector KYC initial submission executes atomic batch and navigates to StatusScreen`() = runTest {
+        val collector = buildUser(
+            id = "uid-collector-1",
+            role = UserRole.COLLECTOR,
+            onboardingStatus = OnboardingStatus.NOT_STARTED,
+            collectorVerificationStatus = CollectorVerificationStatus.NOT_SUBMITTED
+        )
+        fakeRepo.resolvedUser = collector
+
+        val vm = createViewModel()
+        vm.onCollectorVehicleTypeChanged("Skip Loader")
+        vm.onCollectorPlateNumberChanged("T 456 DEF")
+        vm.onCollectorLicenseNumberChanged("DL-555444333")
+        vm.onCollectorServiceZoneChanged("zone_temeke")
+        vm.onCollectorReviewToggled(true)
+
+        val submission = CollectorSubmission(
+            userId = "uid-collector-1",
+            vehicleType = "Skip Loader",
+            vehiclePlateNumber = "T 456 DEF",
+            licenseNumber = "DL-555444333",
+            serviceZoneId = "zone_temeke",
+            status = CollectorVerificationStatus.PENDING_REVIEW,
+            submissionAttempt = 1,
+            submittedAtEpochMs = 1_700_000_000_000L
+        )
+        val updatedUser = collector.copy(
+            onboardingStatus = OnboardingStatus.COMPLETED,
+            collectorVerificationStatus = CollectorVerificationStatus.PENDING_REVIEW,
+            vehicleType = "Skip Loader",
+            vehiclePlateNumber = "T 456 DEF",
+            defaultZoneId = "zone_temeke"
+        )
+        fakeRepo.nextCollectorSubmissionOutcome = CollectorSubmissionOutcome.Success(
+            submission = submission,
+            updatedUser = updatedUser
+        )
+
+        vm.submitCollectorOnboarding()
+        runCurrent()
+
+        assertEquals(1, fakeRepo.submitCollectorCallCount)
+        assertFalse(vm.uiState.value.isSubmittingCollectorOnboarding)
+        assertEquals(submission, vm.uiState.value.collectorSubmission)
+        assertEquals(
+            AuthNavigationEvent.NavigateToCollectorVerificationStatus,
+            vm.navigationEvents.first()
+        )
+    }
+
+    @Test
+    fun `16c Collector KYC resubmission executes atomic batch and navigates to StatusScreen`() = runTest {
+        val rejectedCollector = buildUser(
+            id = "uid-collector-1",
+            role = UserRole.COLLECTOR,
+            onboardingStatus = OnboardingStatus.COMPLETED,
+            collectorVerificationStatus = CollectorVerificationStatus.REJECTED
+        )
+        fakeRepo.resolvedUser = rejectedCollector
+
+        val vm = createViewModel()
+        vm.onCollectorVehicleTypeChanged("Compactor Truck")
+        vm.onCollectorPlateNumberChanged("T 789 GHI")
+        vm.onCollectorLicenseNumberChanged("DL-111222333")
+        vm.onCollectorServiceZoneChanged("zone_ubungo")
+
+        val resubmission = CollectorSubmission(
+            userId = "uid-collector-1",
+            vehicleType = "Compactor Truck",
+            vehiclePlateNumber = "T 789 GHI",
+            licenseNumber = "DL-111222333",
+            serviceZoneId = "zone_ubungo",
+            status = CollectorVerificationStatus.PENDING_REVIEW,
+            submissionAttempt = 2,
+            submittedAtEpochMs = 1_700_000_100_000L,
+            lastRejectionReason = "Expired registration"
+        )
+        val updatedUser = rejectedCollector.copy(
+            collectorVerificationStatus = CollectorVerificationStatus.PENDING_REVIEW
+        )
+        fakeRepo.nextCollectorResubmissionOutcome = CollectorSubmissionOutcome.Success(
+            submission = resubmission,
+            updatedUser = updatedUser
+        )
+
+        vm.resubmitCollectorOnboarding()
+        runCurrent()
+
+        assertEquals(1, fakeRepo.resubmitCollectorCallCount)
+        assertEquals(
+            AuthNavigationEvent.NavigateToCollectorVerificationStatus,
+            vm.navigationEvents.first()
+        )
+    }
+
+    // =========================================================================
+    // 17. Stage 5: Collector Verification Status & Routing
+    // =========================================================================
+
+    @Test
+    fun `17a Refresh status fetches submission and routes to dashboard when approved`() = runTest {
+        val collector = buildUser(
+            id = "uid-collector-1",
+            role = UserRole.COLLECTOR,
+            onboardingStatus = OnboardingStatus.COMPLETED,
+            collectorVerificationStatus = CollectorVerificationStatus.APPROVED
+        )
+        val approvedSubmission = CollectorSubmission(
+            userId = "uid-collector-1",
+            vehicleType = "Compactor Truck",
+            vehiclePlateNumber = "T 123 ABC",
+            licenseNumber = "DL-12345678",
+            serviceZoneId = "zone_kinondoni",
+            status = CollectorVerificationStatus.APPROVED,
+            submissionAttempt = 1,
+            submittedAtEpochMs = 1_700_000_000_000L
+        )
+
+        fakeRepo.resolvedUser = collector
+        fakeRepo.fakeSubmission = approvedSubmission
+        fakeRepo.nextSessionState = SessionState.Authenticated(
+            user = collector,
+            isEmailVerified = true,
+            hasAdminClaim = false
+        )
+
+        val vm = createViewModel()
+        vm.refreshCollectorVerificationStatus()
+        runCurrent()
+
+        assertEquals(1, fakeRepo.getCollectorSubmissionCallCount)
+        assertEquals(approvedSubmission, vm.uiState.value.collectorSubmission)
+        assertEquals(
+            AuthNavigationEvent.NavigateToDestination(
+                route = Destinations.COLLECTOR_DASHBOARD,
+                clearBackStack = true
+            ),
+            vm.navigationEvents.first()
+        )
+    }
+
+    @Test
+    fun `17b Edit and resubmit populates state from existing submission and navigates to onboarding`() = runTest {
+        val existingSubmission = CollectorSubmission(
+            userId = "uid-collector-1",
+            vehicleType = "Tipping Truck",
+            vehiclePlateNumber = "T 321 ZZZ",
+            licenseNumber = "DL-999888777",
+            serviceZoneId = "zone_ilala",
+            status = CollectorVerificationStatus.REJECTED,
+            submissionAttempt = 1,
+            submittedAtEpochMs = 1_700_000_000_000L,
+            rejectionReason = "Plate mismatch with commercial registry"
+        )
+        val rejectedCollector = buildUser(
+            id = "uid-collector-1",
+            role = UserRole.COLLECTOR,
+            onboardingStatus = OnboardingStatus.COMPLETED,
+            collectorVerificationStatus = CollectorVerificationStatus.REJECTED
+        )
+        fakeRepo.resolvedUser = rejectedCollector
+        fakeRepo.fakeSubmission = existingSubmission
+
+        val vm = createViewModel()
+        vm.loadCollectorSubmission()
+        runCurrent()
+
+        assertEquals(existingSubmission, vm.uiState.value.collectorSubmission)
+
+        vm.startCollectorEditAndResubmit()
+        runCurrent()
+
+        assertEquals("Tipping Truck", vm.uiState.value.collectorVehicleType)
+        assertEquals("T 321 ZZZ", vm.uiState.value.collectorPlateNumber)
+        assertEquals("DL-999888777", vm.uiState.value.collectorLicenseNumber)
+        assertEquals("zone_ilala", vm.uiState.value.collectorServiceZoneId)
+        assertFalse(vm.uiState.value.isCollectorReviewStep)
+        assertEquals(
+            AuthNavigationEvent.NavigateToOnboarding(UserRole.COLLECTOR),
+            vm.navigationEvents.first()
+        )
+    }
+
+    // =========================================================================
     // Fake Canonical AuthRepository
     // =========================================================================
 
@@ -859,6 +1137,11 @@ class AuthViewModelTest {
             PasswordResetOutcome.ResetEmailDispatched("amina@wastelink.co.tz")
         var completeResidentOnboardingOutcome: ProfileUpdateOutcome =
             ProfileUpdateOutcome.Failure(AuthError.NetworkFailure())
+        var nextCollectorSubmissionOutcome: CollectorSubmissionOutcome =
+            CollectorSubmissionOutcome.Failure(AuthError.NetworkFailure())
+        var nextCollectorResubmissionOutcome: CollectorSubmissionOutcome =
+            CollectorSubmissionOutcome.Failure(AuthError.NetworkFailure())
+        var fakeSubmission: CollectorSubmission? = null
 
         var loginCallCount = 0
         var registerResidentCallCount = 0
@@ -869,6 +1152,9 @@ class AuthViewModelTest {
         var refreshVerificationCallCount = 0
         var sendPasswordResetCallCount = 0
         var logoutCallCount = 0
+        var submitCollectorCallCount = 0
+        var resubmitCollectorCallCount = 0
+        var getCollectorSubmissionCallCount = 0
 
         override fun getCurrentUser(): User? = resolvedUser
         override fun getCachedOrVerifiedUser(): User? = resolvedUser
@@ -962,6 +1248,38 @@ class AuthViewModelTest {
 
         override suspend fun completeResidentOnboarding(defaultZoneId: String?): ProfileUpdateOutcome =
             completeResidentOnboardingOutcome
+
+        override suspend fun submitCollectorOnboarding(
+            input: CollectorSubmissionInput
+        ): CollectorSubmissionOutcome {
+            submitCollectorCallCount++
+            return nextCollectorSubmissionOutcome
+        }
+
+        override suspend fun resubmitCollectorOnboarding(
+            input: CollectorSubmissionInput
+        ): CollectorSubmissionOutcome {
+            resubmitCollectorCallCount++
+            return nextCollectorResubmissionOutcome
+        }
+
+        override suspend fun getCollectorSubmission(
+            uid: String
+        ): Result<CollectorSubmission?> {
+            getCollectorSubmissionCallCount++
+            return Result.success(fakeSubmission)
+        }
+
+        override suspend fun adminApproveCollectorSubmission(
+            collectorUid: String,
+            adminUid: String
+        ): Result<Unit> = Result.success(Unit)
+
+        override suspend fun adminRejectCollectorSubmission(
+            collectorUid: String,
+            adminUid: String,
+            rejectionReason: String
+        ): Result<Unit> = Result.success(Unit)
 
         override suspend fun updateProfile(
             fullName: String,

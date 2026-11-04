@@ -30,6 +30,7 @@ import com.waste.link.ui.admin.AdminShellScreen
 import com.waste.link.ui.auth.AuthNavigationEvent
 import com.waste.link.ui.auth.AuthPrimaryGreen
 import com.waste.link.ui.auth.AuthViewModel
+import com.waste.link.ui.auth.CollectorVerificationStatusScreen
 import com.waste.link.ui.auth.CompleteProfileScreen
 import com.waste.link.ui.auth.LoginScreen
 import com.waste.link.ui.auth.OnboardingScreen
@@ -45,6 +46,7 @@ object Destinations {
     const val VERIFY_EMAIL = "verify_email"
     const val COMPLETE_PROFILE = "complete_profile"
     const val ONBOARDING = "onboarding"
+    const val COLLECTOR_VERIFICATION_STATUS = "collector_verification_status"
     const val RESIDENT_HOME = "resident_home"
     const val COLLECTOR_DASHBOARD = "collector_dashboard"
     const val ADMIN_SHELL = "admin_shell"
@@ -105,6 +107,12 @@ fun WasteLinkNavGraph(
                 }
                 is AuthNavigationEvent.NavigateToOnboarding -> {
                     navController.navigate(Destinations.ONBOARDING) {
+                        popUpTo(0) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+                is AuthNavigationEvent.NavigateToCollectorVerificationStatus -> {
+                    navController.navigate(Destinations.COLLECTOR_VERIFICATION_STATUS) {
                         popUpTo(0) { inclusive = true }
                         launchSingleTop = true
                     }
@@ -256,7 +264,38 @@ fun WasteLinkNavGraph(
         composable(Destinations.ONBOARDING) {
             OnboardingScreen(
                 uiState = uiState,
+                onResidentZoneChanged = authViewModel::onResidentZoneChanged,
+                onResidentAddressChanged = authViewModel::onResidentAddressChanged,
+                onCompleteResidentOnboarding = { authViewModel.completeResidentOnboarding() },
+                onCollectorVehicleTypeChanged = authViewModel::onCollectorVehicleTypeChanged,
+                onCollectorPlateNumberChanged = authViewModel::onCollectorPlateNumberChanged,
+                onCollectorLicenseNumberChanged = authViewModel::onCollectorLicenseNumberChanged,
+                onCollectorServiceZoneChanged = authViewModel::onCollectorServiceZoneChanged,
+                onCollectorReviewToggled = authViewModel::onCollectorReviewToggled,
+                onSubmitCollectorOnboarding = authViewModel::submitCollectorOnboarding,
+                onResubmitCollectorOnboarding = authViewModel::resubmitCollectorOnboarding,
                 onCompleteOnboarding = { authViewModel.completeStage4Onboarding() },
+                onLogoutClick = authViewModel::logout
+            )
+        }
+
+        composable(Destinations.COLLECTOR_VERIFICATION_STATUS) {
+            CollectorVerificationStatusScreen(
+                uiState = uiState,
+                onRefreshStatus = authViewModel::refreshCollectorVerificationStatus,
+                onEditAndResubmit = authViewModel::startCollectorEditAndResubmit,
+                onNavigateToDashboard = {
+                    navController.navigate(Destinations.COLLECTOR_DASHBOARD) {
+                        popUpTo(0) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                },
+                onNavigateToOnboarding = {
+                    navController.navigate(Destinations.ONBOARDING) {
+                        popUpTo(0) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                },
                 onLogoutClick = authViewModel::logout
             )
         }

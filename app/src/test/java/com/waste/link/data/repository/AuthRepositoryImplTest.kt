@@ -1328,6 +1328,70 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
         serverUserDocuments[uid] = existing
     }
 
+    val serverCollectorSubmissions = mutableMapOf<String, Map<String, Any?>>()
+    val serverCollectorHistory = mutableMapOf<String, MutableList<Map<String, Any?>>>()
+
+    override suspend fun fetchCollectorSubmission(uid: String): RemoteDocumentResult {
+        val doc = serverCollectorSubmissions[uid]
+        return if (doc != null) {
+            RemoteDocumentResult.Found(data = doc, isFromCache = false)
+        } else {
+            RemoteDocumentResult.NotFound(isFromCache = false)
+        }
+    }
+
+    override suspend fun executeCollectorInitialSubmissionBatch(
+        uid: String,
+        submissionData: Map<String, Any?>,
+        historyData: Map<String, Any?>,
+        attemptId: String,
+        userUpdateFields: Map<String, Any?>
+    ) {
+        serverCollectorSubmissions[uid] = submissionData
+        val historyList = serverCollectorHistory.getOrPut(uid) { mutableListOf() }
+        historyList.add(historyData)
+        updateUserDocument(uid, userUpdateFields)
+    }
+
+    override suspend fun executeCollectorResubmissionBatch(
+        uid: String,
+        submissionUpdateData: Map<String, Any?>,
+        historyData: Map<String, Any?>,
+        attemptId: String,
+        userUpdateFields: Map<String, Any?>
+    ) {
+        serverCollectorSubmissions[uid] = submissionUpdateData
+        val historyList = serverCollectorHistory.getOrPut(uid) { mutableListOf() }
+        historyList.add(historyData)
+        updateUserDocument(uid, userUpdateFields)
+    }
+
+    override suspend fun executeAdminCollectorApprovalBatch(
+        uid: String,
+        attemptId: String,
+        historyData: Map<String, Any?>,
+        submissionUpdateData: Map<String, Any?>,
+        userUpdateFields: Map<String, Any?>
+    ) {
+        serverCollectorSubmissions[uid] = submissionUpdateData
+        val historyList = serverCollectorHistory.getOrPut(uid) { mutableListOf() }
+        historyList.add(historyData)
+        updateUserDocument(uid, userUpdateFields)
+    }
+
+    override suspend fun executeAdminCollectorRejectionBatch(
+        uid: String,
+        attemptId: String,
+        historyData: Map<String, Any?>,
+        submissionUpdateData: Map<String, Any?>,
+        userUpdateFields: Map<String, Any?>
+    ) {
+        serverCollectorSubmissions[uid] = submissionUpdateData
+        val historyList = serverCollectorHistory.getOrPut(uid) { mutableListOf() }
+        historyList.add(historyData)
+        updateUserDocument(uid, userUpdateFields)
+    }
+
     override fun simulateNextProfileWriteFailureOnce(failure: Throwable) {
         nextWriteUserError = failure
     }

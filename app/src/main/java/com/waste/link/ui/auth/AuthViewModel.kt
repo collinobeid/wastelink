@@ -5,6 +5,10 @@ import androidx.lifecycle.viewModelScope
 import com.waste.link.data.repository.AuthRepository
 import com.waste.link.domain.model.AccountStatus
 import com.waste.link.domain.model.AuthError
+import com.waste.link.domain.model.CollectorSubmission
+import com.waste.link.domain.model.CollectorSubmissionInput
+import com.waste.link.domain.model.CollectorSubmissionOutcome
+import com.waste.link.domain.model.CollectorVerificationStatus
 import com.waste.link.domain.model.EmailVerificationOutcome
 import com.waste.link.domain.model.FieldValidationFailure
 import com.waste.link.domain.model.LoginOutcome
@@ -100,6 +104,8 @@ sealed interface AuthNavigationEvent {
         val role: UserRole
     ) : AuthNavigationEvent
 
+    data object NavigateToCollectorVerificationStatus : AuthNavigationEvent
+
     data class NavigateToDestination(
         val route: String,
         val clearBackStack: Boolean = true
@@ -107,7 +113,7 @@ sealed interface AuthNavigationEvent {
 }
 
 /**
- * Canonical, immutable UI state for all Module 1 Stage 4 authentication workflows.
+ * Canonical, immutable UI state for all Module 1 authentication and onboarding workflows.
  *
  * Security Invariant:
  * - Raw passwords are NEVER stored in [AuthUiState], [RegistrationDraft], logs, or navigation events.
@@ -171,9 +177,31 @@ data class AuthUiState(
     // Forgot Password Dialog State
     val passwordReset: PasswordResetUiState = PasswordResetUiState(),
 
-    // Onboarding Compatibility State
+    // Resident Onboarding State
+    val residentSelectedZone: String = "zone_kinondoni",
+    val residentZoneError: String? = null,
+    val residentAddress: String = "",
     val isCompletingOnboarding: Boolean = false,
-    val onboardingError: String? = null
+    val onboardingError: String? = null,
+    val residentOnboardingBanner: AuthBannerMessage? = null,
+
+    // Collector Onboarding & KYC State
+    val collectorVehicleType: String = "Compactor Truck",
+    val collectorVehicleTypeError: String? = null,
+    val collectorPlateNumber: String = "",
+    val collectorPlateNumberError: String? = null,
+    val collectorLicenseNumber: String = "",
+    val collectorLicenseNumberError: String? = null,
+    val collectorServiceZoneId: String = "zone_kinondoni",
+    val collectorServiceZoneError: String? = null,
+    val isCollectorReviewStep: Boolean = false,
+    val isSubmittingCollectorOnboarding: Boolean = false,
+    val collectorOnboardingBanner: AuthBannerMessage? = null,
+
+    // Collector Verification Status State
+    val collectorSubmission: CollectorSubmission? = null,
+    val isLoadingCollectorSubmission: Boolean = false,
+    val collectorStatusBanner: AuthBannerMessage? = null
 ) {
     val isAdmin: Boolean
         get() = currentUser?.role == UserRole.ADMIN && hasAdminClaim
@@ -398,7 +426,34 @@ class AuthViewModel @Inject constructor(
             return
         }
 
-        if (user.role != UserRole.ADMIN && user.onboardingStatus != OnboardingStatus.COMPLETED) {
+        if (user.role == UserRole.COLLECTOR) {
+            when (user.collectorVerificationStatus) {
+                CollectorVerificationStatus.NOT_SUBMITTED -> {
+                    emitNavigation(AuthNavigationEvent.NavigateToOnboarding(user.role))
+                    return
+                }
+                CollectorVerificationStatus.PENDING_REVIEW,
+                CollectorVerificationStatus.REJECTED -> {
+                    emitNavigation(AuthNavigationEvent.NavigateToCollectorVerificationStatus)
+                    return
+                }
+                CollectorVerificationStatus.APPROVED -> {
+                    emitNavigation(
+                        AuthNavigationEvent.NavigateToDestination(
+                            route = Destinations.COLLECTOR_DASHBOARD,
+                            clearBackStack = true
+                        )
+                    )
+                    return
+                }
+                else -> {
+                    emitNavigation(AuthNavigationEvent.NavigateToOnboarding(user.role))
+                    return
+                }
+            }
+        }
+
+        if (user.role == UserRole.RESIDENT && user.onboardingStatus != OnboardingStatus.COMPLETED) {
             emitNavigation(AuthNavigationEvent.NavigateToOnboarding(user.role))
             return
         }
@@ -1496,40 +1551,56 @@ class AuthViewModel @Inject constructor(
     }
 
     // =========================================================================
-    // 7. Onboarding Compatibility (Stage 4 Role-Aware Entry)
+    // 7. Role-Specific Onboarding & Collector Verification Workflows (Stage 5)
     // =========================================================================
 
-    fun completeStage4Onboarding(defaultZoneId: String? = null) {
+    // --- Resident Onboarding ---
+
+    fun onResidentZoneChanged(zone: String) {
+        val validation = AuthValidator.validateServiceZoneId(zone)
+        _uiState.update {
+            it.copy(
+                residentSelectedZone = zone,
+                residentZoneError = validation.errorMessageOrNull(),
+                onboardingError = null
+            )
+        }
+    }
+
+    fun onResidentAddressChanged(address: String) {
+        _uiState.update {
+            it.copy(
+                residentAddress = address,
+                onboardingError = null
+            )
+        }
+    }
+
+    fun completeResidentOnboarding(defaultZoneId: String? = _uiState.value.residentSelectedZone) {
         val currentState = _uiState.value
         if (currentState.isCompletingOnboarding) return
 
-        val user = currentState.currentUser ?: authRepository.getCurrentUser()
-        if (user == null) {
-            emitNavigation(AuthNavigationEvent.NavigateToLogin(clearBackStack = true))
-            return
-        }
-
-        if (user.role == UserRole.COLLECTOR) {
-            // Stage 5 implements the Collector KYC & vehicle submission form;
-            // in Stage 4, Collector onboarding compatibility routes cleanly to Collector Dashboard.
-            emitNavigation(
-                AuthNavigationEvent.NavigateToDestination(
-                    route = Destinations.COLLECTOR_DASHBOARD,
-                    clearBackStack = true
+        val zoneToValidate = defaultZoneId ?: currentState.residentSelectedZone
+        val zoneValidation = AuthValidator.validateServiceZoneId(zoneToValidate)
+        if (zoneValidation.isInvalid) {
+            _uiState.update {
+                it.copy(
+                    residentZoneError = zoneValidation.errorMessageOrNull()
                 )
-            )
+            }
             return
         }
 
         _uiState.update {
             it.copy(
                 isCompletingOnboarding = true,
+                residentZoneError = null,
                 onboardingError = null
             )
         }
 
         viewModelScope.launch {
-            when (val outcome = authRepository.completeResidentOnboarding(defaultZoneId)) {
+            when (val outcome = authRepository.completeResidentOnboarding(zoneToValidate)) {
                 is ProfileUpdateOutcome.Success -> {
                     _uiState.update {
                         it.copy(
@@ -1554,6 +1625,286 @@ class AuthViewModel @Inject constructor(
                     }
                 }
             }
+        }
+    }
+
+    fun completeStage4Onboarding(defaultZoneId: String? = null) {
+        completeResidentOnboarding(defaultZoneId ?: _uiState.value.residentSelectedZone)
+    }
+
+    // --- Collector Onboarding KYC & Application Submission ---
+
+    fun onCollectorVehicleTypeChanged(type: String) {
+        val validation = AuthValidator.validateVehicleType(type)
+        _uiState.update {
+            it.copy(
+                collectorVehicleType = type,
+                collectorVehicleTypeError = validation.errorMessageOrNull(),
+                collectorOnboardingBanner = null
+            )
+        }
+    }
+
+    fun onCollectorPlateNumberChanged(plate: String) {
+        val inlineError = if (plate.isNotBlank()) {
+            AuthValidator.validateVehiclePlateNumber(plate).errorMessageOrNull()
+        } else null
+        _uiState.update {
+            it.copy(
+                collectorPlateNumber = plate,
+                collectorPlateNumberError = inlineError,
+                collectorOnboardingBanner = null
+            )
+        }
+    }
+
+    fun onCollectorLicenseNumberChanged(license: String) {
+        val inlineError = if (license.isNotBlank()) {
+            AuthValidator.validateLicenseNumber(license).errorMessageOrNull()
+        } else null
+        _uiState.update {
+            it.copy(
+                collectorLicenseNumber = license,
+                collectorLicenseNumberError = inlineError,
+                collectorOnboardingBanner = null
+            )
+        }
+    }
+
+    fun onCollectorServiceZoneChanged(zone: String) {
+        val validation = AuthValidator.validateServiceZoneId(zone)
+        _uiState.update {
+            it.copy(
+                collectorServiceZoneId = zone,
+                collectorServiceZoneError = validation.errorMessageOrNull(),
+                collectorOnboardingBanner = null
+            )
+        }
+    }
+
+    fun onCollectorReviewToggled(inReview: Boolean) {
+        if (inReview) {
+            val currentState = _uiState.value
+            val vTypeValidation = AuthValidator.validateVehicleType(currentState.collectorVehicleType)
+            val plateValidation = AuthValidator.validateVehiclePlateNumber(currentState.collectorPlateNumber)
+            val licValidation = AuthValidator.validateLicenseNumber(currentState.collectorLicenseNumber)
+            val zoneValidation = AuthValidator.validateServiceZoneId(currentState.collectorServiceZoneId)
+
+            if (vTypeValidation.isInvalid || plateValidation.isInvalid || licValidation.isInvalid || zoneValidation.isInvalid) {
+                _uiState.update {
+                    it.copy(
+                        collectorVehicleTypeError = vTypeValidation.errorMessageOrNull(),
+                        collectorPlateNumberError = plateValidation.errorMessageOrNull(),
+                        collectorLicenseNumberError = licValidation.errorMessageOrNull(),
+                        collectorServiceZoneError = zoneValidation.errorMessageOrNull(),
+                        isCollectorReviewStep = false
+                    )
+                }
+                return
+            }
+        }
+        _uiState.update {
+            it.copy(
+                isCollectorReviewStep = inReview,
+                collectorOnboardingBanner = null
+            )
+        }
+    }
+
+    fun submitCollectorOnboarding() {
+        val currentState = _uiState.value
+        if (currentState.isSubmittingCollectorOnboarding) return
+
+        val vTypeValidation = AuthValidator.validateVehicleType(currentState.collectorVehicleType)
+        val plateValidation = AuthValidator.validateVehiclePlateNumber(currentState.collectorPlateNumber)
+        val licValidation = AuthValidator.validateLicenseNumber(currentState.collectorLicenseNumber)
+        val zoneValidation = AuthValidator.validateServiceZoneId(currentState.collectorServiceZoneId)
+
+        if (vTypeValidation.isInvalid || plateValidation.isInvalid || licValidation.isInvalid || zoneValidation.isInvalid) {
+            _uiState.update {
+                it.copy(
+                    collectorVehicleTypeError = vTypeValidation.errorMessageOrNull(),
+                    collectorPlateNumberError = plateValidation.errorMessageOrNull(),
+                    collectorLicenseNumberError = licValidation.errorMessageOrNull(),
+                    collectorServiceZoneError = zoneValidation.errorMessageOrNull(),
+                    isCollectorReviewStep = false
+                )
+            }
+            return
+        }
+
+        val input = CollectorSubmissionInput(
+            vehicleType = vTypeValidation.getOrNull()!!,
+            vehiclePlateNumber = plateValidation.getOrNull()!!,
+            licenseNumber = licValidation.getOrNull()!!,
+            serviceZoneId = zoneValidation.getOrNull()!!
+        )
+
+        _uiState.update {
+            it.copy(
+                isSubmittingCollectorOnboarding = true,
+                collectorOnboardingBanner = null
+            )
+        }
+
+        viewModelScope.launch {
+            when (val outcome = authRepository.submitCollectorOnboarding(input)) {
+                is CollectorSubmissionOutcome.Success -> {
+                    _uiState.update {
+                        it.copy(
+                            isSubmittingCollectorOnboarding = false,
+                            collectorSubmission = outcome.submission,
+                            currentUser = outcome.updatedUser,
+                            collectorOnboardingBanner = null
+                        )
+                    }
+                    emitNavigation(AuthNavigationEvent.NavigateToCollectorVerificationStatus)
+                }
+                is CollectorSubmissionOutcome.Failure -> {
+                    _uiState.update {
+                        it.copy(
+                            isSubmittingCollectorOnboarding = false,
+                            collectorOnboardingBanner = AuthBannerMessage(
+                                type = AuthBannerType.ERROR,
+                                title = "Submission Failed",
+                                message = outcome.error.message,
+                                isRetryable = outcome.error is AuthError.NetworkFailure
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun resubmitCollectorOnboarding() {
+        val currentState = _uiState.value
+        if (currentState.isSubmittingCollectorOnboarding) return
+
+        val vTypeValidation = AuthValidator.validateVehicleType(currentState.collectorVehicleType)
+        val plateValidation = AuthValidator.validateVehiclePlateNumber(currentState.collectorPlateNumber)
+        val licValidation = AuthValidator.validateLicenseNumber(currentState.collectorLicenseNumber)
+        val zoneValidation = AuthValidator.validateServiceZoneId(currentState.collectorServiceZoneId)
+
+        if (vTypeValidation.isInvalid || plateValidation.isInvalid || licValidation.isInvalid || zoneValidation.isInvalid) {
+            _uiState.update {
+                it.copy(
+                    collectorVehicleTypeError = vTypeValidation.errorMessageOrNull(),
+                    collectorPlateNumberError = plateValidation.errorMessageOrNull(),
+                    collectorLicenseNumberError = licValidation.errorMessageOrNull(),
+                    collectorServiceZoneError = zoneValidation.errorMessageOrNull(),
+                    isCollectorReviewStep = false
+                )
+            }
+            return
+        }
+
+        val input = CollectorSubmissionInput(
+            vehicleType = vTypeValidation.getOrNull()!!,
+            vehiclePlateNumber = plateValidation.getOrNull()!!,
+            licenseNumber = licValidation.getOrNull()!!,
+            serviceZoneId = zoneValidation.getOrNull()!!
+        )
+
+        _uiState.update {
+            it.copy(
+                isSubmittingCollectorOnboarding = true,
+                collectorOnboardingBanner = null
+            )
+        }
+
+        viewModelScope.launch {
+            when (val outcome = authRepository.resubmitCollectorOnboarding(input)) {
+                is CollectorSubmissionOutcome.Success -> {
+                    _uiState.update {
+                        it.copy(
+                            isSubmittingCollectorOnboarding = false,
+                            collectorSubmission = outcome.submission,
+                            currentUser = outcome.updatedUser,
+                            collectorOnboardingBanner = null
+                        )
+                    }
+                    emitNavigation(AuthNavigationEvent.NavigateToCollectorVerificationStatus)
+                }
+                is CollectorSubmissionOutcome.Failure -> {
+                    _uiState.update {
+                        it.copy(
+                            isSubmittingCollectorOnboarding = false,
+                            collectorOnboardingBanner = AuthBannerMessage(
+                                type = AuthBannerType.ERROR,
+                                title = "Resubmission Failed",
+                                message = outcome.error.message,
+                                isRetryable = outcome.error is AuthError.NetworkFailure
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Collector Verification Status Screen ---
+
+    fun loadCollectorSubmission() {
+        val uid = _uiState.value.currentUser?.id ?: authRepository.getCurrentUser()?.id ?: return
+        _uiState.update { it.copy(isLoadingCollectorSubmission = true) }
+        viewModelScope.launch {
+            val submission = authRepository.getCollectorSubmission(uid).getOrNull()
+            _uiState.update {
+                it.copy(
+                    isLoadingCollectorSubmission = false,
+                    collectorSubmission = submission
+                )
+            }
+        }
+    }
+
+    fun refreshCollectorVerificationStatus() {
+        if (_uiState.value.isLoadingCollectorSubmission) return
+        _uiState.update { it.copy(isLoadingCollectorSubmission = true) }
+        viewModelScope.launch {
+            authRepository.restoreSession()
+            val user = authRepository.getCurrentUser()
+            val submission = user?.let { authRepository.getCollectorSubmission(it.id).getOrNull() }
+            _uiState.update {
+                it.copy(
+                    isLoadingCollectorSubmission = false,
+                    currentUser = user ?: it.currentUser,
+                    collectorSubmission = submission ?: it.collectorSubmission
+                )
+            }
+            if (user?.collectorVerificationStatus == CollectorVerificationStatus.APPROVED) {
+                emitNavigation(
+                    AuthNavigationEvent.NavigateToDestination(
+                        route = Destinations.COLLECTOR_DASHBOARD,
+                        clearBackStack = true
+                    )
+                )
+            }
+        }
+    }
+
+    fun startCollectorEditAndResubmit() {
+        val currentSub = _uiState.value.collectorSubmission
+        val currentUser = _uiState.value.currentUser
+        viewModelScope.launch {
+            val sub = currentSub ?: currentUser?.let { authRepository.getCollectorSubmission(it.id).getOrNull() }
+            _uiState.update {
+                it.copy(
+                    collectorSubmission = sub ?: it.collectorSubmission,
+                    collectorVehicleType = sub?.vehicleType ?: currentUser?.vehicleType ?: "Compactor Truck",
+                    collectorPlateNumber = sub?.vehiclePlateNumber ?: currentUser?.vehiclePlateNumber ?: "",
+                    collectorLicenseNumber = sub?.licenseNumber ?: it.collectorLicenseNumber.ifBlank { "DL-11112222" },
+                    collectorServiceZoneId = sub?.serviceZoneId ?: currentUser?.defaultZoneId ?: "zone_kinondoni",
+                    collectorVehicleTypeError = null,
+                    collectorPlateNumberError = null,
+                    collectorLicenseNumberError = null,
+                    collectorServiceZoneError = null,
+                    isCollectorReviewStep = false,
+                    collectorOnboardingBanner = null
+                )
+            }
+            emitNavigation(AuthNavigationEvent.NavigateToOnboarding(UserRole.COLLECTOR))
         }
     }
 

@@ -96,6 +96,40 @@ interface AuthRemoteDataSource {
 
     suspend fun updateUserDocument(uid: String, fields: Map<String, Any?>)
 
+    suspend fun fetchCollectorSubmission(uid: String): RemoteDocumentResult
+
+    suspend fun executeCollectorInitialSubmissionBatch(
+        uid: String,
+        submissionData: Map<String, Any?>,
+        historyData: Map<String, Any?>,
+        attemptId: String,
+        userUpdateFields: Map<String, Any?>
+    )
+
+    suspend fun executeCollectorResubmissionBatch(
+        uid: String,
+        submissionUpdateData: Map<String, Any?>,
+        historyData: Map<String, Any?>,
+        attemptId: String,
+        userUpdateFields: Map<String, Any?>
+    )
+
+    suspend fun executeAdminCollectorApprovalBatch(
+        uid: String,
+        attemptId: String,
+        historyData: Map<String, Any?>,
+        submissionUpdateData: Map<String, Any?>,
+        userUpdateFields: Map<String, Any?>
+    )
+
+    suspend fun executeAdminCollectorRejectionBatch(
+        uid: String,
+        attemptId: String,
+        historyData: Map<String, Any?>,
+        submissionUpdateData: Map<String, Any?>,
+        userUpdateFields: Map<String, Any?>
+    )
+
     /**
      * Controlled integration-test hook to simulate a one-shot failure on the next
      * [writeUserDocument] call after `createAuthUser` succeeds.

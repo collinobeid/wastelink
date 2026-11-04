@@ -296,4 +296,95 @@ class AuthValidatorTest {
         assertEquals(4, fullReport.score)
         assertFalse(fullReport.toString().contains("WasteLink2026"))
     }
+
+    // =========================================================================
+    // 8. Collector Onboarding KYC Validators (Stage 5)
+    // =========================================================================
+
+    @Test
+    fun `validateVehicleType accepts standard types and validates length bounds`() {
+        // Valid
+        val standard = AuthValidator.validateVehicleType("Compactor Truck")
+        assertTrue(standard.isValid)
+        assertEquals("Compactor Truck", standard.getOrNull())
+
+        val custom = AuthValidator.validateVehicleType("  Electric Waste Cart  ")
+        assertTrue(custom.isValid)
+        assertEquals("Electric Waste Cart", custom.getOrNull())
+
+        // Invalid: blank / null
+        assertEquals(ValidationError.REQUIRED_FIELD, AuthValidator.validateVehicleType(null).errorOrNull())
+        assertEquals(ValidationError.REQUIRED_FIELD, AuthValidator.validateVehicleType("   ").errorOrNull())
+
+        // Invalid: too short (< 2 chars)
+        assertEquals(ValidationError.VEHICLE_TYPE_INVALID, AuthValidator.validateVehicleType("A").errorOrNull())
+
+        // Invalid: too long (> 40 chars)
+        val tooLong = "A".repeat(41)
+        assertEquals(ValidationError.VEHICLE_TYPE_INVALID, AuthValidator.validateVehicleType(tooLong).errorOrNull())
+    }
+
+    @Test
+    fun `validateVehiclePlateNumber normalizes plates and validates syntax and length`() {
+        // Valid: Tanzania standard format
+        val result1 = AuthValidator.validateVehiclePlateNumber("  t 123 abc ")
+        assertTrue(result1.isValid)
+        assertEquals("T 123 ABC", result1.getOrNull())
+
+        val result2 = AuthValidator.validateVehiclePlateNumber("TZ-999-XYZ")
+        assertTrue(result2.isValid)
+        assertEquals("TZ-999-XYZ", result2.getOrNull())
+
+        // Invalid: blank / null
+        assertEquals(ValidationError.REQUIRED_FIELD, AuthValidator.validateVehiclePlateNumber(null).errorOrNull())
+        assertEquals(ValidationError.REQUIRED_FIELD, AuthValidator.validateVehiclePlateNumber("   ").errorOrNull())
+
+        // Invalid: too short (< 3 chars)
+        assertEquals(ValidationError.VEHICLE_PLATE_INVALID, AuthValidator.validateVehiclePlateNumber("T1").errorOrNull())
+
+        // Invalid: too long (> 20 chars)
+        assertEquals(ValidationError.VEHICLE_PLATE_INVALID, AuthValidator.validateVehiclePlateNumber("T".repeat(21)).errorOrNull())
+
+        // Invalid characters (e.g. symbols like @, #, $, %)
+        assertEquals(ValidationError.VEHICLE_PLATE_INVALID, AuthValidator.validateVehiclePlateNumber("T@123#XYZ").errorOrNull())
+    }
+
+    @Test
+    fun `validateLicenseNumber validates length and characters`() {
+        // Valid
+        val result = AuthValidator.validateLicenseNumber("  DL-12345678  ")
+        assertTrue(result.isValid)
+        assertEquals("DL-12345678", result.getOrNull())
+
+        // Invalid: blank / null
+        assertEquals(ValidationError.REQUIRED_FIELD, AuthValidator.validateLicenseNumber(null).errorOrNull())
+        assertEquals(ValidationError.REQUIRED_FIELD, AuthValidator.validateLicenseNumber("   ").errorOrNull())
+
+        // Invalid: too short (< 4 chars)
+        assertEquals(ValidationError.LICENSE_NUMBER_INVALID, AuthValidator.validateLicenseNumber("ABC").errorOrNull())
+
+        // Invalid: too long (> 40 chars)
+        assertEquals(ValidationError.LICENSE_NUMBER_INVALID, AuthValidator.validateLicenseNumber("A".repeat(41)).errorOrNull())
+
+        // Invalid characters
+        assertEquals(ValidationError.LICENSE_NUMBER_INVALID, AuthValidator.validateLicenseNumber("DL*1234?").errorOrNull())
+    }
+
+    @Test
+    fun `validateServiceZoneId accepts valid catalog zones and rejects unknown or blank`() {
+        // Valid catalog zones
+        assertTrue(AuthValidator.validateServiceZoneId("zone_kinondoni").isValid)
+        assertTrue(AuthValidator.validateServiceZoneId("zone_ilala").isValid)
+        assertTrue(AuthValidator.validateServiceZoneId("zone_temeke").isValid)
+        assertTrue(AuthValidator.validateServiceZoneId("zone_ubungo").isValid)
+        assertTrue(AuthValidator.validateServiceZoneId("zone_kigamboni").isValid)
+
+        // Invalid: null / blank
+        assertEquals(ValidationError.REQUIRED_FIELD, AuthValidator.validateServiceZoneId(null).errorOrNull())
+        assertEquals(ValidationError.REQUIRED_FIELD, AuthValidator.validateServiceZoneId("").errorOrNull())
+
+        // Invalid: unknown zone
+        assertEquals(ValidationError.SERVICE_ZONE_INVALID, AuthValidator.validateServiceZoneId("zone_atlantis").errorOrNull())
+        assertEquals(ValidationError.SERVICE_ZONE_INVALID, AuthValidator.validateServiceZoneId("invalid_format").errorOrNull())
+    }
 }
