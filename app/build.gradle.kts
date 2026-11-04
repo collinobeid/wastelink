@@ -46,6 +46,10 @@ kotlin {
     }
 }
 
+hilt {
+    enableAggregatingTask = false
+}
+
 dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.core.ktx)
@@ -71,6 +75,7 @@ dependencies {
     // Hilt
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
+    annotationProcessor("org.jetbrains.kotlinx:kotlinx-metadata-jvm:0.9.0")
     implementation(libs.hilt.navigation.compose)
     implementation(libs.hilt.work)
     ksp(libs.hilt.compiler.android)

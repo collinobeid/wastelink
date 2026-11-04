@@ -55,7 +55,7 @@ private val DarkColorScheme = darkColorScheme(
 
 @Composable
 fun WasteLinkTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
+    darkTheme: Boolean = true, // Default to true to prevent black-on-black text contrast bugs on light-mode devices
     dynamicColor: Boolean = false, // Disabled for explicit brand colors
     content: @Composable () -> Unit
 ) {

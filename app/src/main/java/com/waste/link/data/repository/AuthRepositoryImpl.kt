@@ -21,22 +21,9 @@ class AuthRepositoryImpl @Inject constructor(
             val result = auth.createUserWithEmailAndPassword(email, password).await()
             val uid = result.user?.uid ?: throw Exception("User creation failed")
 
-            // Genesis Protocol & Admin Override
-            val countSnapshot = firestore.collection("users").limit(1).get().await()
-            val isGenesisUser = countSnapshot.isEmpty
-            val isAdminEmail = email.lowercase() == "collinobeid@gmail.com"
-
-            val role = if (isGenesisUser || isAdminEmail) {
-                "admin"
-            } else {
-                "unassigned"
-            }
-
-            val status = if (role == "admin") {
-                "ACTIVE"
-            } else {
-                "UNVERIFIED"
-            }
+            // Standard registration default role (Admin cannot be self-assigned from client)
+            val role = "unassigned"
+            val status = "UNVERIFIED"
 
             val appUser = AppUser(
                 uid = uid,
@@ -56,9 +43,12 @@ class AuthRepositoryImpl @Inject constructor(
 
     override suspend fun setRole(uid: String, role: String): Result<AppUser> {
         return try {
+            if (role != "resident" && role != "collector") {
+                throw IllegalArgumentException("Invalid client role: $role. Admin role cannot be self-assigned.")
+            }
             val document = firestore.collection("users").document(uid).get().await()
             val user = document.toObject(AppUser::class.java) ?: throw Exception("User not found")
-            val updatedUser = user.copy(role = role, status = if (role == "admin") "ACTIVE" else "UNVERIFIED")
+            val updatedUser = user.copy(role = role, status = "ACTIVE")
             firestore.collection("users").document(uid).set(updatedUser).await()
             Result.success(updatedUser)
         } catch (e: Exception) {
@@ -71,31 +61,21 @@ class AuthRepositoryImpl @Inject constructor(
             val result = auth.signInWithEmailAndPassword(email, password).await()
             val uid = result.user?.uid ?: throw Exception("Sign in failed")
             val roleResult = getUserRole(uid)
-            val isAdminEmail = email.lowercase() == "collinobeid@gmail.com"
             
             if (roleResult.isFailure) {
-                // Auto-create missing document for any legacy account
-                val defaultRole = if (isAdminEmail) "admin" else "resident"
+                // Auto-create fallback document if missing
                 val appUser = AppUser(
                     uid = uid,
-                    name = if (isAdminEmail) "Collin Obeid" else "Legacy User",
+                    name = "User",
                     email = email,
                     phone = "Not provided",
-                    role = defaultRole,
-                    status = "ACTIVE" // Auto-active for legacy
+                    role = "resident",
+                    status = "ACTIVE"
                 )
                 firestore.collection("users").document(uid).set(appUser).await()
                 Result.success(appUser)
             } else {
-                val existingUser = roleResult.getOrThrow()
-                if (isAdminEmail && existingUser.role != "admin") {
-                    // Force upgrade to admin if it's the admin email but they aren't admin in Firestore
-                    val upgradedUser = existingUser.copy(role = "admin", status = "ACTIVE")
-                    firestore.collection("users").document(uid).set(upgradedUser).await()
-                    Result.success(upgradedUser)
-                } else {
-                    roleResult
-                }
+                roleResult
             }
         } catch (e: Exception) {
             Result.failure(e)

@@ -19,10 +19,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.WasteLink">
 
-        <meta-data
-            android:name="com.google.android.geo.API_KEY"
-            android:value="AIzaSyBfHpvoWipBfhN6on4NBgDZUM1vOCab1hI" />
-
         <activity
             android:name=".MainActivity"
             android:exported="true"

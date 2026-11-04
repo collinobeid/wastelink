@@ -93,13 +93,4 @@ class AuthViewModel @Inject constructor(
             _authState.value = AuthState.Idle
         }
     }
-
-    fun wipeDatabase() {
-        viewModelScope.launch {
-            val db = com.google.firebase.firestore.FirebaseFirestore.getInstance()
-            com.waste.link.utils.DatabaseWipeUtility.wipeDatabase(db)
-            authRepository.signOut()
-            _authState.value = AuthState.Idle
-        }
-    }
 }

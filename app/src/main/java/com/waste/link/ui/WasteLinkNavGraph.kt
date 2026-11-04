@@ -96,9 +96,6 @@ fun WasteLinkNavGraph(
                 onLoginClick = { email, password ->
                     authViewModel.signIn(email, password)
                 },
-                onWipeDbClick = {
-                    authViewModel.wipeDatabase()
-                },
                 onForgotPasswordClick = { email ->
                     if (email.isBlank()) {
                         android.widget.Toast.makeText(context, "Please enter your email first", android.widget.Toast.LENGTH_SHORT).show()

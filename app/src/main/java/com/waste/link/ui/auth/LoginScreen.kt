@@ -23,7 +23,6 @@ import com.waste.link.ui.theme.*
 fun LoginScreen(
     onNavigateToRegister: () -> Unit,
     onLoginClick: (String, String) -> Unit,
-    onWipeDbClick: () -> Unit = {},
     onForgotPasswordClick: (String) -> Unit = {},
     authState: AuthState
 ) {
@@ -164,11 +163,6 @@ fun LoginScreen(
                 ) {
                     Text("Google", color = Color.White)
                 }
-            }
-            
-            Spacer(modifier = Modifier.height(24.dp))
-            TextButton(onClick = onWipeDbClick) {
-                Text("WIPE DATABASE (DEV ONLY)", color = Color.Red.copy(alpha = 0.9f), fontSize = 12.sp)
             }
         }
     }
