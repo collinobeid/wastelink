@@ -21,6 +21,9 @@ import com.waste.link.domain.model.RegistrationOutcome
 import com.waste.link.domain.model.SessionState
 import com.waste.link.domain.model.UserRole
 import com.waste.link.domain.validation.AuthValidator
+import com.waste.link.ui.Destinations
+import com.waste.link.ui.navigation.NavigationDestinationDecision
+import com.waste.link.ui.navigation.SessionNavigationResolver
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -999,6 +1002,104 @@ class AuthRepositoryImplTest {
         assertTrue(createdAt > 0L)
         assertTrue(updatedAt >= createdAt)
     }
+
+    // =========================================================================
+    // Scenario 25: Removing admin custom claim invalidates admin access on refresh
+    // =========================================================================
+    @Test
+    fun `25 - Removing admin custom claim invalidates admin access after token refresh`() = runBlocking {
+        val adminUid = "admin-uid-101"
+        val adminEmail = "admin@wastelink.co.tz"
+
+        // 1. Initial State: Valid administrator account with verified custom claim
+        fakeRemote.seedAuthAccount(
+            uid = adminUid,
+            email = adminEmail,
+            password = "AdminSecretPass!",
+            isEmailVerified = true,
+            hasAdminClaim = true
+        )
+        fakeRemote.seedCanonicalAdminProfile(adminUid, adminEmail)
+        fakeRemote.setActiveSession(adminUid)
+
+        val initialSession = repository.restoreSession()
+        assertTrue("Expected Authenticated with hasAdminClaim = true", initialSession is SessionState.Authenticated)
+        val authSession = initialSession as SessionState.Authenticated
+        assertTrue(authSession.hasAdminClaim)
+        assertEquals(UserRole.ADMIN, authSession.user.role)
+
+        // SessionNavigationResolver grants AdminConsole
+        val initialDecision = SessionNavigationResolver.resolve(initialSession)
+        assertEquals(Destinations.ADMIN_SHELL, initialDecision.route)
+        assertTrue(initialDecision is NavigationDestinationDecision.AdminConsole)
+
+        // 2. Server revokes / removes the administrator custom claim
+        fakeRemote.setAdminClaim(adminUid, false)
+
+        // 3. Token is refreshed / session is restored
+        val refreshedSession = repository.restoreSession()
+
+        // 4. Verification: Session is invalidated to AuthenticatedProfileLoadError(UnauthorizedAdminClaim)
+        assertTrue("Refreshed session must reject admin without claim", refreshedSession is SessionState.AuthenticatedProfileLoadError)
+        val loadError = refreshedSession as SessionState.AuthenticatedProfileLoadError
+        assertTrue("Error must be UnauthorizedAdminClaim", loadError.error is AuthError.UnauthorizedAdminClaim)
+
+        // 5. Verification: Resolver routes away from AdminConsole to Login/SafeRecovery
+        val refreshedDecision = SessionNavigationResolver.resolve(refreshedSession)
+        assertFalse("Must never allow AdminConsole after claim removal", refreshedDecision is NavigationDestinationDecision.AdminConsole)
+        assertEquals(Destinations.LOGIN, refreshedDecision.route)
+    }
+
+    // =========================================================================
+    // Scenario 26: Suspending active authenticated user is immediately enforced
+    // =========================================================================
+    @Test
+    fun `26 - Suspending active user on server immediately reflects as AuthenticatedRestricted on session restore`() = runBlocking {
+        val userUid = "resident-active-202"
+        val userEmail = "resident202@wastelink.co.tz"
+
+        // 1. Initial State: Active authenticated resident
+        fakeRemote.seedAuthAccount(
+            uid = userUid,
+            email = userEmail,
+            password = "ResidentPass123!",
+            isEmailVerified = true
+        )
+        fakeRemote.seedCanonicalResidentProfile(userUid, userEmail)
+        fakeRemote.setActiveSession(userUid)
+
+        val initialSession = repository.restoreSession()
+        assertTrue(initialSession is SessionState.Authenticated)
+        assertEquals(AccountStatus.ACTIVE, (initialSession as SessionState.Authenticated).user.accountStatus)
+
+        val initialDecision = SessionNavigationResolver.resolve(initialSession)
+        assertEquals(Destinations.RESIDENT_HOME, initialDecision.route)
+
+        // 2. Municipal moderation suspends the user in Firestore
+        val existingDoc = fakeRemote.serverUserDocuments[userUid]!!.toMutableMap()
+        existingDoc["accountStatus"] = "SUSPENDED"
+        existingDoc["status"] = "SUSPENDED"
+        existingDoc["statusReason"] = "Suspended for municipal compliance violation"
+        existingDoc["suspendedUntilEpochMs"] = 1750000000000L
+        fakeRemote.serverUserDocuments[userUid] = existingDoc
+
+        // 3. User session is refreshed / checked
+        val updatedSession = repository.restoreSession()
+
+        // 4. Verification: Immediately mapped to AuthenticatedRestricted with SUSPENDED status
+        assertTrue("Updated session must be AuthenticatedRestricted", updatedSession is SessionState.AuthenticatedRestricted)
+        val restricted = updatedSession as SessionState.AuthenticatedRestricted
+        assertEquals(AccountStatus.SUSPENDED, restricted.accountStatus)
+        assertEquals("Suspended for municipal compliance violation", restricted.statusReason)
+        assertEquals(1750000000000L, restricted.suspendedUntilEpochMs)
+
+        // 5. Verification: Navigation resolver routes immediately to AccountStatusLock
+        val lockDecision = SessionNavigationResolver.resolve(updatedSession)
+        assertTrue("Must route to AccountStatusLock", lockDecision is NavigationDestinationDecision.AccountStatusLock)
+        val lock = lockDecision as NavigationDestinationDecision.AccountStatusLock
+        assertEquals(AccountStatus.SUSPENDED, lock.status)
+        assertEquals(Destinations.ACCOUNT_STATUS_LOCK, lock.route)
+    }
 }
 
 /**
@@ -1081,6 +1182,10 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
         authAccountsByUid[uid]?.isTokenRevoked = revoked
     }
 
+    fun setAdminClaim(uid: String, hasClaim: Boolean) {
+        authAccountsByUid[uid]?.hasAdminClaim = hasClaim
+    }
+
     fun notifyListenersOfCurrentAccountUpdate() {
         val current = currentUser ?: return
         val updated = authAccountsByUid[current.uid]?.toRemoteUser()
@@ -1153,6 +1258,36 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
             "defaultZoneId" to "zone_ilala",
             "vehicleType" to "Compactor Truck",
             "vehiclePlateNumber" to "T 123 WST",
+            "preferredLanguage" to "en",
+            "createdAtEpochMs" to 1730000000000L,
+            "updatedAtEpochMs" to 1730000000000L
+        )
+    }
+
+    fun seedCanonicalAdminProfile(
+        uid: String,
+        email: String
+    ) {
+        serverUserDocuments[uid] = mapOf(
+            "id" to uid,
+            "uid" to uid,
+            "fullName" to "Admin Official",
+            "name" to "Admin Official",
+            "email" to email.lowercase(),
+            "phoneNumber" to "+255700000001",
+            "phone" to "+255700000001",
+            "role" to "admin",
+            "accountStatus" to "ACTIVE",
+            "status" to "ACTIVE",
+            "statusReason" to null,
+            "suspendedUntilEpochMs" to null,
+            "onboardingStatus" to "COMPLETED",
+            "isVerified" to true,
+            "collectorVerificationStatus" to "NOT_APPLICABLE",
+            "collectorRejectionReason" to null,
+            "defaultZoneId" to "zone_kinondoni",
+            "vehicleType" to null,
+            "vehiclePlateNumber" to null,
             "preferredLanguage" to "en",
             "createdAtEpochMs" to 1730000000000L,
             "updatedAtEpochMs" to 1730000000000L
