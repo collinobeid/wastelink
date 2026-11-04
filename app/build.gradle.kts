@@ -96,8 +96,10 @@ dependencies {
     // Auth & Biometric
     implementation(libs.androidx.biometric)
     implementation(libs.play.services.auth)
+    implementation(libs.libphonenumber)
 
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

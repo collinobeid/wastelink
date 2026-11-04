@@ -1,138 +1,270 @@
 package com.waste.link.ui
 
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.runtime.*
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
-import androidx.compose.animation.AnimatedContentTransitionScope
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import com.waste.link.ui.admin.AdminShellScreen
-import com.waste.link.ui.auth.AuthState
+import com.waste.link.ui.auth.AuthNavigationEvent
+import com.waste.link.ui.auth.AuthPrimaryGreen
 import com.waste.link.ui.auth.AuthViewModel
+import com.waste.link.ui.auth.CompleteProfileScreen
 import com.waste.link.ui.auth.LoginScreen
+import com.waste.link.ui.auth.OnboardingScreen
 import com.waste.link.ui.auth.RegisterScreen
+import com.waste.link.ui.auth.VerifyEmailScreen
+import com.waste.link.ui.theme.DarkBackground
+import com.waste.link.ui.theme.DarkMutedForeground
 
 object Destinations {
     const val CHECK_AUTH = "check_auth"
     const val LOGIN = "login"
     const val REGISTER = "register"
+    const val VERIFY_EMAIL = "verify_email"
+    const val COMPLETE_PROFILE = "complete_profile"
+    const val ONBOARDING = "onboarding"
     const val RESIDENT_HOME = "resident_home"
     const val COLLECTOR_DASHBOARD = "collector_dashboard"
     const val ADMIN_SHELL = "admin_shell"
     const val SETTINGS = "settings"
-    const val ONBOARDING = "onboarding"
 }
 
 @Composable
 fun WasteLinkNavGraph(
     modifier: Modifier = Modifier,
-    navController: NavHostController = rememberNavController()
+    navController: NavHostController = rememberNavController(),
+    authViewModel: AuthViewModel = hiltViewModel()
 ) {
-    val authViewModel: AuthViewModel = hiltViewModel()
-    val authState by authViewModel.authState.collectAsState()
+    val uiState by authViewModel.uiState.collectAsState()
 
     LaunchedEffect(Unit) {
-        authViewModel.checkCurrentUser()
+        authViewModel.restoreSessionOnLaunch()
     }
 
-    LaunchedEffect(authState) {
-        when (val state = authState) {
-            is AuthState.Idle -> {
-                if (!authViewModel.isUserSignedIn()) {
-                    if (navController.currentDestination?.route != Destinations.LOGIN && 
-                        navController.currentDestination?.route != Destinations.REGISTER) {
+    LaunchedEffect(navController, authViewModel) {
+        authViewModel.navigationEvents.collect { event ->
+            when (event) {
+                is AuthNavigationEvent.NavigateToLogin -> {
+                    if (!event.prefillEmail.isNullOrBlank()) {
+                        authViewModel.onLoginEmailChanged(event.prefillEmail)
+                    }
+                    if (event.clearBackStack) {
                         navController.navigate(Destinations.LOGIN) {
-                            popUpTo(0) // clear backstack
+                            popUpTo(0) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    } else {
+                        val popped = navController.popBackStack(Destinations.LOGIN, inclusive = false)
+                        if (!popped) {
+                            navController.navigate(Destinations.LOGIN) {
+                                launchSingleTop = true
+                            }
                         }
                     }
                 }
-            }
-            is AuthState.Authenticated -> {
-                val route = when (state.user.role) {
-                    "admin" -> Destinations.RESIDENT_HOME // Admins start as normal users
-                    "collector" -> Destinations.COLLECTOR_DASHBOARD
-                    "unassigned" -> Destinations.ONBOARDING
-                    else -> Destinations.RESIDENT_HOME
+                is AuthNavigationEvent.NavigateToRegister -> {
+                    if (navController.currentDestination?.route != Destinations.REGISTER) {
+                        navController.navigate(Destinations.REGISTER) {
+                            launchSingleTop = true
+                        }
+                    }
                 }
-                navController.navigate(route) {
-                    popUpTo(0) // clear backstack
+                is AuthNavigationEvent.NavigateToVerifyEmail -> {
+                    navController.navigate(Destinations.VERIFY_EMAIL) {
+                        popUpTo(0) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+                is AuthNavigationEvent.NavigateToCompleteProfile -> {
+                    navController.navigate(Destinations.COMPLETE_PROFILE) {
+                        popUpTo(0) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+                is AuthNavigationEvent.NavigateToOnboarding -> {
+                    navController.navigate(Destinations.ONBOARDING) {
+                        popUpTo(0) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+                is AuthNavigationEvent.NavigateToDestination -> {
+                    navController.navigate(event.route) {
+                        if (event.clearBackStack) {
+                            popUpTo(0) { inclusive = true }
+                        }
+                        launchSingleTop = true
+                    }
                 }
             }
-            else -> {}
         }
     }
 
     NavHost(
         navController = navController,
         startDestination = Destinations.CHECK_AUTH,
-        modifier = modifier.then(androidx.compose.ui.Modifier.background(androidx.compose.ui.graphics.Color(0xFF0F1115))),
-        enterTransition = { slideIntoContainer(AnimatedContentTransitionScope.SlideDirection.Left, animationSpec = tween(400)) + fadeIn(animationSpec = tween(400)) },
-        exitTransition = { slideOutOfContainer(AnimatedContentTransitionScope.SlideDirection.Left, animationSpec = tween(400)) + fadeOut(animationSpec = tween(400)) },
-        popEnterTransition = { slideIntoContainer(AnimatedContentTransitionScope.SlideDirection.Right, animationSpec = tween(400)) + fadeIn(animationSpec = tween(400)) },
-        popExitTransition = { slideOutOfContainer(AnimatedContentTransitionScope.SlideDirection.Right, animationSpec = tween(400)) + fadeOut(animationSpec = tween(400)) }
+        modifier = modifier.background(DarkBackground),
+        enterTransition = {
+            slideIntoContainer(
+                AnimatedContentTransitionScope.SlideDirection.Left,
+                animationSpec = tween(320)
+            ) + fadeIn(animationSpec = tween(320))
+        },
+        exitTransition = {
+            slideOutOfContainer(
+                AnimatedContentTransitionScope.SlideDirection.Left,
+                animationSpec = tween(320)
+            ) + fadeOut(animationSpec = tween(320))
+        },
+        popEnterTransition = {
+            slideIntoContainer(
+                AnimatedContentTransitionScope.SlideDirection.Right,
+                animationSpec = tween(320)
+            ) + fadeIn(animationSpec = tween(320))
+        },
+        popExitTransition = {
+            slideOutOfContainer(
+                AnimatedContentTransitionScope.SlideDirection.Right,
+                animationSpec = tween(320)
+            ) + fadeOut(animationSpec = tween(320))
+        }
     ) {
         composable(Destinations.CHECK_AUTH) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(color = androidx.compose.material3.MaterialTheme.colorScheme.primary)
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(DarkBackground),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(
+                        color = AuthPrimaryGreen,
+                        modifier = Modifier.size(36.dp)
+                    )
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Text(
+                        text = "Verifying WasteLink session...",
+                        color = DarkMutedForeground,
+                        fontSize = 13.sp
+                    )
+                }
             }
         }
 
         composable(Destinations.LOGIN) {
-            val context = androidx.compose.ui.platform.LocalContext.current
             LoginScreen(
+                uiState = uiState,
+                onEmailChanged = authViewModel::onLoginEmailChanged,
+                onPasswordEdited = authViewModel::onLoginPasswordEdited,
+                onSignInClick = authViewModel::submitLogin,
+                onForgotPasswordClick = authViewModel::openForgotPasswordDialog,
+                onDismissForgotPassword = authViewModel::dismissForgotPasswordDialog,
+                onPasswordResetEmailChanged = authViewModel::onPasswordResetEmailChanged,
+                onSubmitPasswordReset = authViewModel::submitPasswordReset,
                 onNavigateToRegister = {
-                    navController.navigate("register")
-                },
-                onLoginClick = { email, password ->
-                    authViewModel.signIn(email, password)
-                },
-                onForgotPasswordClick = { email ->
-                    if (email.isBlank()) {
-                        android.widget.Toast.makeText(context, "Please enter your email first", android.widget.Toast.LENGTH_SHORT).show()
-                    } else {
-                        authViewModel.sendPasswordResetEmail(email) { success, error ->
-                            val msg = if (success) "Password reset email sent" else "Error: $error"
-                            android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_LONG).show()
+                    if (navController.currentDestination?.route != Destinations.REGISTER) {
+                        navController.navigate(Destinations.REGISTER) {
+                            launchSingleTop = true
                         }
                     }
                 },
-                authState = authState
+                onRetryProfileLoad = authViewModel::retryProfileLoadAfterLogin,
+                onSignOutLockedAccount = authViewModel::logout
             )
         }
 
         composable(Destinations.REGISTER) {
             RegisterScreen(
-                onNavigateToLogin = { navController.popBackStack() },
-                onRegisterClick = { email, password, name, phone ->
-                    authViewModel.signUp(email, password, name, phone)
+                uiState = uiState,
+                onRoleSelected = authViewModel::onRoleSelected,
+                onFullNameChanged = authViewModel::onRegFullNameChanged,
+                onEmailChanged = authViewModel::onRegEmailChanged,
+                onPhoneChanged = authViewModel::onRegPhoneChanged,
+                onPasswordChanged = authViewModel::onRegPasswordChanged,
+                onConfirmPasswordChanged = authViewModel::onRegConfirmPasswordChanged,
+                onRegisterSubmit = { fullName, email, phone, password, confirmPassword ->
+                    authViewModel.submitRegistration(
+                        rawFullName = fullName,
+                        rawEmail = email,
+                        rawPhone = phone,
+                        rawPassword = password,
+                        rawConfirmPassword = confirmPassword
+                    )
                 },
-                authState = authState
+                onRetryProfileSetup = authViewModel::retrySameSessionProfileInitialization,
+                onAbortRecoverySignOut = authViewModel::logout,
+                onNavigateToLogin = {
+                    val popped = navController.popBackStack(Destinations.LOGIN, inclusive = false)
+                    if (!popped) {
+                        navController.navigate(Destinations.LOGIN) {
+                            launchSingleTop = true
+                        }
+                    }
+                },
+                onNavigateToLoginWithDuplicateEmail = authViewModel::navigateToLoginFromDuplicateEmail
+            )
+        }
+
+        composable(Destinations.VERIFY_EMAIL) {
+            VerifyEmailScreen(
+                uiState = uiState,
+                onRefreshVerificationStatus = authViewModel::refreshEmailVerificationStatus,
+                onResendVerificationEmail = authViewModel::resendVerificationEmail,
+                onContinueAfterVerification = authViewModel::continueFromEmailVerification,
+                onLogoutClick = authViewModel::logout
+            )
+        }
+
+        composable(Destinations.COMPLETE_PROFILE) {
+            CompleteProfileScreen(
+                uiState = uiState,
+                onRoleSelected = authViewModel::onRecoveryRoleSelected,
+                onFullNameChanged = authViewModel::onRecoveryFullNameChanged,
+                onPhoneChanged = authViewModel::onRecoveryPhoneChanged,
+                onSubmitRecovery = { fullName, phone, role ->
+                    authViewModel.submitMissingProfileRecovery(
+                        rawFullName = fullName,
+                        rawPhone = phone,
+                        role = role
+                    )
+                },
+                onLogoutClick = authViewModel::logout
             )
         }
 
         composable(Destinations.ONBOARDING) {
-            com.waste.link.ui.auth.OnboardingScreen(
-                onRoleSelected = { role ->
-                    authViewModel.setRole(role)
-                },
-                authState = authState
+            OnboardingScreen(
+                uiState = uiState,
+                onCompleteOnboarding = { authViewModel.completeStage4Onboarding() },
+                onLogoutClick = authViewModel::logout
             )
         }
 
         composable(Destinations.RESIDENT_HOME) {
-            com.waste.link.ui.MainScreen(
+            MainScreen(
                 rootNavController = navController,
-                onNewRequest = { /* Handle request */ },
+                onNewRequest = { /* Handled in Resident module */ },
                 onNavigateToAdmin = { navController.navigate(Destinations.ADMIN_SHELL) }
             )
         }
@@ -163,10 +295,7 @@ fun WasteLinkNavGraph(
         composable(Destinations.ADMIN_SHELL) {
             AdminShellScreen(
                 onLogout = {
-                    authViewModel.signOut()
-                    navController.navigate(Destinations.LOGIN) {
-                        popUpTo(0)
-                    }
+                    authViewModel.logout()
                 }
             )
         }

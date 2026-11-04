@@ -1,5 +1,7 @@
 package com.waste.link.domain.validation
 
+import com.google.i18n.phonenumbers.NumberParseException
+import com.google.i18n.phonenumbers.PhoneNumberUtil
 import com.waste.link.domain.model.UserRole
 
 /**
@@ -51,13 +53,30 @@ sealed interface ValidationResult<out T> {
 }
 
 /**
+ * Non-sensitive password strength evaluation report used by registration UI.
+ * Never holds or exposes the underlying password string.
+ */
+data class PasswordStrengthReport(
+    val hasMinLength: Boolean,
+    val hasUppercase: Boolean,
+    val hasLowercase: Boolean,
+    val hasDigit: Boolean,
+    val hasSpecialChar: Boolean,
+    val score: Int,
+    val label: String
+) {
+    val meetsMinimumPolicy: Boolean
+        get() = hasMinLength && hasUppercase && hasLowercase && hasDigit
+}
+
+/**
  * Centralized, pure-Kotlin authentication and profile input validator.
  *
  * Security & Design Guarantees:
  * - Zero dependency on Android framework classes (`android.util.Patterns`) so validation behaves
  *   identically in JVM unit tests and on Android devices.
- * - Normalizes domestic and international phone numbers into ITU-T E.164 format (`+<7..15 digits>`)
- *   without rejecting legitimate non-Tanzanian international numbers.
+ * - Uses Google's `libphonenumber` ([PhoneNumberUtil]) to validate and normalize domestic and
+ *   international phone numbers into ITU-T E.164 format (`+<country><subscriber>`).
  * - Password validation returns `ValidationResult<Unit>` and never embeds or logs password strings
  *   in error messages or result objects.
  */
@@ -71,6 +90,9 @@ object AuthValidator {
     const val MIN_PASSWORD_LENGTH = 8
     const val MAX_PASSWORD_LENGTH = 64
     const val DEFAULT_COUNTRY_CALLING_CODE = "+255"
+    const val DEFAULT_REGION_CODE = "TZ"
+
+    private val phoneNumberUtil: PhoneNumberUtil by lazy { PhoneNumberUtil.getInstance() }
 
     private val WHITESPACE_REGEX = Regex("\\s+")
 
@@ -205,14 +227,15 @@ object AuthValidator {
     }
 
     /**
-     * Validates and normalizes a phone number into ITU-T E.164 format (`+<country><subscriber>`).
+     * Validates and normalizes a phone number into ITU-T E.164 format (`+<country><subscriber>`)
+     * backed by Google's `libphonenumber` ([PhoneNumberUtil]).
      *
      * Supported inputs:
      * 1. Explicit E.164 international format from ANY country (`+255712345678`, `+254712345678`,
      *    `+256772123456`, `+1 (415) 555-2671`, `+44 7911 123456`, `+91 98765 43210`, etc.).
-     * 2. International `00` prefix (`00255712345678`, `00447911123456`, `0014155552671`), converted to `+`.
+     * 2. International `00` prefix (`00255712345678`, `00447911123456`, `004915123456789`), converted to `+`.
      * 3. Local national format starting with a single `0` (`0712 345 678`), normalized using
-     *    [defaultCountryCallingCode] (defaults to `"+255"`).
+     *    [defaultCountryCallingCode] (defaults to `"+255"` / region `"TZ"`).
      * 4. Bare international digits starting with non-zero country code (`255712345678`, `254712345678`),
      *    normalized by prepending `+` when length is 10..15 digits.
      */
@@ -256,7 +279,6 @@ object AuthValidator {
                         message = "Please enter a valid phone number."
                     )
                 }
-                // Local national subscriber numbers must be 7 to 12 digits after the trunk '0'
                 if (nationalDigits.length < 7) {
                     return ValidationResult.Invalid(
                         error = ValidationError.PHONE_TOO_SHORT,
@@ -272,7 +294,6 @@ object AuthValidator {
                 "$normalizedCountryCode$nationalDigits"
             }
             cleaned.all { it.isDigit() } -> {
-                // Bare digits starting with [1-9]
                 if (cleaned.length < 10) {
                     return ValidationResult.Invalid(
                         error = ValidationError.PHONE_TOO_SHORT,
@@ -297,7 +318,6 @@ object AuthValidator {
             )
         }
 
-        // E.164 country codes never begin with '0'
         if (digitsOnly.startsWith("0")) {
             return ValidationResult.Invalid(
                 error = ValidationError.PHONE_INVALID_FORMAT,
@@ -319,7 +339,106 @@ object AuthValidator {
             )
         }
 
-        return ValidationResult.Valid("+$digitsOnly")
+        // Validate against Google's libphonenumber ITU-T numbering plans
+        val callingCodeInt = normalizedCountryCode.removePrefix("+").toIntOrNull()
+        val defaultRegion = callingCodeInt
+            ?.let { phoneNumberUtil.getRegionCodeForCountryCode(it) }
+            ?.takeIf { it != "ZZ" && it.isNotBlank() }
+            ?: DEFAULT_REGION_CODE
+
+        val parsedNumber = try {
+            phoneNumberUtil.parse(candidateE164, defaultRegion)
+        } catch (e: NumberParseException) {
+            return when (e.errorType) {
+                NumberParseException.ErrorType.TOO_SHORT_AFTER_IDD,
+                NumberParseException.ErrorType.TOO_SHORT_NSN -> ValidationResult.Invalid(
+                    error = ValidationError.PHONE_TOO_SHORT,
+                    message = "Phone number is too short for the selected country."
+                )
+                NumberParseException.ErrorType.TOO_LONG -> ValidationResult.Invalid(
+                    error = ValidationError.PHONE_TOO_LONG,
+                    message = "Phone number exceeds the maximum length."
+                )
+                else -> ValidationResult.Invalid(
+                    error = ValidationError.PHONE_INVALID_FORMAT,
+                    message = "Please enter a valid international phone number (e.g., +255 712 345 678)."
+                )
+            }
+        }
+
+        when (phoneNumberUtil.isPossibleNumberWithReason(parsedNumber)) {
+            PhoneNumberUtil.ValidationResult.TOO_SHORT -> {
+                return ValidationResult.Invalid(
+                    error = ValidationError.PHONE_TOO_SHORT,
+                    message = "Phone number is too short for its country code."
+                )
+            }
+            PhoneNumberUtil.ValidationResult.TOO_LONG -> {
+                return ValidationResult.Invalid(
+                    error = ValidationError.PHONE_TOO_LONG,
+                    message = "Phone number is too long for its country code."
+                )
+            }
+            PhoneNumberUtil.ValidationResult.INVALID_COUNTRY_CODE,
+            PhoneNumberUtil.ValidationResult.INVALID_LENGTH -> {
+                return ValidationResult.Invalid(
+                    error = ValidationError.PHONE_INVALID_FORMAT,
+                    message = "Please enter a valid phone number for its country code."
+                )
+            }
+            PhoneNumberUtil.ValidationResult.IS_POSSIBLE,
+            PhoneNumberUtil.ValidationResult.IS_POSSIBLE_LOCAL_ONLY -> {
+                // Proceed to full validity check
+            }
+        }
+
+        if (!phoneNumberUtil.isValidNumber(parsedNumber)) {
+            return ValidationResult.Invalid(
+                error = ValidationError.PHONE_INVALID_FORMAT,
+                message = "Please enter a valid phone number with country code (e.g., +255 712 345 678)."
+            )
+        }
+
+        val formattedE164 = phoneNumberUtil.format(parsedNumber, PhoneNumberUtil.PhoneNumberFormat.E164)
+        return ValidationResult.Valid(formattedE164)
+    }
+
+    /**
+     * Evaluates password strength criteria without storing or exposing the raw password string.
+     */
+    fun evaluatePasswordStrength(rawPassword: String?): PasswordStrengthReport {
+        val pwd = rawPassword.orEmpty()
+        val hasMinLength = pwd.length >= MIN_PASSWORD_LENGTH
+        val hasUppercase = pwd.any { it.isUpperCase() }
+        val hasLowercase = pwd.any { it.isLowerCase() }
+        val hasDigit = pwd.any { it.isDigit() }
+        val hasSpecialChar = pwd.any { !it.isLetterOrDigit() && !it.isWhitespace() }
+
+        val criteriaMet = listOf(hasMinLength, hasUppercase, hasLowercase, hasDigit).count { it }
+        val score = when {
+            pwd.isEmpty() -> 0
+            criteriaMet <= 1 -> 1
+            criteriaMet == 2 -> 2
+            criteriaMet == 3 -> 3
+            hasSpecialChar && pwd.length >= 10 -> 4
+            else -> 4
+        }
+        val label = when (score) {
+            0 -> "Enter a password"
+            1 -> "Weak"
+            2 -> "Fair"
+            3 -> "Good"
+            else -> "Strong"
+        }
+        return PasswordStrengthReport(
+            hasMinLength = hasMinLength,
+            hasUppercase = hasUppercase,
+            hasLowercase = hasLowercase,
+            hasDigit = hasDigit,
+            hasSpecialChar = hasSpecialChar,
+            score = score,
+            label = label
+        )
     }
 
     /**
@@ -414,3 +533,4 @@ object AuthValidator {
         return ValidationResult.Valid(role)
     }
 }
+

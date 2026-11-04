@@ -268,4 +268,32 @@ class AuthValidatorTest {
             AuthValidator.validateSelfRegistrationRole(UserRole.ADMIN).errorOrNull()
         )
     }
+
+    @Test
+    fun `evaluatePasswordStrength accurately tracks all 4 password criteria without leaking secret`() {
+        val emptyReport = AuthValidator.evaluatePasswordStrength("")
+        assertFalse(emptyReport.hasMinLength)
+        assertFalse(emptyReport.hasUppercase)
+        assertFalse(emptyReport.hasLowercase)
+        assertFalse(emptyReport.hasDigit)
+        assertFalse(emptyReport.meetsMinimumPolicy)
+        assertEquals(0, emptyReport.score)
+
+        val partialReport = AuthValidator.evaluatePasswordStrength("Abcdefgh")
+        assertTrue(partialReport.hasMinLength)
+        assertTrue(partialReport.hasUppercase)
+        assertTrue(partialReport.hasLowercase)
+        assertFalse(partialReport.hasDigit)
+        assertFalse(partialReport.meetsMinimumPolicy)
+        assertEquals(3, partialReport.score)
+
+        val fullReport = AuthValidator.evaluatePasswordStrength("WasteLink2026")
+        assertTrue(fullReport.hasMinLength)
+        assertTrue(fullReport.hasUppercase)
+        assertTrue(fullReport.hasLowercase)
+        assertTrue(fullReport.hasDigit)
+        assertTrue(fullReport.meetsMinimumPolicy)
+        assertEquals(4, fullReport.score)
+        assertFalse(fullReport.toString().contains("WasteLink2026"))
+    }
 }

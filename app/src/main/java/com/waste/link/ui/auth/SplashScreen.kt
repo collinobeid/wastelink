@@ -40,25 +40,11 @@ import kotlinx.coroutines.delay
 @Composable
 fun SplashScreen(
     onContinue: () -> Unit,
-    onAdmin: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val auth = com.google.firebase.auth.FirebaseAuth.getInstance()
-    
     LaunchedEffect(Unit) {
-        if (auth.currentUser != null) {
-            delay(1000)
-            onContinue()
-        } else {
-            auth.signInAnonymously().addOnCompleteListener { task ->
-                if (task.isSuccessful) {
-                    onContinue()
-                } else {
-                    // In a real app we'd show an error or retry, but for MVP we'll just continue
-                    onContinue()
-                }
-            }
-        }
+        delay(600)
+        onContinue()
     }
 
     val gradient = Brush.verticalGradient(
@@ -92,16 +78,16 @@ fun SplashScreen(
                     modifier = Modifier.size(40.dp)
                 )
             }
-            
+
             Spacer(modifier = Modifier.height(16.dp))
-            
+
             Text(
                 text = stringResource(R.string.app_name),
                 style = MaterialTheme.typography.headlineLarge,
                 color = Color.White,
                 fontWeight = FontWeight.Bold
             )
-            
+
             Text(
                 text = stringResource(R.string.tagline),
                 style = MaterialTheme.typography.bodyMedium,
@@ -121,16 +107,6 @@ fun SplashScreen(
                 strokeWidth = 2.dp,
                 modifier = Modifier.size(24.dp)
             )
-            
-            Spacer(modifier = Modifier.height(16.dp))
-            
-            TextButton(onClick = onAdmin) {
-                Text(
-                    text = "Admin Portal →",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = Color.White.copy(alpha = 0.4f)
-                )
-            }
         }
     }
 }

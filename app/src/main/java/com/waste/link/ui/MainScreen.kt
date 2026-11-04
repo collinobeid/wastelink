@@ -40,12 +40,8 @@ fun MainScreen(
 ) {
     val bnbNavController = rememberNavController()
     val authViewModel: com.waste.link.ui.auth.AuthViewModel = androidx.hilt.navigation.compose.hiltViewModel()
-    val authState by authViewModel.authState.collectAsState()
-    val isAdmin = (authState as? com.waste.link.ui.auth.AuthState.Authenticated)?.user?.role == "admin"
-
-    LaunchedEffect(Unit) {
-        authViewModel.checkCurrentUser()
-    }
+    val uiState by authViewModel.uiState.collectAsState()
+    val isAdmin = uiState.isAdmin
 
     MainScaffold(navController = bnbNavController) {
         NavHost(
