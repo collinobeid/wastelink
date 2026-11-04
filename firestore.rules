@@ -3,7 +3,7 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     // =========================================================================
-    // 1. CORE IDENTITY & AUTHORIZATION HELPERS
+    // 1. CORE IDENTITY, TYPE VALIDATION & AUTHORIZATION HELPERS
     // =========================================================================
 
     function isAuthenticated() {
@@ -42,8 +42,28 @@ service cloud.firestore {
       return val is int && val >= 0;
     }
 
+    function isPositiveInt(val) {
+      return val is int && val > 0;
+    }
+
     function isNullablePositiveInt(val) {
       return val == null || (val is int && val > 0);
+    }
+
+    function isTimestampOrPositiveInt(val) {
+      return val is timestamp || (val is int && val > 0);
+    }
+
+    function isNullableTimestampOrPositiveInt(val) {
+      return val == null || isTimestampOrPositiveInt(val);
+    }
+
+    function isValidLat(val) {
+      return val is number && val >= -90 && val <= 90;
+    }
+
+    function isValidLng(val) {
+      return val is number && val >= -180 && val <= 180;
     }
 
     function userExists(userId) {
@@ -66,12 +86,25 @@ service cloud.firestore {
       return getAfter(/databases/$(database)/documents/collector_submissions/$(userId)/history/$(attemptId));
     }
 
+    function moderationDocAfter(userId) {
+      return getAfter(/databases/$(database)/documents/user_moderation/$(userId));
+    }
+
     function hasValidHistoryAfter(userId, attemptId, expectedEventType, expectedAttempt) {
       return existsAfter(/databases/$(database)/documents/collector_submissions/$(userId)/history/$(attemptId))
         && historyDocAfter(userId, attemptId).data.userId == userId
         && historyDocAfter(userId, attemptId).data.actorUid == userId
         && historyDocAfter(userId, attemptId).data.eventType == expectedEventType
         && historyDocAfter(userId, attemptId).data.submissionAttempt == expectedAttempt;
+    }
+
+    function hasValidAdminDecisionHistoryAfter(userId, attemptId, expectedEventType, expectedAttempt, expectedReason) {
+      return existsAfter(/databases/$(database)/documents/collector_submissions/$(userId)/history/$(attemptId))
+        && historyDocAfter(userId, attemptId).data.userId == userId
+        && historyDocAfter(userId, attemptId).data.actorUid == request.auth.uid
+        && historyDocAfter(userId, attemptId).data.eventType == expectedEventType
+        && historyDocAfter(userId, attemptId).data.submissionAttempt == expectedAttempt
+        && historyDocAfter(userId, attemptId).data.rejectionReason == expectedReason;
     }
 
     function isActiveResident(userId) {
@@ -82,6 +115,13 @@ service cloud.firestore {
         && userDoc(userId).data.accountStatus == 'ACTIVE';
     }
 
+    function isActiveOrRestrictedUser(userId) {
+      return isOwner(userId)
+        && isEmailVerifiedInToken()
+        && userExists(userId)
+        && userDoc(userId).data.accountStatus in ['ACTIVE', 'RESTRICTED'];
+    }
+
     function isActiveCollectorOwner(userId) {
       return isOwner(userId)
         && isEmailVerifiedInToken()
@@ -90,10 +130,10 @@ service cloud.firestore {
         && userDoc(userId).data.accountStatus == 'ACTIVE';
     }
 
+    // Authoritative collector approval check using canonical collectorVerificationStatus == 'APPROVED'
     function isApprovedActiveCollector(userId) {
       return isActiveCollectorOwner(userId)
-        && (userDoc(userId).data.collectorVerificationStatus == 'APPROVED'
-            || userDoc(userId).data.isVerified == true);
+        && userDoc(userId).data.collectorVerificationStatus == 'APPROVED';
     }
 
     // =========================================================================
@@ -149,12 +189,13 @@ service cloud.firestore {
         && (!('vehiclePlateNumber' in request.resource.data) || request.resource.data.vehiclePlateNumber == null)
         && (!('preferredLanguage' in request.resource.data) || isValidNonEmptyString(request.resource.data.preferredLanguage, 2, 10))
         && (!('fcmToken' in request.resource.data) || isNullableString(request.resource.data.fcmToken, 1, 512))
-        && isNonNegativeInt(request.resource.data.createdAtEpochMs)
-        && isNonNegativeInt(request.resource.data.updatedAtEpochMs);
+        && isPositiveInt(request.resource.data.createdAtEpochMs)
+        && isPositiveInt(request.resource.data.updatedAtEpochMs)
+        && request.resource.data.updatedAtEpochMs >= request.resource.data.createdAtEpochMs;
 
       // Profile Updates:
       // Branch A: Self-service update by verified, ACTIVE owner
-      // Branch B: Moderation / collector vetting update by trusted Administrator (custom claim)
+      // Branch B: Constrained moderation / collector vetting update by trusted Administrator (custom claim)
       allow update: if (
         isOwner(userId)
         && isEmailVerifiedInToken()
@@ -174,9 +215,19 @@ service cloud.firestore {
         && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
              'id', 'uid', 'email', 'role', 'accountStatus', 'status', 'statusReason',
              'suspendedUntilEpochMs', 'isVerified', 'createdAtEpochMs',
-             'collectorRejectionReason', 'bannedUntil', 'contractUntil',
-             'deletedAt', 'isActive', 'isEmailVerified', 'isPhoneVerified'
+             'bannedUntil', 'contractUntil', 'deletedAt', 'isActive',
+             'isEmailVerified', 'isPhoneVerified'
            ])
+        // collectorRejectionReason is immutable by owner EXCEPT when cleared to null during a valid REJECTED -> PENDING_REVIEW resubmission
+        && (
+             !request.resource.data.diff(resource.data).affectedKeys().hasAny(['collectorRejectionReason'])
+             || (
+                  resource.data.role in ['COLLECTOR', 'collector']
+                  && resource.data.collectorVerificationStatus == 'REJECTED'
+                  && request.resource.data.collectorVerificationStatus == 'PENDING_REVIEW'
+                  && request.resource.data.collectorRejectionReason == null
+                )
+           )
         // Collector verification status transition guard for Owner:
         // 1. Residents cannot change collectorVerificationStatus.
         // 2. Collectors can ONLY transition from NOT_SUBMITTED or REJECTED to PENDING_REVIEW,
@@ -196,26 +247,79 @@ service cloud.firestore {
         && isValidNonEmptyString(request.resource.data.phoneNumber, 8, 20)
         && request.resource.data.phone == request.resource.data.phoneNumber
         && request.resource.data.onboardingStatus in ['NOT_STARTED', 'IN_PROGRESS', 'COMPLETED']
+        && !(resource.data.onboardingStatus == 'COMPLETED' && request.resource.data.onboardingStatus == 'NOT_STARTED')
         && (!('defaultZoneId' in request.resource.data) || isNullableString(request.resource.data.defaultZoneId, 1, 80))
         && (!('vehicleType' in request.resource.data) || isNullableString(request.resource.data.vehicleType, 2, 40))
         && (!('vehiclePlateNumber' in request.resource.data) || isNullableString(request.resource.data.vehiclePlateNumber, 3, 20))
         && (!('preferredLanguage' in request.resource.data) || isValidNonEmptyString(request.resource.data.preferredLanguage, 2, 10))
         && (!('fcmToken' in request.resource.data) || isNullableString(request.resource.data.fcmToken, 1, 512))
-        && isNonNegativeInt(request.resource.data.updatedAtEpochMs)
+        && isPositiveInt(request.resource.data.updatedAtEpochMs)
+        && request.resource.data.updatedAtEpochMs >= resource.data.updatedAtEpochMs
       ) || (
         isAdmin()
-        // Even an Admin cannot alter a user's UID, email, role, or creation timestamp via client SDK
+        && request.resource.data.keys().hasOnly([
+             'id', 'uid', 'fullName', 'name', 'email', 'phoneNumber', 'phone',
+             'role', 'accountStatus', 'status', 'statusReason', 'suspendedUntilEpochMs',
+             'onboardingStatus', 'isVerified', 'collectorVerificationStatus',
+             'collectorRejectionReason', 'defaultZoneId', 'vehicleType',
+             'vehiclePlateNumber', 'preferredLanguage', 'createdAtEpochMs',
+             'updatedAtEpochMs', 'fcmToken',
+             'bannedUntil', 'contractUntil', 'deletedAt', 'isActive'
+           ])
+        // STRICT ADMIN IMMUTABILITY BOUNDARY:
+        // Even an Administrator cannot alter user identity, personal contact info, role, onboardingStatus, language, FCM token, or creation timestamp
         && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-             'id', 'uid', 'email', 'role', 'createdAtEpochMs'
+             'id', 'uid', 'email', 'fullName', 'name', 'phoneNumber', 'phone',
+             'role', 'onboardingStatus', 'preferredLanguage', 'fcmToken',
+             'createdAtEpochMs', 'isEmailVerified', 'isPhoneVerified'
            ])
         && request.resource.data.accountStatus in ['ACTIVE', 'RESTRICTED', 'SUSPENDED', 'BANNED']
-        && request.resource.data.collectorVerificationStatus in [
-             'NOT_APPLICABLE', 'NOT_SUBMITTED', 'PENDING_REVIEW', 'APPROVED', 'REJECTED'
-           ]
+        && request.resource.data.status in ['ACTIVE', 'RESTRICTED', 'SUSPENDED', 'BANNED', 'REJECTED']
+        // Account restriction/suspension/ban reason & audit enforcement
+        && (
+             request.resource.data.accountStatus == 'ACTIVE'
+             || isValidNonEmptyString(request.resource.data.statusReason, 3, 500)
+           )
+        && (
+             request.resource.data.accountStatus != 'SUSPENDED'
+             || isPositiveInt(request.resource.data.suspendedUntilEpochMs)
+           )
+        // If Admin changes accountStatus, an atomic /user_moderation/{userId} record with matching status & admin UID is required
+        && (
+             request.resource.data.accountStatus == resource.data.accountStatus
+             || (
+                  existsAfter(/databases/$(database)/documents/user_moderation/$(userId))
+                  && moderationDocAfter(userId).data.accountStatus == request.resource.data.accountStatus
+                  && moderationDocAfter(userId).data.moderatedByUid == request.auth.uid
+                )
+           )
+        // Collector verification state machine enforcement for Admin
+        && (
+             (resource.data.role in ['RESIDENT', 'resident', 'ADMIN', 'admin']
+              && request.resource.data.collectorVerificationStatus == 'NOT_APPLICABLE'
+              && request.resource.data.isVerified == resource.data.isVerified)
+             ||
+             (resource.data.role in ['COLLECTOR', 'collector']
+              && (
+                   request.resource.data.collectorVerificationStatus == resource.data.collectorVerificationStatus
+                   || (
+                        resource.data.collectorVerificationStatus == 'PENDING_REVIEW'
+                        && request.resource.data.collectorVerificationStatus == 'APPROVED'
+                        && request.resource.data.isVerified == true
+                        && (!('collectorRejectionReason' in request.resource.data) || request.resource.data.collectorRejectionReason == null)
+                      )
+                   || (
+                        resource.data.collectorVerificationStatus in ['PENDING_REVIEW', 'APPROVED']
+                        && request.resource.data.collectorVerificationStatus == 'REJECTED'
+                        && request.resource.data.isVerified == false
+                        && isValidNonEmptyString(request.resource.data.collectorRejectionReason, 3, 500)
+                      )
+                 ))
+           )
       );
 
-      // Users can never delete their own profile document directly; only Admins.
-      allow delete: if isAdmin();
+      // User profiles are permanent identity records; hard deletion via client SDK is denied for all roles.
+      allow delete: if false;
     }
 
     // =========================================================================
@@ -238,8 +342,7 @@ service cloud.firestore {
         && request.resource.data.userId == userId
         && request.resource.data.status == 'PENDING_REVIEW'
         && request.resource.data.submissionAttempt == 1
-        && request.resource.data.submittedAtEpochMs is int
-        && request.resource.data.submittedAtEpochMs > 0
+        && isPositiveInt(request.resource.data.submittedAtEpochMs)
         && isValidNonEmptyString(request.resource.data.vehicleType, 2, 40)
         && isValidNonEmptyString(request.resource.data.vehiclePlateNumber, 3, 20)
         && isValidNonEmptyString(request.resource.data.licenseNumber, 4, 40)
@@ -260,7 +363,7 @@ service cloud.firestore {
 
       // Updates to Collector Submission:
       // Branch A: Collector Resubmission (Allowed ONLY when current status == 'REJECTED')
-      // Branch B: Trusted Administrator Approval or Rejection
+      // Branch B: Trusted Administrator Approval or Rejection (Requires valid transition + atomic user & history updates)
       allow update: if (
         isActiveCollectorOwner(userId)
         && resource.data.status == 'REJECTED'
@@ -274,8 +377,7 @@ service cloud.firestore {
         && request.resource.data.userId == userId
         && request.resource.data.status == 'PENDING_REVIEW'
         && request.resource.data.submissionAttempt == resource.data.submissionAttempt + 1
-        && request.resource.data.submittedAtEpochMs is int
-        && request.resource.data.submittedAtEpochMs > 0
+        && isPositiveInt(request.resource.data.submittedAtEpochMs)
         && isValidNonEmptyString(request.resource.data.vehicleType, 2, 40)
         && isValidNonEmptyString(request.resource.data.vehiclePlateNumber, 3, 20)
         && isValidNonEmptyString(request.resource.data.licenseNumber, 4, 40)
@@ -301,26 +403,53 @@ service cloud.firestore {
            )
       ) || (
         isAdmin()
-        && request.resource.data.userId == userId
-        && request.resource.data.submissionAttempt == resource.data.submissionAttempt
-        && request.resource.data.status in ['APPROVED', 'REJECTED']
+        && resource.data.status in ['PENDING_REVIEW', 'APPROVED']
+        && request.resource.data.keys().hasOnly([
+             'userId', 'vehicleType', 'vehiclePlateNumber', 'licenseNumber',
+             'serviceZoneId', 'status', 'submissionAttempt', 'submittedAtEpochMs',
+             'reviewedByUid', 'reviewedAtEpochMs', 'rejectionReason', 'adminNotes',
+             'lastRejectionReason', 'lastReviewedByUid', 'lastReviewedAtEpochMs'
+           ])
+        // Admin cannot tamper with collector-submitted vehicle/license data or attempt counter
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+             'userId', 'vehicleType', 'vehiclePlateNumber', 'licenseNumber',
+             'serviceZoneId', 'submissionAttempt', 'submittedAtEpochMs',
+             'lastRejectionReason', 'lastReviewedByUid', 'lastReviewedAtEpochMs'
+           ])
         && request.resource.data.reviewedByUid == request.auth.uid
-        && request.resource.data.reviewedAtEpochMs is int
-        && request.resource.data.reviewedAtEpochMs > 0
+        && isPositiveInt(request.resource.data.reviewedAtEpochMs)
         && (
-             (request.resource.data.status == 'APPROVED'
+             (resource.data.status == 'PENDING_REVIEW'
+              && request.resource.data.status == 'APPROVED'
               && request.resource.data.rejectionReason == null
               && userDocAfter(userId).data.collectorVerificationStatus == 'APPROVED'
-              && userDocAfter(userId).data.isVerified == true)
+              && userDocAfter(userId).data.isVerified == true
+              && hasValidAdminDecisionHistoryAfter(
+                   userId,
+                   'attempt_' + string(resource.data.submissionAttempt) + '_approved',
+                   'APPROVED',
+                   resource.data.submissionAttempt,
+                   null
+                 ))
              ||
-             (request.resource.data.status == 'REJECTED'
+             (resource.data.status in ['PENDING_REVIEW', 'APPROVED']
+              && request.resource.data.status == 'REJECTED'
               && isValidNonEmptyString(request.resource.data.rejectionReason, 3, 500)
               && userDocAfter(userId).data.collectorVerificationStatus == 'REJECTED'
-              && userDocAfter(userId).data.isVerified == false)
+              && userDocAfter(userId).data.isVerified == false
+              && userDocAfter(userId).data.collectorRejectionReason == request.resource.data.rejectionReason
+              && hasValidAdminDecisionHistoryAfter(
+                   userId,
+                   'attempt_' + string(resource.data.submissionAttempt) + '_rejected',
+                   'REJECTED',
+                   resource.data.submissionAttempt,
+                   request.resource.data.rejectionReason
+                 ))
            )
       );
 
-      allow delete: if isAdmin();
+      // Collector submissions cannot be deleted by anyone
+      allow delete: if false;
 
       // =======================================================================
       // 3a. IMMUTABLE SUBMISSION HISTORY: /collector_submissions/{userId}/history/{attemptId}
@@ -342,8 +471,7 @@ service cloud.firestore {
           && request.resource.data.submissionAttempt is int
           && request.resource.data.submissionAttempt >= 1
           && attemptId == 'attempt_' + string(request.resource.data.submissionAttempt)
-          && request.resource.data.timestampEpochMs is int
-          && request.resource.data.timestampEpochMs > 0
+          && isPositiveInt(request.resource.data.timestampEpochMs)
           && request.resource.data.rejectionReason == null
           && existsAfter(/databases/$(database)/documents/collector_submissions/$(userId))
           && submissionDocAfter(userId).data.submissionAttempt == request.resource.data.submissionAttempt
@@ -359,6 +487,14 @@ service cloud.firestore {
           && request.resource.data.userId == userId
           && request.resource.data.actorUid == request.auth.uid
           && request.resource.data.eventType in ['APPROVED', 'REJECTED']
+          && isPositiveInt(request.resource.data.timestampEpochMs)
+          && (
+               (request.resource.data.eventType == 'APPROVED'
+                && request.resource.data.rejectionReason == null)
+               ||
+               (request.resource.data.eventType == 'REJECTED'
+                && isValidNonEmptyString(request.resource.data.rejectionReason, 3, 500))
+             )
         );
 
         // History entries are strictly append-only and can NEVER be modified or deleted by anyone
@@ -381,102 +517,396 @@ service cloud.firestore {
            ])
         && request.resource.data.userId == userId
         && request.resource.data.moderatedByUid == request.auth.uid
-        && request.resource.data.moderatedAtEpochMs is int
-        && request.resource.data.moderatedAtEpochMs > 0;
+        && request.resource.data.accountStatus in ['ACTIVE', 'RESTRICTED', 'SUSPENDED', 'BANNED']
+        && request.resource.data.action in ['RESTRICTED', 'SUSPENDED', 'BANNED', 'REINSTATED', 'UNBANNED', 'WARNING']
+        && isValidNonEmptyString(request.resource.data.reason, 3, 500)
+        && (!('adminNotes' in request.resource.data) || isNullableString(request.resource.data.adminNotes, 1, 2000))
+        && (!('suspendedUntilEpochMs' in request.resource.data) || isNullablePositiveInt(request.resource.data.suspendedUntilEpochMs))
+        && (!('bannedUntil' in request.resource.data) || isNullablePositiveInt(request.resource.data.bannedUntil))
+        && (!('contractUntil' in request.resource.data) || isNullablePositiveInt(request.resource.data.contractUntil))
+        && (!('deletedAt' in request.resource.data) || isNullablePositiveInt(request.resource.data.deletedAt))
+        && isPositiveInt(request.resource.data.moderatedAtEpochMs);
 
       allow delete: if false;
     }
 
     // =========================================================================
-    // 5. APPEND-ONLY ADMINISTRATIVE AUDIT LOGS: /admin_actions_log/{logId} & /audit_logs/{logId}
+    // 5. APPEND-ONLY ADMINISTRATIVE & SYSTEM AUDIT LOGS
     // =========================================================================
     match /admin_actions_log/{logId} {
       allow get, list: if isAdmin();
+
       allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+             'id', 'adminId', 'actorId', 'targetUserId', 'targetId',
+             'action', 'reason', 'timestampMs', 'title', 'description',
+             'iconType', 'createdAt'
+           ])
+        // Anti-impersonation: at least one actor field must exist, and EVERY present actor field MUST equal request.auth.uid
+        && ('actorId' in request.resource.data || 'adminId' in request.resource.data)
+        && (!('actorId' in request.resource.data) || request.resource.data.actorId == request.auth.uid)
+        && (!('adminId' in request.resource.data) || request.resource.data.adminId == request.auth.uid)
+        && isValidNonEmptyString(request.resource.data.action, 2, 100)
+        && isValidNonEmptyString(request.resource.data.reason, 2, 1000)
         && (
-             ('adminId' in request.resource.data && request.resource.data.adminId == request.auth.uid)
-             || ('actorId' in request.resource.data && request.resource.data.actorId == request.auth.uid)
+             ('targetId' in request.resource.data && isValidNonEmptyString(request.resource.data.targetId, 1, 128))
+             || ('targetUserId' in request.resource.data && isValidNonEmptyString(request.resource.data.targetUserId, 1, 128))
+           )
+        && (
+             ('timestampMs' in request.resource.data && isPositiveInt(request.resource.data.timestampMs))
+             || ('createdAt' in request.resource.data && isTimestampOrPositiveInt(request.resource.data.createdAt))
            );
+
       // Administrative audit records can NEVER be altered or deleted after creation
       allow update, delete: if false;
     }
 
     match /audit_logs/{logId} {
       allow get, list: if isAdmin();
-      allow create: if isAdmin()
-        || (isAuthenticated() && request.resource.data.uid == request.auth.uid);
+
+      allow create: if isAuthenticated()
+        && request.resource.data.keys().hasOnly([
+             'uid', 'actorUid', 'action', 'targetId', 'details',
+             'timestamp', 'timestampMs', 'createdAt'
+           ])
+        // Anti-impersonation for both regular users and admins: uid and actorUid must match request.auth.uid
+        && request.resource.data.uid == request.auth.uid
+        && (!('actorUid' in request.resource.data) || request.resource.data.actorUid == request.auth.uid)
+        && isValidNonEmptyString(request.resource.data.action, 2, 100)
+        // Non-admin callers may only log self-service account events, never admin actions
+        && (isAdmin() || request.resource.data.action in ['ACCOUNT_DELETED', 'PROFILE_RECOVERED', 'SIGN_OUT'])
+        && (
+             ('timestamp' in request.resource.data && isPositiveInt(request.resource.data.timestamp))
+             || ('timestampMs' in request.resource.data && isPositiveInt(request.resource.data.timestampMs))
+             || ('createdAt' in request.resource.data && isTimestampOrPositiveInt(request.resource.data.createdAt))
+           );
+
       allow update, delete: if false;
     }
 
     // =========================================================================
-    // 6. EXISTING OPERATIONAL COLLECTIONS (HARDENED AGAINST UNAUTHORIZED ACCESS)
+    // 6. WASTE REQUESTS: /waste_requests/{requestId} & /wasteRequests/{requestId}
     // =========================================================================
 
+    function hasAllowedWasteRequestKeys(data) {
+      return data.keys().hasOnly([
+        'id', 'requestRef', 'clientUid', 'geohash', 'lat', 'lng',
+        'pickupAddress', 'category', 'volumeTier', 'notes',
+        'gatePhotoBase64', 'pocPhotoBase64', 'gatePhotoUrl', 'pocPhotoUrl',
+        'photos', 'status', 'assignedTruckId', 'assignedAt', 'enRouteAt',
+        'arrivedAt', 'collectedAt', 'completedAt', 'failedAt', 'failureReason',
+        'agreedPrice', 'residentPhoneNumber', 'collectorPhoneNumber',
+        'createdAt', 'updatedAt'
+      ]);
+    }
+
+    // Strict relationship-based read access:
+    // 1. Resident owner (clientUid == request.auth.uid)
+    // 2. Assigned approved active Collector (assignedTruckId == request.auth.uid)
+    // 3. Trusted Administrator (isAdmin())
     function canReadWasteRequest(reqData) {
       return isAdmin()
         || (isAuthenticated() && reqData.clientUid == request.auth.uid)
-        || isApprovedActiveCollector(request.auth.uid);
+        || (isApprovedActiveCollector(request.auth.uid) && reqData.assignedTruckId == request.auth.uid);
     }
 
-    function canCreateWasteRequest(reqData) {
-      return isAdmin()
-        || (isActiveResident(request.auth.uid)
-            && reqData.clientUid == request.auth.uid
-            && reqData.status in ['PENDING_DISPATCH', 'FLAGGED_FOR_REVIEW']);
+    // Resident Creation Rules:
+    // - Only an ACTIVE, email-verified Resident can create a request for their own UID.
+    // - Initial status must be 'PENDING_DISPATCH'.
+    // - Assignment, completion, collector, and payment fields (agreedPrice) must be null.
+    function canCreateWasteRequest(requestId, reqData) {
+      return isActiveResident(request.auth.uid)
+        && hasAllowedWasteRequestKeys(reqData)
+        && (!('id' in reqData) || reqData.id == '' || reqData.id == requestId)
+        && reqData.clientUid == request.auth.uid
+        && isValidNonEmptyString(reqData.requestRef, 3, 64)
+        && isValidNonEmptyString(reqData.pickupAddress, 2, 300)
+        && isValidNonEmptyString(reqData.category, 2, 60)
+        && isValidNonEmptyString(reqData.volumeTier, 2, 60)
+        && isValidLat(reqData.lat)
+        && isValidLng(reqData.lng)
+        && reqData.status == 'PENDING_DISPATCH'
+        && (!('assignedTruckId' in reqData) || reqData.assignedTruckId == null)
+        && (!('assignedAt' in reqData) || reqData.assignedAt == null)
+        && (!('enRouteAt' in reqData) || reqData.enRouteAt == null)
+        && (!('arrivedAt' in reqData) || reqData.arrivedAt == null)
+        && (!('collectedAt' in reqData) || reqData.collectedAt == null)
+        && (!('completedAt' in reqData) || reqData.completedAt == null)
+        && (!('failedAt' in reqData) || reqData.failedAt == null)
+        && (!('failureReason' in reqData) || reqData.failureReason == null)
+        && (!('pocPhotoUrl' in reqData) || reqData.pocPhotoUrl == null)
+        && (!('pocPhotoBase64' in reqData) || reqData.pocPhotoBase64 == null)
+        && (!('collectorPhoneNumber' in reqData) || reqData.collectorPhoneNumber == null)
+        && (!('agreedPrice' in reqData) || reqData.agreedPrice == null)
+        && isTimestampOrPositiveInt(reqData.createdAt)
+        && isTimestampOrPositiveInt(reqData.updatedAt);
+    }
+
+    function hasProofOfCollection(reqData) {
+      return ('pocPhotoUrl' in reqData && isValidNonEmptyString(reqData.pocPhotoUrl, 5, 1024))
+        || ('pocPhotoBase64' in reqData && isValidNonEmptyString(reqData.pocPhotoBase64, 10, 1048576));
+    }
+
+    function isValidCollectorRequestTransition(existingData, newData) {
+      return (existingData.status == 'ASSIGNED_TO_FLEET'
+              && newData.status == 'EN_ROUTE'
+              && isTimestampOrPositiveInt(newData.enRouteAt))
+        || (existingData.status == 'EN_ROUTE'
+            && newData.status == 'ARRIVED_AT_LOCATION'
+            && isTimestampOrPositiveInt(newData.arrivedAt))
+        || (existingData.status == 'ARRIVED_AT_LOCATION'
+            && newData.status == 'COLLECTION_VERIFIED'
+            && isTimestampOrPositiveInt(newData.collectedAt))
+        || (existingData.status == 'COLLECTION_VERIFIED'
+            && newData.status == 'IN_TRANSIT_TO_DUMP')
+        || (existingData.status in ['ARRIVED_AT_LOCATION', 'COLLECTION_VERIFIED', 'IN_TRANSIT_TO_DUMP']
+            && newData.status == 'COMPLETED'
+            && isTimestampOrPositiveInt(newData.completedAt)
+            && hasProofOfCollection(newData))
+        || (existingData.status in ['ASSIGNED_TO_FLEET', 'EN_ROUTE', 'ARRIVED_AT_LOCATION']
+            && newData.status == 'FAILED'
+            && isTimestampOrPositiveInt(newData.failedAt)
+            && isValidNonEmptyString(newData.failureReason, 3, 500));
     }
 
     function canUpdateWasteRequest(existingData, newData) {
-      return isAdmin()
-        || (isActiveResident(request.auth.uid)
+      return hasAllowedWasteRequestKeys(newData)
+        && isTimestampOrPositiveInt(newData.updatedAt)
+        && (
+          // Branch A: Resident Owner (May only edit notes/address/photos or cancel while PENDING_DISPATCH)
+          (
+            isActiveResident(request.auth.uid)
             && existingData.clientUid == request.auth.uid
-            && newData.clientUid == existingData.clientUid
-            && newData.assignedTruckId == existingData.assignedTruckId)
-        || (isApprovedActiveCollector(request.auth.uid)
+            && existingData.status == 'PENDING_DISPATCH'
+            && newData.status in ['PENDING_DISPATCH', 'CANCELLED']
+            && !newData.diff(existingData).affectedKeys().hasAny([
+                 'id', 'requestRef', 'clientUid', 'category', 'volumeTier',
+                 'assignedTruckId', 'assignedAt', 'enRouteAt', 'arrivedAt',
+                 'collectedAt', 'completedAt', 'failedAt', 'failureReason',
+                 'pocPhotoUrl', 'pocPhotoBase64', 'agreedPrice',
+                 'collectorPhoneNumber', 'createdAt'
+               ])
+          )
+          // Branch B: Assigned Collector (Strictly operational state transitions; cannot touch ownership or payment)
+          || (
+            isApprovedActiveCollector(request.auth.uid)
             && existingData.assignedTruckId == request.auth.uid
-            && newData.clientUid == existingData.clientUid
-            && newData.assignedTruckId == existingData.assignedTruckId);
+            && !newData.diff(existingData).affectedKeys().hasAny([
+                 'id', 'requestRef', 'clientUid', 'geohash', 'lat', 'lng',
+                 'pickupAddress', 'category', 'volumeTier', 'notes',
+                 'gatePhotoBase64', 'gatePhotoUrl', 'photos',
+                 'assignedTruckId', 'assignedAt', 'agreedPrice',
+                 'residentPhoneNumber', 'createdAt'
+               ])
+            && isValidCollectorRequestTransition(existingData, newData)
+          )
+          // Branch C: Trusted Administrator (Dispatch assignment, price setting, or administrative status resolution)
+          || (
+            isAdmin()
+            && !newData.diff(existingData).affectedKeys().hasAny([
+                 'id', 'requestRef', 'clientUid', 'createdAt'
+               ])
+            && newData.status in [
+                 'PENDING_DISPATCH', 'FLAGGED_FOR_REVIEW', 'ASSIGNED_TO_FLEET',
+                 'CANCELLED', 'FAILED'
+               ]
+            && (
+                 newData.status != 'ASSIGNED_TO_FLEET'
+                 || isValidNonEmptyString(newData.assignedTruckId, 1, 128)
+               )
+            && (
+                 !('agreedPrice' in newData)
+                 || newData.agreedPrice == null
+                 || (newData.agreedPrice is number && newData.agreedPrice >= 0)
+               )
+          )
+        );
     }
 
-    // Both legacy naming variants ("waste_requests" and "wasteRequests") are protected identically
+    // Both canonical ("waste_requests") and legacy ("wasteRequests") paths enforce identical security rules
     match /waste_requests/{requestId} {
       allow get, list: if canReadWasteRequest(resource.data);
-      allow create: if canCreateWasteRequest(request.resource.data);
+      allow create: if canCreateWasteRequest(requestId, request.resource.data);
       allow update: if canUpdateWasteRequest(resource.data, request.resource.data);
-      allow delete: if isAdmin();
+      allow delete: if false;
     }
 
     match /wasteRequests/{requestId} {
       allow get, list: if canReadWasteRequest(resource.data);
-      allow create: if canCreateWasteRequest(request.resource.data);
+      allow create: if canCreateWasteRequest(requestId, request.resource.data);
       allow update: if canUpdateWasteRequest(resource.data, request.resource.data);
-      allow delete: if isAdmin();
+      allow delete: if false;
     }
 
-    // Live Collector Telemetry: only approved, active collectors can publish their own location
+    // =========================================================================
+    // 7. LIVE COLLECTOR TELEMETRY: /live_locations/{collectorId}
+    // =========================================================================
+
+    function isActiveRequestForCollectorAndResident(reqData, collectorId, residentUid) {
+      return reqData.clientUid == residentUid
+        && reqData.assignedTruckId == collectorId
+        && reqData.status in ['ASSIGNED_TO_FLEET', 'EN_ROUTE', 'ARRIVED_AT_LOCATION'];
+    }
+
+    function isActiveRequestAssignedToCollector(reqData, collectorId) {
+      return reqData.assignedTruckId == collectorId
+        && reqData.status in [
+             'ASSIGNED_TO_FLEET', 'EN_ROUTE', 'ARRIVED_AT_LOCATION',
+             'COLLECTION_VERIFIED', 'IN_TRANSIT_TO_DUMP'
+           ];
+    }
+
+    // Verifies the actual request-to-collector-to-resident relationship in Firestore
+    function isResidentAssignedToActiveCollector(collectorId, locData) {
+      return isAuthenticated()
+        && ('activeRequestId' in locData)
+        && isValidNonEmptyString(locData.activeRequestId, 1, 128)
+        && (
+             (exists(/databases/$(database)/documents/waste_requests/$(locData.activeRequestId))
+              && isActiveRequestForCollectorAndResident(
+                   get(/databases/$(database)/documents/waste_requests/$(locData.activeRequestId)).data,
+                   collectorId,
+                   request.auth.uid
+                 ))
+             ||
+             (exists(/databases/$(database)/documents/wasteRequests/$(locData.activeRequestId))
+              && isActiveRequestForCollectorAndResident(
+                   get(/databases/$(database)/documents/wasteRequests/$(locData.activeRequestId)).data,
+                   collectorId,
+                   request.auth.uid
+                 ))
+           );
+    }
+
+    // Verifies on collector location write that any referenced activeRequestId is genuinely assigned to this collector
+    function hasValidOptionalActiveRequestForCollector(collectorId, locData) {
+      return !('activeRequestId' in locData)
+        || locData.activeRequestId == null
+        || (
+             isValidNonEmptyString(locData.activeRequestId, 1, 128)
+             && (
+                  (exists(/databases/$(database)/documents/waste_requests/$(locData.activeRequestId))
+                   && isActiveRequestAssignedToCollector(
+                        get(/databases/$(database)/documents/waste_requests/$(locData.activeRequestId)).data,
+                        collectorId
+                      ))
+                  ||
+                  (exists(/databases/$(database)/documents/wasteRequests/$(locData.activeRequestId))
+                   && isActiveRequestAssignedToCollector(
+                        get(/databases/$(database)/documents/wasteRequests/$(locData.activeRequestId)).data,
+                        collectorId
+                      ))
+                )
+           );
+    }
+
     match /live_locations/{collectorId} {
-      allow get, list: if isAuthenticated();
-      allow create, update: if isAdmin()
-        || (isApprovedActiveCollector(collectorId)
-            && request.resource.data.collectorId == collectorId);
+      // Single-document read:
+      // 1. Trusted Admin (fleet monitoring)
+      // 2. Collector reading their own location
+      // 3. Resident whose active waste request is currently assigned to this collector
+      allow get: if isAdmin()
+        || isApprovedActiveCollector(collectorId)
+        || isResidentAssignedToActiveCollector(collectorId, resource.data);
+
+      // Collection listing of all live locations is restricted strictly to Administrators
+      allow list: if isAdmin();
+
+      // Only an approved, active collector (for their own UID) or Admin can write telemetry
+      allow create, update: if (
+        isApprovedActiveCollector(collectorId)
+        && request.resource.data.keys().hasOnly([
+             'id', 'collectorId', 'lat', 'lng', 'heading',
+             'timestamp', 'updatedAtEpochMs', 'activeRequestId'
+           ])
+        && request.resource.data.collectorId == collectorId
+        && isValidLat(request.resource.data.lat)
+        && isValidLng(request.resource.data.lng)
+        && request.resource.data.heading is number
+        && request.resource.data.heading >= 0
+        && request.resource.data.heading <= 360
+        && hasValidOptionalActiveRequestForCollector(collectorId, request.resource.data)
+      ) || (
+        isAdmin()
+        && request.resource.data.keys().hasOnly([
+             'id', 'collectorId', 'lat', 'lng', 'heading',
+             'timestamp', 'updatedAtEpochMs', 'activeRequestId'
+           ])
+        && request.resource.data.collectorId == collectorId
+        && isValidLat(request.resource.data.lat)
+        && isValidLng(request.resource.data.lng)
+      );
+
       allow delete: if isAdmin() || isOwner(collectorId);
     }
 
-    // Disputes & Append-Only Dispute Notes
+    // =========================================================================
+    // 8. DISPUTES & APPEND-ONLY DISPUTE NOTES: /disputes/{disputeId} & /service_disputes/{disputeId}
+    // =========================================================================
+
+    function isGenuineResidentRequestForDispute(reqId, residentUid, collectorUid) {
+      return isValidNonEmptyString(reqId, 1, 128)
+        && (
+             (exists(/databases/$(database)/documents/waste_requests/$(reqId))
+              && get(/databases/$(database)/documents/waste_requests/$(reqId)).data.clientUid == residentUid
+              && (collectorUid == '' || get(/databases/$(database)/documents/waste_requests/$(reqId)).data.assignedTruckId == collectorUid))
+             ||
+             (exists(/databases/$(database)/documents/wasteRequests/$(reqId))
+              && get(/databases/$(database)/documents/wasteRequests/$(reqId)).data.clientUid == residentUid
+              && (collectorUid == '' || get(/databases/$(database)/documents/wasteRequests/$(reqId)).data.assignedTruckId == collectorUid))
+           );
+    }
+
     match /disputes/{disputeId} {
       allow get, list: if isAdmin()
         || (isAuthenticated()
             && (resource.data.residentId == request.auth.uid
                 || resource.data.collectorId == request.auth.uid));
-      allow create: if isAdmin()
-        || (isAuthenticated()
-            && isEmailVerifiedInToken()
-            && request.resource.data.residentId == request.auth.uid);
-      allow update, delete: if isAdmin();
+
+      allow create: if isActiveOrRestrictedUser(request.auth.uid)
+        && userDoc(request.auth.uid).data.role in ['RESIDENT', 'resident']
+        && request.resource.data.keys().hasOnly([
+             'id', 'requestId', 'residentId', 'collectorId', 'status',
+             'reason', 'resolutionOutcome', 'dueBy', 'createdAt', 'updatedAt'
+           ])
+        && request.resource.data.residentId == request.auth.uid
+        && request.resource.data.collectorId is string
+        && isGenuineResidentRequestForDispute(
+             request.resource.data.requestId,
+             request.auth.uid,
+             request.resource.data.collectorId
+           )
+        && request.resource.data.status == 'OPEN'
+        && isValidNonEmptyString(request.resource.data.reason, 5, 1000)
+        && (!('resolutionOutcome' in request.resource.data) || request.resource.data.resolutionOutcome == null)
+        && isTimestampOrPositiveInt(request.resource.data.createdAt)
+        && isTimestampOrPositiveInt(request.resource.data.updatedAt);
+
+      allow update: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+             'id', 'requestId', 'residentId', 'collectorId', 'status',
+             'reason', 'resolutionOutcome', 'dueBy', 'createdAt', 'updatedAt',
+             'resolvedByUid', 'resolvedAtEpochMs'
+           ])
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+             'id', 'requestId', 'residentId', 'collectorId', 'reason', 'createdAt'
+           ])
+        && request.resource.data.status in ['OPEN', 'INVESTIGATING', 'RESOLVED']
+        && (
+             request.resource.data.status != 'RESOLVED'
+             || isValidNonEmptyString(request.resource.data.resolutionOutcome, 2, 500)
+           )
+        && (!('resolvedByUid' in request.resource.data) || request.resource.data.resolvedByUid == request.auth.uid);
+
+      allow delete: if false;
 
       match /notes/{noteId} {
         allow get, list: if isAdmin();
         allow create: if isAdmin()
-          && request.resource.data.adminId == request.auth.uid;
+          && request.resource.data.keys().hasOnly(['id', 'text', 'adminId', 'timestampMs'])
+          && request.resource.data.adminId == request.auth.uid
+          && isValidNonEmptyString(request.resource.data.text, 2, 2000)
+          && isPositiveInt(request.resource.data.timestampMs);
         allow update, delete: if false;
       }
     }
@@ -484,20 +914,79 @@ service cloud.firestore {
     match /service_disputes/{disputeId} {
       allow get, list: if isAdmin()
         || (isAuthenticated() && resource.data.reporterId == request.auth.uid);
-      allow create: if isAdmin()
-        || (isAuthenticated()
-            && isEmailVerifiedInToken()
-            && request.resource.data.reporterId == request.auth.uid);
-      allow update, delete: if isAdmin();
-    }
 
-    match /operational_units/{unitId} {
-      allow get, list: if isAuthenticated();
-      allow create, update, delete: if isAdmin();
+      allow create: if isActiveOrRestrictedUser(request.auth.uid)
+        && request.resource.data.keys().hasOnly([
+             'id', 'reporterId', 'disputedEntityType', 'disputedEntityId',
+             'snapshotData', 'reason', 'status', 'resolutionOutcome',
+             'resolvedByUid', 'createdAt', 'updatedAt'
+           ])
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.disputedEntityType in ['CLIENT', 'OPERATIONAL_UNIT', 'PICKUP_REQUEST']
+        && isValidNonEmptyString(request.resource.data.disputedEntityId, 1, 128)
+        && isValidNonEmptyString(request.resource.data.reason, 5, 1000)
+        && request.resource.data.status in ['PENDING_REVIEW', 'OPEN']
+        && (!('resolutionOutcome' in request.resource.data) || request.resource.data.resolutionOutcome == null)
+        && (!('resolvedByUid' in request.resource.data) || request.resource.data.resolvedByUid == null)
+        && isTimestampOrPositiveInt(request.resource.data.createdAt)
+        && isTimestampOrPositiveInt(request.resource.data.updatedAt);
+
+      allow update: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+             'id', 'reporterId', 'disputedEntityType', 'disputedEntityId',
+             'snapshotData', 'reason', 'status', 'resolutionOutcome',
+             'resolvedByUid', 'createdAt', 'updatedAt'
+           ])
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+             'id', 'reporterId', 'disputedEntityType', 'disputedEntityId',
+             'snapshotData', 'reason', 'createdAt'
+           ])
+        && request.resource.data.status in [
+             'PENDING_REVIEW', 'OPEN', 'ACTIVE', 'PENDING',
+             'INVESTIGATING', 'RESOLVED', 'DISMISSED'
+           ]
+        && (!('resolvedByUid' in request.resource.data) || request.resource.data.resolvedByUid == request.auth.uid);
+
+      allow delete: if false;
     }
 
     // =========================================================================
-    // 7. DEFAULT-DENY FALLBACK FOR ALL UNRECOGNIZED PATHS
+    // 9. OPERATIONAL FLEET UNITS: /operational_units/{unitId}
+    // =========================================================================
+    match /operational_units/{unitId} {
+      // Only Admins or the approved active collector owning the unit (companyId) can read
+      allow get, list: if isAdmin()
+        || (isApprovedActiveCollector(request.auth.uid) && resource.data.companyId == request.auth.uid);
+
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+             'id', 'companyId', 'name', 'licensePlate', 'status',
+             'totalPickups', 'rating', 'createdAt', 'updatedAt'
+           ])
+        && isValidNonEmptyString(request.resource.data.companyId, 1, 128)
+        && isValidNonEmptyString(request.resource.data.name, 2, 100)
+        && isValidNonEmptyString(request.resource.data.licensePlate, 3, 20)
+        && request.resource.data.status in ['DRAFT', 'PENDING_INSPECTION', 'ACTIVE', 'GROUNDED']
+        && isNonNegativeInt(request.resource.data.totalPickups)
+        && request.resource.data.rating is number
+        && request.resource.data.rating >= 0
+        && request.resource.data.rating <= 5;
+
+      allow update: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+             'id', 'companyId', 'name', 'licensePlate', 'status',
+             'totalPickups', 'rating', 'createdAt', 'updatedAt'
+           ])
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+             'id', 'companyId', 'createdAt'
+           ])
+        && request.resource.data.status in ['DRAFT', 'PENDING_INSPECTION', 'ACTIVE', 'GROUNDED'];
+
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 10. DEFAULT-DENY FALLBACK FOR ALL UNRECOGNIZED PATHS
     // =========================================================================
     match /{document=**} {
       allow read, write: if false;

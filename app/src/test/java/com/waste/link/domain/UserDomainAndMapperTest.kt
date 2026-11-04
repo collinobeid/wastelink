@@ -369,4 +369,86 @@ class UserDomainAndMapperTest {
         assertEquals(1740000000000L, convertedFromLegacyDataUser.suspendedUntilEpochMs)
         assertTrue(convertedFromLegacyDataUser.isAccountLocked)
     }
+
+    // =========================================================================
+    // 6. Canonical Schema Contract & Firestore Rules Drift Regression
+    // =========================================================================
+
+    @Test
+    fun `canonical Kotlin domain enums and UserMapper keys match firestore rules schema contract`() {
+        assertEquals(
+            listOf("RESIDENT", "COLLECTOR", "ADMIN"),
+            UserRole.entries.map { it.name }
+        )
+        assertEquals(
+            listOf("resident", "collector", "admin"),
+            UserRole.entries.map { it.firestoreValue }
+        )
+        assertEquals(
+            listOf("ACTIVE", "RESTRICTED", "SUSPENDED", "BANNED"),
+            AccountStatus.entries.map { it.name }
+        )
+        assertEquals(
+            listOf("NOT_STARTED", "IN_PROGRESS", "COMPLETED"),
+            OnboardingStatus.entries.map { it.name }
+        )
+        assertEquals(
+            listOf("NOT_APPLICABLE", "NOT_SUBMITTED", "PENDING_REVIEW", "APPROVED", "REJECTED"),
+            CollectorVerificationStatus.entries.map { it.name }
+        )
+
+        val rulesFile = listOf(
+            java.io.File("firestore.rules"),
+            java.io.File("../firestore.rules")
+        ).firstOrNull { it.exists() }
+        assertNotNull("firestore.rules must exist at repository root", rulesFile)
+        val rulesText = rulesFile!!.readText()
+
+        // 1. All canonical enum values must be present in firestore.rules
+        for (status in AccountStatus.entries) {
+            assertTrue("Missing AccountStatus.${status.name} in firestore.rules", rulesText.contains("'${status.name}'"))
+        }
+        for (status in OnboardingStatus.entries) {
+            assertTrue("Missing OnboardingStatus.${status.name} in firestore.rules", rulesText.contains("'${status.name}'"))
+        }
+        for (status in CollectorVerificationStatus.entries) {
+            assertTrue(
+                "Missing CollectorVerificationStatus.${status.name} in firestore.rules",
+                rulesText.contains("'${status.name}'")
+            )
+        }
+
+        // 2. Non-canonical / drifted enum strings must NEVER appear in firestore.rules
+        val forbiddenDriftedEnums = listOf(
+            "'UNSUBMITTED'",
+            "'PROFILE_COMPLETE'",
+            "'COLLECTOR_PROFILE_INCOMPLETE'",
+            "'COLLECTOR_PENDING_VERIFICATION'",
+            "'COLLECTOR_APPROVED'",
+            "'COLLECTOR_REJECTED'",
+            "'DEACTIVATED'"
+        )
+        for (forbidden in forbiddenDriftedEnums) {
+            assertFalse(
+                "Forbidden non-canonical enum value $forbidden found in firestore.rules",
+                rulesText.contains(forbidden)
+            )
+        }
+
+        // 3. Every key written by UserMapper.toFirestoreMap() must be allowed in firestore.rules
+        val sampleUser = User(
+            id = "uid_schema_check",
+            fullName = "Schema Contract User",
+            email = "schema@wastelink.co.tz",
+            phoneNumber = "+255712345678",
+            role = UserRole.RESIDENT,
+            createdAtEpochMs = 1730000000000L,
+            updatedAtEpochMs = 1730000000000L
+        )
+        val mapKeys = sampleUser.toFirestoreMap().keys
+        for (key in mapKeys) {
+            assertTrue("UserMapper key '$key' missing from firestore.rules allowlist", rulesText.contains("'$key'"))
+        }
+    }
 }
+

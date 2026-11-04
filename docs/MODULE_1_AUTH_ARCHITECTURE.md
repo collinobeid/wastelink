@@ -127,9 +127,10 @@ data class User(
     val statusReason: String? = null,                            // Admin-supplied reason for RESTRICTED / SUSPENDED / BANNED
     val suspendedUntilEpochMs: Long? = null,                     // Read-only expiration timestamp when SUSPENDED
     val onboardingStatus: OnboardingStatus = OnboardingStatus.NOT_STARTED,
-    val isEmailVerified: Boolean = false,                        // Populated EXCLUSIVELY from FirebaseAuth.currentUser.isEmailVerified
     val isPhoneVerified: Boolean = false,                        // Always false in Module 1 (contact info only)
-    val collectorVerificationStatus: CollectorVerificationStatus = CollectorVerificationStatus.NOT_APPLICABLE,
+    val collectorVerificationStatus: CollectorVerificationStatus =
+        if (role == UserRole.COLLECTOR) CollectorVerificationStatus.NOT_SUBMITTED
+        else CollectorVerificationStatus.NOT_APPLICABLE,
     val collectorRejectionReason: String? = null,                // Admin feedback when collectorVerificationStatus == REJECTED
     val defaultZoneId: String? = null,                           // Resident default pickup zone / Collector operating zone
     val vehicleType: String? = null,                             // Collector vehicle classification

@@ -17,7 +17,31 @@
       ]
     },
     {
+      "collectionGroup": "users",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "role", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "waste_requests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "clientUid", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "waste_requests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assignedTruckId", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wasteRequests",
       "queryScope": "COLLECTION",
       "fields": [
         { "fieldPath": "clientUid", "order": "ASCENDING" },
@@ -28,7 +52,31 @@
       "collectionGroup": "wasteRequests",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "clientUid", "order": "ASCENDING" },
+        { "fieldPath": "assignedTruckId", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "disputes",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "residentId", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "disputes",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "collectorId", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "service_disputes",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "reporterId", "order": "ASCENDING" },
         { "fieldPath": "createdAt", "order": "DESCENDING" }
       ]
     }
