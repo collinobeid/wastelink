@@ -98,6 +98,8 @@ interface AuthRemoteDataSource {
 
     suspend fun fetchCollectorSubmission(uid: String): RemoteDocumentResult
 
+    suspend fun fetchCollectorSubmissionHistory(uid: String): List<Map<String, Any?>>
+
     suspend fun executeCollectorInitialSubmissionBatch(
         uid: String,
         submissionData: Map<String, Any?>,

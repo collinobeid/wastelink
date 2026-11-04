@@ -383,6 +383,12 @@ class AuthValidatorTest {
         assertEquals(ValidationError.REQUIRED_FIELD, AuthValidator.validateServiceZoneId(null).errorOrNull())
         assertEquals(ValidationError.REQUIRED_FIELD, AuthValidator.validateServiceZoneId("").errorOrNull())
 
+        // Explicit unsupported / unlisted zone choice
+        val unsupportedResult = AuthValidator.validateServiceZoneId(AuthValidator.UNSUPPORTED_ZONE_ID)
+        assertFalse(unsupportedResult.isValid)
+        assertEquals(ValidationError.SERVICE_ZONE_INVALID, unsupportedResult.errorOrNull())
+        assertTrue(unsupportedResult.errorMessageOrNull()!!.contains("not yet supported in this area"))
+
         // Invalid: unknown zone
         assertEquals(ValidationError.SERVICE_ZONE_INVALID, AuthValidator.validateServiceZoneId("zone_atlantis").errorOrNull())
         assertEquals(ValidationError.SERVICE_ZONE_INVALID, AuthValidator.validateServiceZoneId("invalid_format").errorOrNull())

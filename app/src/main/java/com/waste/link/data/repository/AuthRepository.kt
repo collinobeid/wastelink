@@ -61,6 +61,12 @@ interface AuthRepository {
      */
     fun isServerVerifiedSession(): Boolean
 
+    /**
+     * Updates the current in-memory [SessionState] with an authoritative, server-verified [User] profile.
+     * Used by collaborating repositories (such as [CollectorVerificationRepository]) to update the session.
+     */
+    fun applyServerVerifiedUserToSession(user: User)
+
     /** Returns the cached [RegistrationDraft] if a same-session partial registration is pending recovery. */
     fun getPendingRegistrationDraft(): RegistrationDraft?
 

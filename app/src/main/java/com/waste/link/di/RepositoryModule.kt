@@ -6,6 +6,8 @@ import com.waste.link.data.remote.AuthRemoteDataSource
 import com.waste.link.data.remote.FirebaseAuthDataSource
 import com.waste.link.data.repository.AuthRepository
 import com.waste.link.data.repository.AuthRepositoryImpl
+import com.waste.link.data.repository.CollectorVerificationRepository
+import com.waste.link.data.repository.CollectorVerificationRepositoryImpl
 import com.waste.link.data.repository.WasteRequestRepository
 import com.waste.link.data.repository.WasteRequestRepositoryImpl
 import dagger.Binds
@@ -33,6 +35,12 @@ abstract class RepositoryModule {
 
     @Binds
     @Singleton
+    abstract fun bindCollectorVerificationRepository(
+        collectorVerificationRepositoryImpl: CollectorVerificationRepositoryImpl
+    ): CollectorVerificationRepository
+
+    @Binds
+    @Singleton
     abstract fun bindWasteRequestRepository(
         wasteRequestRepositoryImpl: WasteRequestRepositoryImpl
     ): WasteRequestRepository
@@ -44,6 +52,8 @@ interface AuthRepositoryEntryPoint {
     fun authRemoteDataSource(): AuthRemoteDataSource
     fun authRepository(): AuthRepository
     fun authRepositoryImpl(): AuthRepositoryImpl
+    fun collectorVerificationRepository(): CollectorVerificationRepository
+    fun collectorVerificationRepositoryImpl(): CollectorVerificationRepositoryImpl
     fun firebaseAuth(): FirebaseAuth
     fun firebaseFirestore(): FirebaseFirestore
 }

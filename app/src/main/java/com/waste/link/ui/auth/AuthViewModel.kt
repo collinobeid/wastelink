@@ -3,6 +3,7 @@ package com.waste.link.ui.auth
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.waste.link.data.repository.AuthRepository
+import com.waste.link.data.repository.CollectorVerificationRepository
 import com.waste.link.domain.model.AccountStatus
 import com.waste.link.domain.model.AuthError
 import com.waste.link.domain.model.CollectorSubmission
@@ -178,7 +179,7 @@ data class AuthUiState(
     val passwordReset: PasswordResetUiState = PasswordResetUiState(),
 
     // Resident Onboarding State
-    val residentSelectedZone: String = "zone_kinondoni",
+    val residentSelectedZone: String = "",
     val residentZoneError: String? = null,
     val residentAddress: String = "",
     val isCompletingOnboarding: Boolean = false,
@@ -186,13 +187,13 @@ data class AuthUiState(
     val residentOnboardingBanner: AuthBannerMessage? = null,
 
     // Collector Onboarding & KYC State
-    val collectorVehicleType: String = "Compactor Truck",
+    val collectorVehicleType: String = "",
     val collectorVehicleTypeError: String? = null,
     val collectorPlateNumber: String = "",
     val collectorPlateNumberError: String? = null,
     val collectorLicenseNumber: String = "",
     val collectorLicenseNumberError: String? = null,
-    val collectorServiceZoneId: String = "zone_kinondoni",
+    val collectorServiceZoneId: String = "",
     val collectorServiceZoneError: String? = null,
     val isCollectorReviewStep: Boolean = false,
     val isSubmittingCollectorOnboarding: Boolean = false,
@@ -208,15 +209,33 @@ data class AuthUiState(
 }
 
 /**
- * Canonical Authentication ViewModel (Module 1, Stage 4).
+ * Canonical Authentication ViewModel (Module 1, Stage 4 & 5.1).
  *
- * Connects the presentation layer to the canonical [AuthRepository] contract without using
- * any deprecated legacy `AppUser` bridge methods.
+ * Connects the presentation layer to the canonical [AuthRepository] and [CollectorVerificationRepository] contracts.
  */
 @HiltViewModel
 class AuthViewModel @Inject constructor(
-    private val authRepository: AuthRepository
+    private val authRepository: AuthRepository,
+    private val collectorVerificationRepository: CollectorVerificationRepository
 ) : ViewModel() {
+
+    constructor(authRepository: AuthRepository) : this(
+        authRepository = authRepository,
+        collectorVerificationRepository = object : CollectorVerificationRepository {
+            override suspend fun submitInitialVerification(input: com.waste.link.domain.model.CollectorSubmissionInput) =
+                authRepository.submitCollectorOnboarding(input)
+            override suspend fun resubmitVerification(input: com.waste.link.domain.model.CollectorSubmissionInput) =
+                authRepository.resubmitCollectorOnboarding(input)
+            override suspend fun getSubmission(uid: String) =
+                authRepository.getCollectorSubmission(uid)
+            override suspend fun getSubmissionHistory(uid: String) =
+                Result.success(emptyList<com.waste.link.domain.model.CollectorSubmissionHistoryEntry>())
+            override suspend fun adminApproveCollectorSubmission(collectorUid: String, adminUid: String) =
+                authRepository.adminApproveCollectorSubmission(collectorUid, adminUid)
+            override suspend fun adminRejectCollectorSubmission(collectorUid: String, adminUid: String, rejectionReason: String, adminNotes: String?) =
+                authRepository.adminRejectCollectorSubmission(collectorUid, adminUid, rejectionReason)
+        }
+    )
 
     companion object {
         const val DEFAULT_COOLDOWN_SECONDS = 60
@@ -1562,6 +1581,14 @@ class AuthViewModel @Inject constructor(
             it.copy(
                 residentSelectedZone = zone,
                 residentZoneError = validation.errorMessageOrNull(),
+                residentOnboardingBanner = if (zone.equals(AuthValidator.UNSUPPORTED_ZONE_ID, ignoreCase = true)) {
+                    AuthBannerMessage(
+                        type = AuthBannerType.WARNING,
+                        title = "Service Area Not Yet Supported",
+                        message = "WasteLink doorstep collection is currently active in Dar es Salaam, Arusha, and Dodoma municipal zones. Pickups cannot be scheduled outside active zones.",
+                        isRetryable = false
+                    )
+                } else null,
                 onboardingError = null
             )
         }
@@ -1580,12 +1607,19 @@ class AuthViewModel @Inject constructor(
         val currentState = _uiState.value
         if (currentState.isCompletingOnboarding) return
 
-        val zoneToValidate = defaultZoneId ?: currentState.residentSelectedZone
+        val zoneToValidate = defaultZoneId?.takeIf { it.isNotBlank() } ?: currentState.residentSelectedZone
         val zoneValidation = AuthValidator.validateServiceZoneId(zoneToValidate)
         if (zoneValidation.isInvalid) {
+            val errorMsg = zoneValidation.errorMessageOrNull() ?: "Please select your municipal service zone."
             _uiState.update {
                 it.copy(
-                    residentZoneError = zoneValidation.errorMessageOrNull()
+                    residentZoneError = errorMsg,
+                    residentOnboardingBanner = AuthBannerMessage(
+                        type = AuthBannerType.ERROR,
+                        title = "Service Zone Required",
+                        message = errorMsg,
+                        isRetryable = false
+                    )
                 )
             }
             return
@@ -1595,7 +1629,8 @@ class AuthViewModel @Inject constructor(
             it.copy(
                 isCompletingOnboarding = true,
                 residentZoneError = null,
-                onboardingError = null
+                onboardingError = null,
+                residentOnboardingBanner = null
             )
         }
 
@@ -1606,7 +1641,8 @@ class AuthViewModel @Inject constructor(
                         it.copy(
                             isCompletingOnboarding = false,
                             currentUser = outcome.user,
-                            onboardingError = null
+                            onboardingError = null,
+                            residentOnboardingBanner = null
                         )
                     }
                     emitNavigation(
@@ -1620,7 +1656,13 @@ class AuthViewModel @Inject constructor(
                     _uiState.update {
                         it.copy(
                             isCompletingOnboarding = false,
-                            onboardingError = outcome.error.message
+                            onboardingError = outcome.error.message,
+                            residentOnboardingBanner = AuthBannerMessage(
+                                type = AuthBannerType.ERROR,
+                                title = "Setup Failed",
+                                message = outcome.error.message,
+                                isRetryable = outcome.error is AuthError.NetworkFailure
+                            )
                         )
                     }
                 }
@@ -1677,7 +1719,14 @@ class AuthViewModel @Inject constructor(
             it.copy(
                 collectorServiceZoneId = zone,
                 collectorServiceZoneError = validation.errorMessageOrNull(),
-                collectorOnboardingBanner = null
+                collectorOnboardingBanner = if (zone.equals(AuthValidator.UNSUPPORTED_ZONE_ID, ignoreCase = true)) {
+                    AuthBannerMessage(
+                        type = AuthBannerType.WARNING,
+                        title = "Commercial Coverage Area Required",
+                        message = "Commercial fleet operations are currently supported only in authorized municipal zones (Dar es Salaam, Arusha, Dodoma).",
+                        isRetryable = false
+                    )
+                } else null
             )
         }
     }
@@ -1748,7 +1797,7 @@ class AuthViewModel @Inject constructor(
         }
 
         viewModelScope.launch {
-            when (val outcome = authRepository.submitCollectorOnboarding(input)) {
+            when (val outcome = collectorVerificationRepository.submitInitialVerification(input)) {
                 is CollectorSubmissionOutcome.Success -> {
                     _uiState.update {
                         it.copy(
@@ -1814,7 +1863,7 @@ class AuthViewModel @Inject constructor(
         }
 
         viewModelScope.launch {
-            when (val outcome = authRepository.resubmitCollectorOnboarding(input)) {
+            when (val outcome = collectorVerificationRepository.resubmitVerification(input)) {
                 is CollectorSubmissionOutcome.Success -> {
                     _uiState.update {
                         it.copy(
@@ -1849,7 +1898,7 @@ class AuthViewModel @Inject constructor(
         val uid = _uiState.value.currentUser?.id ?: authRepository.getCurrentUser()?.id ?: return
         _uiState.update { it.copy(isLoadingCollectorSubmission = true) }
         viewModelScope.launch {
-            val submission = authRepository.getCollectorSubmission(uid).getOrNull()
+            val submission = collectorVerificationRepository.getSubmission(uid).getOrNull()
             _uiState.update {
                 it.copy(
                     isLoadingCollectorSubmission = false,
@@ -1865,7 +1914,7 @@ class AuthViewModel @Inject constructor(
         viewModelScope.launch {
             authRepository.restoreSession()
             val user = authRepository.getCurrentUser()
-            val submission = user?.let { authRepository.getCollectorSubmission(it.id).getOrNull() }
+            val submission = user?.let { collectorVerificationRepository.getSubmission(it.id).getOrNull() }
             _uiState.update {
                 it.copy(
                     isLoadingCollectorSubmission = false,
@@ -1888,14 +1937,14 @@ class AuthViewModel @Inject constructor(
         val currentSub = _uiState.value.collectorSubmission
         val currentUser = _uiState.value.currentUser
         viewModelScope.launch {
-            val sub = currentSub ?: currentUser?.let { authRepository.getCollectorSubmission(it.id).getOrNull() }
+            val sub = currentSub ?: currentUser?.let { collectorVerificationRepository.getSubmission(it.id).getOrNull() }
             _uiState.update {
                 it.copy(
                     collectorSubmission = sub ?: it.collectorSubmission,
-                    collectorVehicleType = sub?.vehicleType ?: currentUser?.vehicleType ?: "Compactor Truck",
-                    collectorPlateNumber = sub?.vehiclePlateNumber ?: currentUser?.vehiclePlateNumber ?: "",
-                    collectorLicenseNumber = sub?.licenseNumber ?: it.collectorLicenseNumber.ifBlank { "DL-11112222" },
-                    collectorServiceZoneId = sub?.serviceZoneId ?: currentUser?.defaultZoneId ?: "zone_kinondoni",
+                    collectorVehicleType = sub?.vehicleType ?: currentUser?.vehicleType.orEmpty(),
+                    collectorPlateNumber = sub?.vehiclePlateNumber ?: currentUser?.vehiclePlateNumber.orEmpty(),
+                    collectorLicenseNumber = sub?.licenseNumber ?: it.collectorLicenseNumber,
+                    collectorServiceZoneId = sub?.serviceZoneId ?: currentUser?.defaultZoneId.orEmpty(),
                     collectorVehicleTypeError = null,
                     collectorPlateNumberError = null,
                     collectorLicenseNumberError = null,

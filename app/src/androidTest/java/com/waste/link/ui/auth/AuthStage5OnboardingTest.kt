@@ -193,6 +193,30 @@ class AuthStage5OnboardingTest {
         // Capture visual artifact: stage5_resident_onboarding.png
         saveDeviceScreenshot("stage5_resident_onboarding.png")
 
+        // Click Finish Button without selecting zone -> should show validation error
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_RES_BTN_FINISH)
+            .performScrollTo()
+            .performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Service Zone Required").assertIsDisplayed()
+
+        // Select Unsupported Zone option -> shows warning banner
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_RES_ZONE_DROPDOWN)
+            .performScrollTo()
+            .performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Other / Area Not Listed").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Service Area Not Yet Supported").assertIsDisplayed()
+
+        // Select valid zone: Kinondoni Municipality
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_RES_ZONE_DROPDOWN)
+            .performScrollTo()
+            .performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Kinondoni Municipality").performClick()
+        composeRule.waitForIdle()
+
         // Input street address
         composeRule.onNodeWithTag(AuthTestTags.ONBOARD_RES_INPUT_ADDRESS)
             .performScrollTo()
@@ -259,6 +283,22 @@ class AuthStage5OnboardingTest {
         composeRule.waitForIdle()
         composeRule.onNodeWithTag(AuthTestTags.ONBOARDING_SCREEN).assertIsDisplayed()
         composeRule.onNodeWithText("WASTE COLLECTOR ACCOUNT").assertIsDisplayed()
+
+        // Select Vehicle Type: Compactor Truck
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_COL_VEHICLE_DROPDOWN)
+            .performScrollTo()
+            .performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Compactor Truck").performClick()
+        composeRule.waitForIdle()
+
+        // Select Service Zone: Kinondoni Municipality
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_COL_ZONE_DROPDOWN)
+            .performScrollTo()
+            .performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Kinondoni Municipality").performClick()
+        composeRule.waitForIdle()
 
         // Enter plate number
         composeRule.onNodeWithTag(AuthTestTags.ONBOARD_COL_INPUT_PLATE)
@@ -560,6 +600,64 @@ class AuthStage5OnboardingTest {
     }
 
     // =========================================================================
+    // 5. Unapproved Collector Dashboard Guarding
+    // =========================================================================
+
+    @Test
+    fun test05_unapprovedCollectorBlockedFromDashboard() = runBlocking<Unit> {
+        val authResult = firebaseAuth.createUserWithEmailAndPassword(
+            "collector.pending@wastelink.co.tz",
+            "WasteLink2026!"
+        ).await()
+        val user = authResult.user!!
+        val uid = user.uid
+        verifyCurrentUserEmail(user)
+
+        val epochNow = System.currentTimeMillis()
+
+        // Seed user profile with PENDING_REVIEW verification
+        val userProfile = UserMapper.toFirestoreMap(
+            UserMapper.createInitialProfile(
+                uid = uid,
+                fullName = "Pending Collector",
+                email = "collector.pending@wastelink.co.tz",
+                phoneNumber = "+255755111222",
+                role = UserRole.COLLECTOR,
+                nowEpochMs = epochNow
+            ).copy(
+                onboardingStatus = OnboardingStatus.COMPLETED,
+                collectorVerificationStatus = CollectorVerificationStatus.PENDING_REVIEW,
+                defaultZoneId = "zone_kinondoni",
+                vehicleType = "Pickup Truck",
+                vehiclePlateNumber = "T 111 PND"
+            )
+        )
+        seedFirestoreDocWithAdminBypass("users", uid, userProfile)
+
+        val session = authRepository.restoreSession()
+        assertTrue("Session must be Authenticated", session is SessionState.Authenticated)
+
+        val viewModel = AuthViewModel(authRepository)
+
+        composeRule.setContent {
+            WasteLinkTheme {
+                Stage5TestNavHost(
+                    viewModel = viewModel,
+                    initialRoute = Destinations.COLLECTOR_DASHBOARD
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+        Thread.sleep(1_000L)
+        composeRule.waitForIdle()
+
+        // Navigation guard redirects unapproved collector to status screen
+        composeRule.onNodeWithTag(AuthTestTags.COL_STATUS_SCREEN).assertIsDisplayed()
+        composeRule.onNodeWithText("STATUS: UNDER REVIEW").assertIsDisplayed()
+    }
+
+    // =========================================================================
     // Test NavHost
     // =========================================================================
 
@@ -655,14 +753,26 @@ class AuthStage5OnboardingTest {
             }
 
             composable(Destinations.COLLECTOR_DASHBOARD) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(DarkBackground)
-                        .testTag(TAG_COLLECTOR_ENTRY),
-                    contentAlignment = Alignment.Center
+                val user = uiState.currentUser
+                if (user != null && user.role == UserRole.COLLECTOR &&
+                    user.collectorVerificationStatus != CollectorVerificationStatus.APPROVED
                 ) {
-                    Text("Collector Dashboard Entry", color = DarkForeground)
+                    LaunchedEffect(Unit) {
+                        navController.navigate(Destinations.COLLECTOR_VERIFICATION_STATUS) {
+                            popUpTo(Destinations.COLLECTOR_DASHBOARD) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    }
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(DarkBackground)
+                            .testTag(TAG_COLLECTOR_ENTRY),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("Collector Dashboard Entry", color = DarkForeground)
+                    }
                 }
             }
         }

@@ -216,6 +216,28 @@ class FirebaseAuthDataSource @Inject constructor(
         }
     }
 
+    override suspend fun fetchCollectorSubmissionHistory(uid: String): List<Map<String, Any?>> {
+        return try {
+            val snapshot = firestore.collection(COLLECTOR_SUBMISSIONS_COLLECTION)
+                .document(uid)
+                .collection(HISTORY_SUBCOLLECTION)
+                .get(Source.SERVER)
+                .await()
+            snapshot.documents.mapNotNull { it.data }
+        } catch (_: Exception) {
+            try {
+                val cached = firestore.collection(COLLECTOR_SUBMISSIONS_COLLECTION)
+                    .document(uid)
+                    .collection(HISTORY_SUBCOLLECTION)
+                    .get(Source.CACHE)
+                    .await()
+                cached.documents.mapNotNull { it.data }
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+    }
+
     override suspend fun executeCollectorInitialSubmissionBatch(
         uid: String,
         submissionData: Map<String, Any?>,

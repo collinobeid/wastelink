@@ -138,4 +138,33 @@ object CollectorSubmissionMapper {
             lastReviewedAtEpochMs = (data["lastReviewedAtEpochMs"] as? Number)?.toLong()
         )
     }
+
+    fun fromHistoryFirestoreMap(data: Map<String, Any?>?): CollectorSubmissionHistoryEntry? {
+        if (data == null) return null
+        val attemptId = data["attemptId"] as? String ?: return null
+        val userId = data["userId"] as? String ?: return null
+        val eventType = data["eventType"] as? String ?: return null
+        val vehicleType = (data["vehicleType"] as? String).orEmpty()
+        val vehiclePlateNumber = (data["vehiclePlateNumber"] as? String).orEmpty()
+        val licenseNumber = (data["licenseNumber"] as? String).orEmpty()
+        val serviceZoneId = (data["serviceZoneId"] as? String).orEmpty()
+        val attempt = (data["submissionAttempt"] as? Number)?.toInt() ?: 1
+        val timestamp = (data["timestampEpochMs"] as? Number)?.toLong() ?: 0L
+        val actorUid = data["actorUid"] as? String ?: return null
+        val rejectionReason = data["rejectionReason"] as? String
+
+        return CollectorSubmissionHistoryEntry(
+            attemptId = attemptId,
+            userId = userId,
+            eventType = eventType,
+            vehicleType = vehicleType,
+            vehiclePlateNumber = vehiclePlateNumber,
+            licenseNumber = licenseNumber,
+            serviceZoneId = serviceZoneId,
+            submissionAttempt = attempt,
+            timestampEpochMs = timestamp,
+            actorUid = actorUid,
+            rejectionReason = rejectionReason
+        )
+    }
 }

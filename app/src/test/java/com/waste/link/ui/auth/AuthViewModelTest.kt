@@ -22,6 +22,7 @@ import com.waste.link.domain.model.RegistrationOutcome
 import com.waste.link.domain.model.SessionState
 import com.waste.link.domain.model.User
 import com.waste.link.domain.model.UserRole
+import com.waste.link.domain.validation.AuthValidator
 import com.waste.link.ui.Destinations
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -881,11 +882,38 @@ class AuthViewModelTest {
         fakeRepo.completeResidentOnboardingOutcome = ProfileUpdateOutcome.Failure(AuthError.NetworkFailure())
 
         val vm = createViewModel()
+        vm.onResidentZoneChanged("zone_ilala")
         vm.completeResidentOnboarding()
         runCurrent()
 
         assertFalse(vm.uiState.value.isCompletingOnboarding)
         assertNotNull(vm.uiState.value.onboardingError)
+    }
+
+    @Test
+    fun `15c Resident onboarding with blank or unsupported zone displays validation error and blocks completion`() = runTest {
+        val residentPending = buildUser(
+            role = UserRole.RESIDENT,
+            onboardingStatus = OnboardingStatus.NOT_STARTED
+        )
+        fakeRepo.resolvedUser = residentPending
+
+        val vm = createViewModel()
+        // Blank zone
+        vm.completeResidentOnboarding()
+        runCurrent()
+        assertNotNull(vm.uiState.value.residentZoneError)
+        assertEquals(AuthBannerType.ERROR, vm.uiState.value.residentOnboardingBanner?.type)
+
+        // Unsupported zone choice
+        vm.onResidentZoneChanged(AuthValidator.UNSUPPORTED_ZONE_ID)
+        assertNotNull(vm.uiState.value.residentZoneError)
+        assertEquals(AuthBannerType.WARNING, vm.uiState.value.residentOnboardingBanner?.type)
+
+        vm.completeResidentOnboarding()
+        runCurrent()
+        // Repository should never have been called with an invalid/unsupported zone
+        assertEquals(OnboardingStatus.NOT_STARTED, fakeRepo.resolvedUser?.onboardingStatus)
     }
 
     // =========================================================================
@@ -1161,6 +1189,10 @@ class AuthViewModelTest {
         override fun isServerVerifiedSession(): Boolean = resolvedUser != null
         override fun getPendingRegistrationDraft(): RegistrationDraft? = pendingDraft
         override fun isEmailVerified(): Boolean = emailVerified
+        override fun applyServerVerifiedUserToSession(user: User) {
+            resolvedUser = user
+            _sessionState.value = SessionState.Authenticated(user = user, isEmailVerified = emailVerified)
+        }
 
         override suspend fun registerResident(
             fullName: String,

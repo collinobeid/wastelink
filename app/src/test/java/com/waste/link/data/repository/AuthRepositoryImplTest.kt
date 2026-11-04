@@ -20,6 +20,7 @@ import com.waste.link.domain.model.ProfileUpdateOutcome
 import com.waste.link.domain.model.RegistrationOutcome
 import com.waste.link.domain.model.SessionState
 import com.waste.link.domain.model.UserRole
+import com.waste.link.domain.validation.AuthValidator
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -826,6 +827,21 @@ class AuthRepositoryImplTest {
         fakeRemote.setServerEmailVerified("onboard_uid_24", true)
         repository.refreshEmailVerificationStatus()
 
+        // Null zone rejected
+        val nullZoneResult = repository.completeResidentOnboarding(null)
+        assertTrue(nullZoneResult is ProfileUpdateOutcome.Failure)
+        assertTrue((nullZoneResult as ProfileUpdateOutcome.Failure).error is AuthError.ValidationFailed)
+
+        // Blank zone rejected
+        val blankZoneResult = repository.completeResidentOnboarding("   ")
+        assertTrue(blankZoneResult is ProfileUpdateOutcome.Failure)
+        assertTrue((blankZoneResult as ProfileUpdateOutcome.Failure).error is AuthError.ValidationFailed)
+
+        // Unsupported zone rejected
+        val unsupportedZoneResult = repository.completeResidentOnboarding(AuthValidator.UNSUPPORTED_ZONE_ID)
+        assertTrue(unsupportedZoneResult is ProfileUpdateOutcome.Failure)
+        assertTrue((unsupportedZoneResult as ProfileUpdateOutcome.Failure).error is AuthError.ValidationFailed)
+
         currentEpochMs += 5_000L
         val onboardResult = repository.completeResidentOnboarding("zone_ilala")
         assertTrue(onboardResult is ProfileUpdateOutcome.Success)
@@ -1338,6 +1354,10 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
         } else {
             RemoteDocumentResult.NotFound(isFromCache = false)
         }
+    }
+
+    override suspend fun fetchCollectorSubmissionHistory(uid: String): List<Map<String, Any?>> {
+        return serverCollectorHistory[uid]?.toList() ?: emptyList()
     }
 
     override suspend fun executeCollectorInitialSubmissionBatch(

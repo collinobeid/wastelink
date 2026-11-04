@@ -319,10 +319,22 @@ fun WasteLinkNavGraph(
         }
 
         composable(Destinations.COLLECTOR_DASHBOARD) {
-            com.waste.link.ui.collector.CollectorShellScreen(
-                rootNavController = navController,
-                onAcceptMission = { navController.navigate("collector_mission") }
-            )
+            val user = uiState.currentUser
+            if (user != null && user.role == com.waste.link.domain.model.UserRole.COLLECTOR &&
+                user.collectorVerificationStatus != com.waste.link.domain.model.CollectorVerificationStatus.APPROVED
+            ) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.COLLECTOR_VERIFICATION_STATUS) {
+                        popUpTo(Destinations.COLLECTOR_DASHBOARD) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else {
+                com.waste.link.ui.collector.CollectorShellScreen(
+                    rootNavController = navController,
+                    onAcceptMission = { navController.navigate("collector_mission") }
+                )
+            }
         }
 
         composable("collector_mission") {

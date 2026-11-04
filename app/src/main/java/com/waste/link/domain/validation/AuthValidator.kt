@@ -549,6 +549,7 @@ object AuthValidator {
     const val MAX_LICENSE_NUMBER_LENGTH = 40
     const val MIN_SERVICE_ZONE_LENGTH = 2
     const val MAX_SERVICE_ZONE_LENGTH = 60
+    const val UNSUPPORTED_ZONE_ID = "zone_unsupported"
 
     val STANDARD_VEHICLE_TYPES = listOf(
         "Compactor Truck",
@@ -662,13 +663,25 @@ object AuthValidator {
 
     /**
      * Validates service zone selection for Resident or Collector onboarding.
-     * Enforces length bounds ([MIN_SERVICE_ZONE_LENGTH]..[MAX_SERVICE_ZONE_LENGTH]).
+     * Enforces length bounds ([MIN_SERVICE_ZONE_LENGTH]..[MAX_SERVICE_ZONE_LENGTH])
+     * and rejects unlisted or explicitly unsupported service areas.
      */
     fun validateServiceZoneId(rawZoneId: String?): ValidationResult<String> {
         val required = validateRequired(rawZoneId, "Service zone")
-        if (required is ValidationResult.Invalid) return required
+        if (required is ValidationResult.Invalid) {
+            return ValidationResult.Invalid(
+                error = ValidationError.REQUIRED_FIELD,
+                message = "Please select your municipal service zone."
+            )
+        }
 
         val trimmed = required.getOrNull()!!
+        if (trimmed.equals(UNSUPPORTED_ZONE_ID, ignoreCase = true)) {
+            return ValidationResult.Invalid(
+                error = ValidationError.SERVICE_ZONE_INVALID,
+                message = "WasteLink collection is not yet supported in this area. Service is currently limited to active municipal zones."
+            )
+        }
         if (trimmed.length < MIN_SERVICE_ZONE_LENGTH) {
             return ValidationResult.Invalid(
                 error = ValidationError.SERVICE_ZONE_INVALID,
@@ -683,7 +696,9 @@ object AuthValidator {
         }
         val matchedZone = MUNICIPAL_SERVICE_ZONES.firstOrNull {
             it.id.equals(trimmed, ignoreCase = true) ||
-            it.displayName.contains(trimmed, ignoreCase = true)
+            it.displayName.equals(trimmed, ignoreCase = true) ||
+            it.id.removePrefix("zone_").equals(trimmed, ignoreCase = true) ||
+            it.displayName.startsWith(trimmed, ignoreCase = true)
         }
         if (matchedZone == null) {
             return ValidationResult.Invalid(

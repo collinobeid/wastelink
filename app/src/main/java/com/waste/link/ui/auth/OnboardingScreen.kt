@@ -279,9 +279,10 @@ private fun ResidentOnboardingCard(
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "Select your collection zone for doorstep waste and recycling schedules.",
+                text = "WasteLink provides doorstep collection across active Dar es Salaam municipalities (Kinondoni, Ilala, Temeke, Ubungo, Kigamboni), Arusha, and Dodoma. Select your residential zone.",
                 color = DarkMutedForeground,
-                fontSize = 12.sp
+                fontSize = 12.sp,
+                lineHeight = 16.sp
             )
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -621,8 +622,8 @@ private fun ServiceZoneDropdownSelector(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = formatZoneName(selectedZoneId),
-                        color = DarkForeground,
+                        text = if (selectedZoneId.isBlank()) "Select Service Zone" else formatZoneName(selectedZoneId),
+                        color = if (selectedZoneId.isBlank()) DarkMutedForeground else DarkForeground,
                         fontSize = 14.sp
                     )
                     Icon(
@@ -641,11 +642,19 @@ private fun ServiceZoneDropdownSelector(
                 AuthValidator.MUNICIPAL_SERVICE_ZONES.forEach { zone ->
                     DropdownMenuItem(
                         text = {
-                            Text(
-                                text = zone.displayName,
-                                color = DarkForeground,
-                                fontSize = 14.sp
-                            )
+                            Column {
+                                Text(
+                                    text = zone.displayName,
+                                    color = DarkForeground,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    text = zone.regionDescription,
+                                    color = DarkMutedForeground,
+                                    fontSize = 11.sp
+                                )
+                            }
                         },
                         onClick = {
                             onZoneSelected(zone.id)
@@ -653,6 +662,27 @@ private fun ServiceZoneDropdownSelector(
                         }
                     )
                 }
+                DropdownMenuItem(
+                    text = {
+                        Column {
+                            Text(
+                                text = "Other / Area Not Listed",
+                                color = androidx.compose.ui.graphics.Color(0xFFF59E0B),
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = "Unsupported municipality",
+                                color = DarkMutedForeground,
+                                fontSize = 11.sp
+                            )
+                        }
+                    },
+                    onClick = {
+                        onZoneSelected(AuthValidator.UNSUPPORTED_ZONE_ID)
+                        expanded = false
+                    }
+                )
             }
         }
 
@@ -705,7 +735,7 @@ private fun VehicleTypeDropdownSelector(
                 ) {
                     Text(
                         text = selectedType.ifBlank { "Select Vehicle Type" },
-                        color = DarkForeground,
+                        color = if (selectedType.isBlank()) DarkMutedForeground else DarkForeground,
                         fontSize = 14.sp
                     )
                     Icon(
@@ -751,6 +781,10 @@ private fun VehicleTypeDropdownSelector(
 }
 
 private fun formatZoneName(zoneId: String): String {
+    if (zoneId.isBlank()) return "Select Service Zone"
+    if (zoneId.equals(AuthValidator.UNSUPPORTED_ZONE_ID, ignoreCase = true)) {
+        return "Other / Area Not Listed"
+    }
     return AuthValidator.MUNICIPAL_SERVICE_ZONES.firstOrNull { it.id == zoneId }?.displayName
         ?: zoneId.replace("zone_", "").replace("_", " ").replaceFirstChar { it.uppercase() }
 }

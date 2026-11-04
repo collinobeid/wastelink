@@ -293,6 +293,30 @@ fun CollectorVerificationStatusScreen(
                 // Action Buttons based on status
                 when (status) {
                     CollectorVerificationStatus.APPROVED -> {
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 16.dp),
+                            color = AuthPrimaryGreen.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, AuthEmeraldAccent.copy(alpha = 0.3f))
+                        ) {
+                            Column(modifier = Modifier.padding(14.dp)) {
+                                Text(
+                                    text = "Ready for Municipal Dispatch",
+                                    color = AuthPrimaryGreen,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Your vehicle and driver credentials have been verified by municipal oversight. Live dispatch and route operations will activate upon regional deployment (Module 2).",
+                                    color = DarkForeground,
+                                    fontSize = 12.sp,
+                                    lineHeight = 16.sp
+                                )
+                            }
+                        }
                         AuthPrimaryButton(
                             text = "Open Collector Dashboard",
                             onClick = onNavigateToDashboard,
