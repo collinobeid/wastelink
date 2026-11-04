@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "418666285201",
+    "project_id": "wastelink-4791b",
+    "storage_bucket": "wastelink-4791b.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:418666285201:android:5d4748a9a36f643e205730",
+        "android_client_info": {
+          "package_name": "com.waste.link"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA0ePwBVLCtQi8AyBLPq5G1F6VTaFRiCHY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
