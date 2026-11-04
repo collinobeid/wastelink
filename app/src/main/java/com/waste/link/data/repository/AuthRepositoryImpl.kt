@@ -124,14 +124,83 @@ class AuthRepositoryImpl(
 
     private val isHandlingRevocation = AtomicBoolean(false)
 
+    @Volatile
+    private var activeUserDocListener: AutoCloseable? = null
+    @Volatile
+    private var activeObservedUid: String? = null
+
     private val authStateSubscription: AutoCloseable =
         remoteDataSource.registerAuthStateListener(::onRemoteAuthStateChanged)
 
     /**
-     * Unregisters the underlying Firebase Auth listener when this repository instance is disposed.
+     * Unregisters listeners when this repository instance is disposed.
      */
     override fun close() {
+        stopObservingUserDocument()
         authStateSubscription.close()
+    }
+
+    @Synchronized
+    private fun ensureUserDocumentObserved(uid: String) {
+        if (activeObservedUid == uid && activeUserDocListener != null) return
+        activeUserDocListener?.close()
+        activeObservedUid = uid
+        activeUserDocListener = remoteDataSource.registerUserDocumentSnapshotListener(uid) { docResult ->
+            onUserDocumentSnapshot(uid, docResult)
+        }
+    }
+
+    @Synchronized
+    private fun stopObservingUserDocument() {
+        activeUserDocListener?.close()
+        activeUserDocListener = null
+        activeObservedUid = null
+    }
+
+    private fun onUserDocumentSnapshot(uid: String, docResult: RemoteDocumentResult) {
+        val currentAuth = remoteDataSource.getCurrentAuthUser()
+        if (currentAuth == null || currentAuth.uid != uid) {
+            stopObservingUserDocument()
+            return
+        }
+
+        if (docResult is RemoteDocumentResult.Found) {
+            when (val inspected = UserMapper.inspectFirestoreMap(docResult.data, uid)) {
+                is ProfileMappingResult.Valid -> {
+                    val user = inspected.user
+                    when (user.accountStatus) {
+                        AccountStatus.SUSPENDED,
+                        AccountStatus.BANNED,
+                        AccountStatus.RESTRICTED -> {
+                            val restrictedState = SessionState.AuthenticatedRestricted(
+                                user = user,
+                                isEmailVerified = currentAuth.isEmailVerified,
+                                accountStatus = user.accountStatus,
+                                statusReason = user.statusReason,
+                                suspendedUntilEpochMs = user.suspendedUntilEpochMs
+                            )
+                            _sessionState.value = restrictedState
+                        }
+                        AccountStatus.ACTIVE -> {
+                            val current = _sessionState.value
+                            if (current is SessionState.AuthenticatedRestricted || current is SessionState.AuthenticatedCachedOffline) {
+                                val activeState = SessionState.Authenticated(
+                                    user = user,
+                                    isEmailVerified = currentAuth.isEmailVerified,
+                                    hasAdminClaim = currentAuth.hasAdminClaim
+                                )
+                                _sessionState.value = activeState
+                            } else if (current is SessionState.Authenticated) {
+                                if (current.user != user) {
+                                    _sessionState.value = current.copy(user = user)
+                                }
+                            }
+                        }
+                    }
+                }
+                else -> Unit
+            }
+        }
     }
 
     /**
@@ -140,6 +209,7 @@ class AuthRepositoryImpl(
      */
     private fun onRemoteAuthStateChanged(remoteUser: RemoteAuthUser?) {
         if (remoteUser == null) {
+            stopObservingUserDocument()
             pendingRegistrationState = null
             pendingLegacySignUp = null
             // Preserve AuthenticationRevoked when signOut() was triggered by a revocation/disabled check
@@ -161,6 +231,7 @@ class AuthRepositoryImpl(
         when (val current = _sessionState.value) {
             is SessionState.Authenticated -> {
                 if (current.user.id != remoteUser.uid) {
+                    stopObservingUserDocument()
                     // User switched accounts externally; invalidate stale profile immediately
                     _sessionState.value = SessionState.Unauthenticated
                 } else if (current.isEmailVerified != remoteUser.isEmailVerified) {
@@ -199,6 +270,7 @@ class AuthRepositoryImpl(
     }
 
     private fun handleRevokedOrDisabledSession(error: AuthError): SessionState.AuthenticationRevoked {
+        stopObservingUserDocument()
         isHandlingRevocation.set(true)
         try {
             pendingRegistrationState = null
@@ -256,6 +328,22 @@ class AuthRepositoryImpl(
             is SessionState.AuthenticatedProfileIncomplete -> state.isEmailVerified
             else -> false
         }
+    }
+
+    override suspend fun handleAuthorizationFailure(throwable: Throwable): Boolean {
+        val msg = throwable.message.orEmpty()
+        val causeMsg = throwable.cause?.message.orEmpty()
+        val isDenied = msg.contains("PERMISSION_DENIED", ignoreCase = true) ||
+            causeMsg.contains("PERMISSION_DENIED", ignoreCase = true) ||
+            (throwable as? com.google.firebase.firestore.FirebaseFirestoreException)?.code ==
+            com.google.firebase.firestore.FirebaseFirestoreException.Code.PERMISSION_DENIED ||
+            (throwable.cause as? com.google.firebase.firestore.FirebaseFirestoreException)?.code ==
+            com.google.firebase.firestore.FirebaseFirestoreException.Code.PERMISSION_DENIED
+
+        if (!isDenied) return false
+        val restored = restoreSession()
+        return restored is SessionState.AuthenticatedRestricted &&
+            restored.accountStatus in listOf(AccountStatus.SUSPENDED, AccountStatus.BANNED, AccountStatus.RESTRICTED)
     }
 
     // =========================================================================
@@ -922,6 +1010,7 @@ class AuthRepositoryImpl(
 
     override suspend fun logout(): LogoutOutcome {
         return try {
+            stopObservingUserDocument()
             pendingRegistrationState = null
             pendingLegacySignUp = null
             _sessionState.value = SessionState.Unauthenticated
@@ -1005,6 +1094,7 @@ class AuthRepositoryImpl(
             applyServerVerifiedUserToSessionState(updatedUser, authUser)
             ProfileUpdateOutcome.Success(updatedUser)
         } catch (e: Throwable) {
+            handleAuthorizationFailure(e)
             ProfileUpdateOutcome.Failure(
                 FirebaseErrorMapper.toAuthError(
                     throwable = e,
@@ -1074,6 +1164,7 @@ class AuthRepositoryImpl(
             applyServerVerifiedUserToSessionState(updatedUser, authUser)
             ProfileUpdateOutcome.Success(updatedUser)
         } catch (e: Throwable) {
+            handleAuthorizationFailure(e)
             ProfileUpdateOutcome.Failure(
                 FirebaseErrorMapper.toAuthError(
                     throwable = e,
@@ -1296,6 +1387,7 @@ class AuthRepositoryImpl(
         user: User,
         authUser: RemoteAuthUser
     ): SessionState {
+        ensureUserDocumentObserved(user.id)
         val nextState = when (user.accountStatus) {
             AccountStatus.ACTIVE -> SessionState.Authenticated(
                 user = user,
@@ -1321,6 +1413,7 @@ class AuthRepositoryImpl(
         authUser: RemoteAuthUser,
         networkError: AuthError.NetworkFailure
     ): SessionState {
+        ensureUserDocumentObserved(user.id)
         val nextState = when (user.accountStatus) {
             AccountStatus.ACTIVE -> SessionState.AuthenticatedCachedOffline(
                 cachedUser = user,

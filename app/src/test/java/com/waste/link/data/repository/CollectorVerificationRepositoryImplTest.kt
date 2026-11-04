@@ -592,6 +592,7 @@ private class TestAuthRepository : AuthRepository {
         Result.success(Unit)
     override suspend fun adminRejectCollectorSubmission(collectorUid: String, adminUid: String, rejectionReason: String): Result<Unit> =
         Result.success(Unit)
+    override suspend fun handleAuthorizationFailure(throwable: Throwable): Boolean = false
     override suspend fun updateProfile(fullName: String, phoneNumber: String, defaultZoneId: String?, preferredLanguage: String?): ProfileUpdateOutcome =
         ProfileUpdateOutcome.Failure(AuthError.NetworkFailure())
 
@@ -628,6 +629,11 @@ private class TestAuthRemoteDataSource : AuthRemoteDataSource {
 
     override fun registerAuthStateListener(listener: (RemoteAuthUser?) -> Unit): AutoCloseable =
         AutoCloseable {}
+
+    override fun registerUserDocumentSnapshotListener(
+        uid: String,
+        listener: (RemoteDocumentResult) -> Unit
+    ): AutoCloseable = AutoCloseable {}
 
     override suspend fun createAuthUser(email: String, password: String): RemoteAuthUser =
         throw UnsupportedOperationException()

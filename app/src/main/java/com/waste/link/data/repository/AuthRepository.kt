@@ -73,6 +73,13 @@ interface AuthRepository {
     /** Returns whether the currently authenticated Firebase user's email is verified. */
     fun isEmailVerified(): Boolean
 
+    /**
+     * Intercepts an authorization failure (such as PERMISSION_DENIED on a protected Firestore write)
+     * and refreshes the user's live session standing from the server.
+     * Returns `true` if the account was found to be restricted, suspended, or banned.
+     */
+    suspend fun handleAuthorizationFailure(throwable: Throwable): Boolean
+
     // =========================================================================
     // 2. Canonical Registration Engine
     // =========================================================================

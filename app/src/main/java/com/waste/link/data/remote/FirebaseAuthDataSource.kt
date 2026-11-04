@@ -65,6 +65,37 @@ class FirebaseAuthDataSource @Inject constructor(
         return handle
     }
 
+    @Synchronized
+    override fun registerUserDocumentSnapshotListener(
+        uid: String,
+        listener: (RemoteDocumentResult) -> Unit
+    ): AutoCloseable {
+        val registration = firestore.collection(USERS_COLLECTION)
+            .document(uid)
+            .addSnapshotListener { snapshot, error ->
+                if (error != null || snapshot == null) {
+                    return@addSnapshotListener
+                }
+                if (snapshot.exists() && snapshot.data != null) {
+                    listener(
+                        RemoteDocumentResult.Found(
+                            data = snapshot.data!!,
+                            isFromCache = snapshot.metadata.isFromCache
+                        )
+                    )
+                } else {
+                    listener(RemoteDocumentResult.NotFound(isFromCache = snapshot.metadata.isFromCache))
+                }
+            }
+
+        val closed = AtomicBoolean(false)
+        return AutoCloseable {
+            if (closed.compareAndSet(false, true)) {
+                registration.remove()
+            }
+        }
+    }
+
     override suspend fun createAuthUser(email: String, password: String): RemoteAuthUser {
         val authResult = firebaseAuth.createUserWithEmailAndPassword(email, password).await()
         val user = authResult.user

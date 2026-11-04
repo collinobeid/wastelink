@@ -1271,6 +1271,8 @@ class AuthViewModelTest {
             return nextSessionState
         }
 
+        override suspend fun handleAuthorizationFailure(throwable: Throwable): Boolean = false
+
         override suspend fun logout(): LogoutOutcome {
             logoutCallCount++
             resolvedUser = null

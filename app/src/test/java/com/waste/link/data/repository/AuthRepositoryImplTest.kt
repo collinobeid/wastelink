@@ -1303,6 +1303,29 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
         }
     }
 
+    val userDocListeners = mutableMapOf<String, MutableList<(RemoteDocumentResult) -> Unit>>()
+
+    override fun registerUserDocumentSnapshotListener(
+        uid: String,
+        listener: (RemoteDocumentResult) -> Unit
+    ): AutoCloseable {
+        val list = userDocListeners.getOrPut(uid) { mutableListOf() }
+        list.add(listener)
+        return AutoCloseable {
+            userDocListeners[uid]?.remove(listener)
+        }
+    }
+
+    fun notifyUserDocumentSnapshot(uid: String) {
+        val doc = serverUserDocuments[uid]
+        val result = if (doc != null) {
+            RemoteDocumentResult.Found(data = doc, isFromCache = false)
+        } else {
+            RemoteDocumentResult.NotFound(isFromCache = false)
+        }
+        userDocListeners[uid]?.toList()?.forEach { it(result) }
+    }
+
     override suspend fun createAuthUser(email: String, password: String): RemoteAuthUser {
         createAuthUserCallCount++
         val normalized = email.trim().lowercase()
@@ -1467,6 +1490,7 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
         }
         writeUserDocumentCallCount++
         serverUserDocuments[uid] = data.toMap()
+        notifyUserDocumentSnapshot(uid)
     }
 
     override suspend fun updateUserDocument(uid: String, fields: Map<String, Any?>) {
@@ -1477,6 +1501,7 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
             )
         existing.putAll(fields)
         serverUserDocuments[uid] = existing
+        notifyUserDocumentSnapshot(uid)
     }
 
     val serverCollectorSubmissions = mutableMapOf<String, Map<String, Any?>>()

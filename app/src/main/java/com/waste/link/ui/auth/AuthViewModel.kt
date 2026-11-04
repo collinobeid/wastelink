@@ -258,6 +258,8 @@ class AuthViewModel @Inject constructor(
         observeRepositorySessionState()
     }
 
+    private var previousLockedStatus: AccountStatus? = null
+
     private fun observeRepositorySessionState() {
         viewModelScope.launch {
             authRepository.sessionState.collect { session ->
@@ -336,6 +338,47 @@ class AuthViewModel @Inject constructor(
                         )
                     }
                 }
+
+                when (session) {
+                    is SessionState.AuthenticatedRestricted -> {
+                        if (session.accountStatus == AccountStatus.SUSPENDED ||
+                            session.accountStatus == AccountStatus.BANNED ||
+                            session.accountStatus == AccountStatus.RESTRICTED
+                        ) {
+                            previousLockedStatus = session.accountStatus
+                            val decision = SessionNavigationResolver.resolve(session)
+                            navigateFromDecision(decision, force = true)
+                        }
+                    }
+                    is SessionState.Authenticated -> {
+                        if (previousLockedStatus != null) {
+                            previousLockedStatus = null
+                            val decision = SessionNavigationResolver.resolve(session)
+                            navigateFromDecision(decision, force = true)
+                        }
+                    }
+                    is SessionState.AuthenticationRevoked -> {
+                        previousLockedStatus = null
+                        val decision = SessionNavigationResolver.resolve(session)
+                        navigateFromDecision(decision, force = true)
+                    }
+                    else -> Unit
+                }
+            }
+        }
+    }
+
+    /**
+     * Intercepts an authorization failure (such as PERMISSION_DENIED on a protected write)
+     * and refreshes the user's standing with the server. If restricted, navigates to lock screen.
+     */
+    fun onAuthorizationFailure(throwable: Throwable) {
+        viewModelScope.launch {
+            val isRestricted = authRepository.handleAuthorizationFailure(throwable)
+            if (isRestricted) {
+                val current = authRepository.sessionState.value
+                val decision = SessionNavigationResolver.resolve(current)
+                navigateFromDecision(decision, force = true)
             }
         }
     }

@@ -379,14 +379,17 @@ class AuthStage6NavigationTest {
         }
         seedFirestoreDocWithAdminBypass("users", uid, reinstatedFields)
 
-        // 3. User taps "Check Status" CTA
-        composeRule.onNodeWithTag(AuthTestTags.ACCOUNT_LOCK_BTN_REFRESH)
-            .performScrollTo()
-            .performClick()
-
-        composeRule.waitForIdle()
-        Thread.sleep(1_500L)
-        composeRule.waitForIdle()
+        // 3. Live snapshot automatically restores access or user taps "Check Status" CTA
+        try {
+            composeRule.onNodeWithTag(AuthTestTags.ACCOUNT_LOCK_BTN_REFRESH)
+                .performScrollTo()
+                .performClick()
+            composeRule.waitForIdle()
+            Thread.sleep(1_500L)
+            composeRule.waitForIdle()
+        } catch (_: Throwable) {
+            // Live snapshot listener already reacted and restored RESIDENT_HOME automatically
+        }
 
         // 4. Verify user was automatically navigated to Resident Home upon reinstatement
         composeRule.onNodeWithTag(TAG_RESIDENT_ENTRY).assertIsDisplayed()
@@ -504,6 +507,242 @@ class AuthStage6NavigationTest {
 
         // Security Invariant: The user must NEVER reach Admin Shell
         composeRule.onNodeWithTag(TAG_LOGIN_ENTRY).assertIsDisplayed()
+    }
+
+    // =========================================================================
+    // 8. Active Session Suspension Live Enforcement & Reinstatement (Two-Account)
+    // =========================================================================
+
+    @Test
+    fun test08_activeSession_administratorSuspendsResident_liveEnforcementAndReinstatement() = runBlocking<Unit> {
+        // Step 1: Device A (Resident) signs up and logs in as ACTIVE resident
+        val residentEmail = "resident.session.active@wastelink.co.tz"
+        val residentPass = "WasteLink2026!"
+        val residentAuthResult = firebaseAuth.createUserWithEmailAndPassword(residentEmail, residentPass).await()
+        val residentUser = residentAuthResult.user!!
+        val residentUid = residentUser.uid
+        verifyCurrentUserEmail(residentUser)
+
+        val residentProfile: Map<String, Any?> = mapOf(
+            "id" to residentUid,
+            "uid" to residentUid,
+            "fullName" to "Amina Resident",
+            "name" to "Amina Resident",
+            "email" to residentEmail,
+            "phoneNumber" to "+255711223344",
+            "phone" to "+255711223344",
+            "role" to "RESIDENT",
+            "accountStatus" to "ACTIVE",
+            "status" to "ACTIVE",
+            "onboardingStatus" to "COMPLETED",
+            "defaultZoneId" to "zone_kinondoni",
+            "isVerified" to false,
+            "collectorVerificationStatus" to "NOT_APPLICABLE",
+            "createdAtEpochMs" to 1700000000000L,
+            "updatedAtEpochMs" to 1700000000000L
+        )
+        seedFirestoreDocWithAdminBypass("users", residentUid, residentProfile)
+
+        val preSession = authRepository.restoreSession()
+        assertTrue("Pre-session must be Authenticated, was $preSession", preSession is SessionState.Authenticated)
+
+        // Device A ViewModel & UI
+        val viewModel = AuthViewModel(authRepository)
+
+        composeRule.setContent {
+            WasteLinkTheme {
+                Stage6TestNavHost(viewModel = viewModel)
+            }
+        }
+
+        viewModel.restoreSessionOnLaunch()
+        composeRule.waitForIdle()
+        Thread.sleep(1_000L)
+        composeRule.waitForIdle()
+
+        // Verify Device A is on RESIDENT_HOME
+        composeRule.onNodeWithTag(TAG_RESIDENT_ENTRY).assertIsDisplayed()
+
+        // Verify Device A can perform a valid protected operation (updating profile) while active
+        val initialUpdate = authRepository.updateProfile(
+            fullName = "Amina Resident Initial",
+            phoneNumber = "+255711223344",
+            defaultZoneId = "zone_kinondoni",
+            preferredLanguage = "en"
+        )
+        assertTrue(
+            "Initial update should succeed while active: $initialUpdate",
+            initialUpdate is com.waste.link.domain.model.ProfileUpdateOutcome.Success
+        )
+
+        // Step 2: Device B (Administrator) on a separate FirebaseApp instance signs in with authorized admin claim
+        val adminAppName = "DeviceB_Admin"
+        val adminApp = try {
+            FirebaseApp.getInstance(adminAppName)
+        } catch (_: Exception) {
+            FirebaseApp.initializeApp(context, FirebaseApp.getInstance().options, adminAppName)
+        }
+        val adminAuth = FirebaseAuth.getInstance(adminApp)
+        val adminFirestore = FirebaseFirestore.getInstance(adminApp)
+        adminAuth.useEmulator(emulatorHost, FirebaseEmulatorConfig.DEFAULT_AUTH_PORT)
+        adminFirestore.useEmulator(emulatorHost, FirebaseEmulatorConfig.DEFAULT_FIRESTORE_PORT)
+
+        val adminEmail = "admin.deviceb@wastelink.co.tz"
+        val adminPass = "WasteLink2026!"
+        val adminAuthResult = adminAuth.createUserWithEmailAndPassword(adminEmail, adminPass).await()
+        val adminUser = adminAuthResult.user!!
+        val adminUid = adminUser.uid
+
+        // Verify admin email via OOB code
+        adminUser.sendEmailVerification().await()
+        val adminOob = fetchLatestOobCode(adminEmail, "VERIFY_EMAIL")
+            ?: error("Expected admin VERIFY_EMAIL OOB code")
+        adminAuth.applyActionCode(adminOob).await()
+        adminUser.reload().await()
+
+        // Provision admin custom claim on Auth Emulator & refresh token
+        setAdminCustomClaim(adminUid)
+        adminUser.getIdToken(true).await()
+
+        val adminProfile: Map<String, Any?> = mapOf(
+            "id" to adminUid,
+            "uid" to adminUid,
+            "fullName" to "Government Moderator",
+            "name" to "Government Moderator",
+            "email" to adminEmail,
+            "phoneNumber" to "+255700000009",
+            "phone" to "+255700000009",
+            "role" to "ADMIN",
+            "accountStatus" to "ACTIVE",
+            "status" to "ACTIVE",
+            "onboardingStatus" to "COMPLETED",
+            "isVerified" to true,
+            "collectorVerificationStatus" to "NOT_APPLICABLE",
+            "createdAtEpochMs" to 1700000000000L,
+            "updatedAtEpochMs" to 1700000000000L
+        )
+        seedFirestoreDocWithAdminBypass("users", adminUid, adminProfile)
+
+        // Device B executes administrative suspension batch via Firestore client SDK
+        val suspendBatch = adminFirestore.batch()
+        val residentUserRef = adminFirestore.collection("users").document(residentUid)
+        suspendBatch.update(
+            residentUserRef,
+            mapOf(
+                "accountStatus" to "SUSPENDED",
+                "status" to "SUSPENDED",
+                "statusReason" to "Suspended by municipal moderator for investigation",
+                "suspendedUntilEpochMs" to 1750000000000L,
+                "updatedAtEpochMs" to System.currentTimeMillis()
+            )
+        )
+        val modRef = adminFirestore.collection("user_moderation").document(residentUid)
+        suspendBatch.set(
+            modRef,
+            mapOf(
+                "userId" to residentUid,
+                "action" to "SUSPENDED",
+                "accountStatus" to "SUSPENDED",
+                "reason" to "Suspended by municipal moderator for investigation",
+                "suspendedUntilEpochMs" to 1750000000000L,
+                "moderatedByUid" to adminUid,
+                "moderatedAtEpochMs" to System.currentTimeMillis()
+            )
+        )
+        suspendBatch.commit().await()
+
+        // Step 3: Device A (Resident) — Without signing out or restarting the application:
+        // Attempt a protected operation
+        val updateAttempt = authRepository.updateProfile(
+            fullName = "Amina Resident Blocked",
+            phoneNumber = "+255711223344",
+            defaultZoneId = "zone_kinondoni",
+            preferredLanguage = "en"
+        )
+        // Verify Firestore rejects the operation with PERMISSION_DENIED
+        assertTrue(
+            "Protected operation must be rejected when account is suspended: $updateAttempt",
+            updateAttempt is com.waste.link.domain.model.ProfileUpdateOutcome.Failure
+        )
+
+        // Verify live snapshot listener or authorization-failure handler transitions UI to AccountStatusLockScreen
+        composeRule.waitForIdle()
+        Thread.sleep(1_500L)
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithTag(AuthTestTags.ACCOUNT_LOCK_SCREEN).assertIsDisplayed()
+        composeRule.onNodeWithTag(AuthTestTags.ACCOUNT_LOCK_STATUS_BADGE).assertIsDisplayed()
+        composeRule.onNodeWithText("SUSPENDED").assertIsDisplayed()
+        composeRule.onNodeWithTag(AuthTestTags.ACCOUNT_LOCK_REASON).assertIsDisplayed()
+        composeRule.onNodeWithText("Suspended by municipal moderator for investigation").assertIsDisplayed()
+
+        // Step 4: Subsequent protected operations remain blocked
+        val secondUpdateAttempt = authRepository.updateProfile(
+            fullName = "Still Blocked",
+            phoneNumber = "+255711223344",
+            defaultZoneId = "zone_kinondoni",
+            preferredLanguage = "en"
+        )
+        assertTrue(
+            "Subsequent protected operation must also be rejected: $secondUpdateAttempt",
+            secondUpdateAttempt is com.waste.link.domain.model.ProfileUpdateOutcome.Failure
+        )
+
+        // Step 5: Device B (Administrator) reinstates the resident account
+        val reinstateBatch = adminFirestore.batch()
+        reinstateBatch.update(
+            residentUserRef,
+            mapOf(
+                "accountStatus" to "ACTIVE",
+                "status" to "ACTIVE",
+                "statusReason" to null,
+                "suspendedUntilEpochMs" to null,
+                "updatedAtEpochMs" to System.currentTimeMillis()
+            )
+        )
+        val modReinstateRef = adminFirestore.collection("user_moderation").document(residentUid)
+        reinstateBatch.set(
+            modReinstateRef,
+            mapOf(
+                "userId" to residentUid,
+                "action" to "REINSTATED",
+                "accountStatus" to "ACTIVE",
+                "reason" to "Reinstated following successful review",
+                "moderatedByUid" to adminUid,
+                "moderatedAtEpochMs" to System.currentTimeMillis()
+            )
+        )
+        reinstateBatch.commit().await()
+
+        // Wait for live snapshot or tap "Check Status"
+        composeRule.waitForIdle()
+        Thread.sleep(1_500L)
+        composeRule.waitForIdle()
+
+        try {
+            val refreshNode = composeRule.onNodeWithTag(AuthTestTags.ACCOUNT_LOCK_BTN_REFRESH)
+            refreshNode.performScrollTo().performClick()
+            composeRule.waitForIdle()
+            Thread.sleep(1_500L)
+            composeRule.waitForIdle()
+        } catch (_: Throwable) {
+            // Live snapshot already reacted and restored RESIDENT_HOME automatically
+        }
+
+        // Confirm the resident has recovered operational access to RESIDENT_HOME without signing out
+        composeRule.onNodeWithTag(TAG_RESIDENT_ENTRY).assertIsDisplayed()
+
+        // Confirm protected operations now succeed again
+        val finalUpdate = authRepository.updateProfile(
+            fullName = "Amina Reinstated",
+            phoneNumber = "+255711223344",
+            defaultZoneId = "zone_kinondoni",
+            preferredLanguage = "en"
+        )
+        assertTrue(
+            "Protected operation should succeed after reinstatement: $finalUpdate",
+            finalUpdate is com.waste.link.domain.model.ProfileUpdateOutcome.Success
+        )
     }
 
     // =========================================================================
@@ -790,6 +1029,28 @@ class AuthStage6NavigationTest {
         val code = conn.responseCode
         conn.disconnect()
         assertTrue("Admin bypass write to $collectionPath/$documentId failed with HTTP $code", code in 200..299)
+    }
+
+    private fun setAdminCustomClaim(uid: String) {
+        val url = URL(
+            "http://$emulatorHost:${FirebaseEmulatorConfig.DEFAULT_AUTH_PORT}/identitytoolkit.googleapis.com/v1/projects/$projectId/accounts:update?key=fake-api-key"
+        )
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            setRequestProperty("Authorization", "Bearer owner")
+            setRequestProperty("Content-Type", "application/json")
+            doOutput = true
+            connectTimeout = 5000
+            readTimeout = 5000
+        }
+        val payload = JSONObject().apply {
+            put("localId", uid)
+            put("customAttributes", "{\"admin\":true}")
+        }.toString()
+        conn.outputStream.use { it.write(payload.toByteArray()) }
+        val code = conn.responseCode
+        conn.disconnect()
+        assertTrue("Setting admin custom claim failed with HTTP $code", code in 200..299)
     }
 
     private fun fetchLatestOobCode(email: String, requestType: String): String? {

@@ -70,6 +70,16 @@ interface AuthRemoteDataSource {
      */
     fun registerAuthStateListener(listener: (RemoteAuthUser?) -> Unit): AutoCloseable
 
+    /**
+     * Registers a live snapshot listener for the user's Firestore document (`/users/{uid}`).
+     * Emits the updated [RemoteDocumentResult] whenever the document changes on the server.
+     * Returns an [AutoCloseable] to detach the snapshot listener and prevent leaks.
+     */
+    fun registerUserDocumentSnapshotListener(
+        uid: String,
+        listener: (RemoteDocumentResult) -> Unit
+    ): AutoCloseable
+
     suspend fun createAuthUser(email: String, password: String): RemoteAuthUser
 
     suspend fun signInWithEmailAndPassword(email: String, password: String): RemoteAuthUser
