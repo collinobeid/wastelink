@@ -1,0 +1,506 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // 1. CORE IDENTITY & AUTHORIZATION HELPERS
+    // =========================================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Authoritative email verification check from cryptographically signed Firebase Auth ID token.
+    // Clients can never spoof this via Firestore fields.
+    function isEmailVerifiedInToken() {
+      return isAuthenticated()
+        && ('email_verified' in request.auth.token)
+        && request.auth.token.email_verified == true;
+    }
+
+    // Trusted server-provisioned custom claim check (True Security Boundary).
+    // Having role == 'ADMIN' in a Firestore document without this token claim grants ZERO privilege.
+    function isAdmin() {
+      return isAuthenticated()
+        && ('admin' in request.auth.token)
+        && request.auth.token.admin == true;
+    }
+
+    function isValidNonEmptyString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function isNullableString(val, minLen, maxLen) {
+      return val == null || isValidNonEmptyString(val, minLen, maxLen);
+    }
+
+    function isNonNegativeInt(val) {
+      return val is int && val >= 0;
+    }
+
+    function isNullablePositiveInt(val) {
+      return val == null || (val is int && val > 0);
+    }
+
+    function userExists(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId));
+    }
+
+    function userDoc(userId) {
+      return get(/databases/$(database)/documents/users/$(userId));
+    }
+
+    function userDocAfter(userId) {
+      return getAfter(/databases/$(database)/documents/users/$(userId));
+    }
+
+    function submissionDocAfter(userId) {
+      return getAfter(/databases/$(database)/documents/collector_submissions/$(userId));
+    }
+
+    function historyDocAfter(userId, attemptId) {
+      return getAfter(/databases/$(database)/documents/collector_submissions/$(userId)/history/$(attemptId));
+    }
+
+    function hasValidHistoryAfter(userId, attemptId, expectedEventType, expectedAttempt) {
+      return existsAfter(/databases/$(database)/documents/collector_submissions/$(userId)/history/$(attemptId))
+        && historyDocAfter(userId, attemptId).data.userId == userId
+        && historyDocAfter(userId, attemptId).data.actorUid == userId
+        && historyDocAfter(userId, attemptId).data.eventType == expectedEventType
+        && historyDocAfter(userId, attemptId).data.submissionAttempt == expectedAttempt;
+    }
+
+    function isActiveResident(userId) {
+      return isOwner(userId)
+        && isEmailVerifiedInToken()
+        && userExists(userId)
+        && userDoc(userId).data.role in ['RESIDENT', 'resident']
+        && userDoc(userId).data.accountStatus == 'ACTIVE';
+    }
+
+    function isActiveCollectorOwner(userId) {
+      return isOwner(userId)
+        && isEmailVerifiedInToken()
+        && userExists(userId)
+        && userDoc(userId).data.role in ['COLLECTOR', 'collector']
+        && userDoc(userId).data.accountStatus == 'ACTIVE';
+    }
+
+    function isApprovedActiveCollector(userId) {
+      return isActiveCollectorOwner(userId)
+        && (userDoc(userId).data.collectorVerificationStatus == 'APPROVED'
+            || userDoc(userId).data.isVerified == true);
+    }
+
+    // =========================================================================
+    // 2. USER PROFILES: /users/{userId}
+    // =========================================================================
+    match /users/{userId} {
+
+      // Users can read ONLY their own profile; Admins with custom claim can read/list all.
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
+
+      // Profile Creation (Self-Registration or Authenticated Profile Recovery)
+      allow create: if isOwner(userId)
+        && request.resource.data.keys().hasOnly([
+             'id', 'uid', 'fullName', 'name', 'email', 'phoneNumber', 'phone',
+             'role', 'accountStatus', 'status', 'statusReason', 'suspendedUntilEpochMs',
+             'onboardingStatus', 'isVerified', 'collectorVerificationStatus',
+             'collectorRejectionReason', 'defaultZoneId', 'vehicleType',
+             'vehiclePlateNumber', 'preferredLanguage', 'createdAtEpochMs',
+             'updatedAtEpochMs', 'fcmToken'
+           ])
+        // Strict UID & Email binding to FirebaseAuth token
+        && request.resource.data.id == userId
+        && request.resource.data.uid == userId
+        && request.resource.data.email is string
+        && request.resource.data.email == request.auth.token.email
+        && isValidNonEmptyString(request.resource.data.fullName, 2, 80)
+        && request.resource.data.name == request.resource.data.fullName
+        && isValidNonEmptyString(request.resource.data.phoneNumber, 8, 20)
+        && request.resource.data.phone == request.resource.data.phoneNumber
+        // Role is strictly restricted to RESIDENT or COLLECTOR (never ADMIN or unassigned)
+        && request.resource.data.role in ['RESIDENT', 'COLLECTOR', 'resident', 'collector']
+        // Initial account standing must be ACTIVE; moderation fields must be null
+        && request.resource.data.accountStatus == 'ACTIVE'
+        && request.resource.data.status == 'ACTIVE'
+        && (!('statusReason' in request.resource.data) || request.resource.data.statusReason == null)
+        && (!('suspendedUntilEpochMs' in request.resource.data) || request.resource.data.suspendedUntilEpochMs == null)
+        && request.resource.data.onboardingStatus == 'NOT_STARTED'
+        // Verification fields cannot be fabricated
+        && request.resource.data.isVerified == false
+        && (!('collectorRejectionReason' in request.resource.data) || request.resource.data.collectorRejectionReason == null)
+        // Collector verification initial state must match role
+        && (
+             (request.resource.data.role in ['RESIDENT', 'resident']
+              && request.resource.data.collectorVerificationStatus == 'NOT_APPLICABLE')
+             ||
+             (request.resource.data.role in ['COLLECTOR', 'collector']
+              && request.resource.data.collectorVerificationStatus == 'NOT_SUBMITTED')
+           )
+        // Optional fields & timestamps type validation
+        && (!('defaultZoneId' in request.resource.data) || isNullableString(request.resource.data.defaultZoneId, 1, 80))
+        && (!('vehicleType' in request.resource.data) || request.resource.data.vehicleType == null)
+        && (!('vehiclePlateNumber' in request.resource.data) || request.resource.data.vehiclePlateNumber == null)
+        && (!('preferredLanguage' in request.resource.data) || isValidNonEmptyString(request.resource.data.preferredLanguage, 2, 10))
+        && (!('fcmToken' in request.resource.data) || isNullableString(request.resource.data.fcmToken, 1, 512))
+        && isNonNegativeInt(request.resource.data.createdAtEpochMs)
+        && isNonNegativeInt(request.resource.data.updatedAtEpochMs);
+
+      // Profile Updates:
+      // Branch A: Self-service update by verified, ACTIVE owner
+      // Branch B: Moderation / collector vetting update by trusted Administrator (custom claim)
+      allow update: if (
+        isOwner(userId)
+        && isEmailVerifiedInToken()
+        && resource.data.accountStatus == 'ACTIVE'
+        && request.resource.data.keys().hasOnly([
+             'id', 'uid', 'fullName', 'name', 'email', 'phoneNumber', 'phone',
+             'role', 'accountStatus', 'status', 'statusReason', 'suspendedUntilEpochMs',
+             'onboardingStatus', 'isVerified', 'collectorVerificationStatus',
+             'collectorRejectionReason', 'defaultZoneId', 'vehicleType',
+             'vehiclePlateNumber', 'preferredLanguage', 'createdAtEpochMs',
+             'updatedAtEpochMs', 'fcmToken',
+             // Legacy fields tolerated only if untouched on existing documents
+             'bannedUntil', 'contractUntil', 'deletedAt', 'isActive'
+           ])
+        // IMMUTABLE FIELDS FOR OWNER:
+        // Owner can NEVER modify identity, role, standing, verification, timestamps, or moderation fields.
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+             'id', 'uid', 'email', 'role', 'accountStatus', 'status', 'statusReason',
+             'suspendedUntilEpochMs', 'isVerified', 'createdAtEpochMs',
+             'collectorRejectionReason', 'bannedUntil', 'contractUntil',
+             'deletedAt', 'isActive', 'isEmailVerified', 'isPhoneVerified'
+           ])
+        // Collector verification status transition guard for Owner:
+        // 1. Residents cannot change collectorVerificationStatus.
+        // 2. Collectors can ONLY transition from NOT_SUBMITTED or REJECTED to PENDING_REVIEW,
+        //    AND only in an atomic WriteBatch where /collector_submissions/{userId} is PENDING_REVIEW.
+        && (
+             request.resource.data.collectorVerificationStatus == resource.data.collectorVerificationStatus
+             || (
+                  resource.data.role in ['COLLECTOR', 'collector']
+                  && resource.data.collectorVerificationStatus in ['NOT_SUBMITTED', 'REJECTED']
+                  && request.resource.data.collectorVerificationStatus == 'PENDING_REVIEW'
+                  && existsAfter(/databases/$(database)/documents/collector_submissions/$(userId))
+                  && submissionDocAfter(userId).data.status == 'PENDING_REVIEW'
+                )
+           )
+        && isValidNonEmptyString(request.resource.data.fullName, 2, 80)
+        && request.resource.data.name == request.resource.data.fullName
+        && isValidNonEmptyString(request.resource.data.phoneNumber, 8, 20)
+        && request.resource.data.phone == request.resource.data.phoneNumber
+        && request.resource.data.onboardingStatus in ['NOT_STARTED', 'IN_PROGRESS', 'COMPLETED']
+        && (!('defaultZoneId' in request.resource.data) || isNullableString(request.resource.data.defaultZoneId, 1, 80))
+        && (!('vehicleType' in request.resource.data) || isNullableString(request.resource.data.vehicleType, 2, 40))
+        && (!('vehiclePlateNumber' in request.resource.data) || isNullableString(request.resource.data.vehiclePlateNumber, 3, 20))
+        && (!('preferredLanguage' in request.resource.data) || isValidNonEmptyString(request.resource.data.preferredLanguage, 2, 10))
+        && (!('fcmToken' in request.resource.data) || isNullableString(request.resource.data.fcmToken, 1, 512))
+        && isNonNegativeInt(request.resource.data.updatedAtEpochMs)
+      ) || (
+        isAdmin()
+        // Even an Admin cannot alter a user's UID, email, role, or creation timestamp via client SDK
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+             'id', 'uid', 'email', 'role', 'createdAtEpochMs'
+           ])
+        && request.resource.data.accountStatus in ['ACTIVE', 'RESTRICTED', 'SUSPENDED', 'BANNED']
+        && request.resource.data.collectorVerificationStatus in [
+             'NOT_APPLICABLE', 'NOT_SUBMITTED', 'PENDING_REVIEW', 'APPROVED', 'REJECTED'
+           ]
+      );
+
+      // Users can never delete their own profile document directly; only Admins.
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 3. COLLECTOR VETTING SUBMISSIONS: /collector_submissions/{userId}
+    // =========================================================================
+    match /collector_submissions/{userId} {
+
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
+
+      // Initial Submission by Collector (Allowed ONLY when collectorVerificationStatus == NOT_SUBMITTED)
+      allow create: if isActiveCollectorOwner(userId)
+        && userDoc(userId).data.collectorVerificationStatus == 'NOT_SUBMITTED'
+        && request.resource.data.keys().hasOnly([
+             'userId', 'vehicleType', 'vehiclePlateNumber', 'licenseNumber',
+             'serviceZoneId', 'status', 'submissionAttempt', 'submittedAtEpochMs',
+             'reviewedByUid', 'reviewedAtEpochMs', 'rejectionReason', 'adminNotes',
+             'lastRejectionReason', 'lastReviewedByUid', 'lastReviewedAtEpochMs'
+           ])
+        && request.resource.data.userId == userId
+        && request.resource.data.status == 'PENDING_REVIEW'
+        && request.resource.data.submissionAttempt == 1
+        && request.resource.data.submittedAtEpochMs is int
+        && request.resource.data.submittedAtEpochMs > 0
+        && isValidNonEmptyString(request.resource.data.vehicleType, 2, 40)
+        && isValidNonEmptyString(request.resource.data.vehiclePlateNumber, 3, 20)
+        && isValidNonEmptyString(request.resource.data.licenseNumber, 4, 40)
+        && isValidNonEmptyString(request.resource.data.serviceZoneId, 2, 60)
+        // Admin-only review fields must be null on initial creation
+        && request.resource.data.reviewedByUid == null
+        && request.resource.data.reviewedAtEpochMs == null
+        && request.resource.data.rejectionReason == null
+        && request.resource.data.adminNotes == null
+        && request.resource.data.lastRejectionReason == null
+        && request.resource.data.lastReviewedByUid == null
+        && request.resource.data.lastReviewedAtEpochMs == null
+        // Atomic WriteBatch integrity checks:
+        // 1. Parent /users/{userId} must transition to PENDING_REVIEW in the same batch.
+        // 2. History entry /collector_submissions/{userId}/history/attempt_1 must be created in the same batch.
+        && userDocAfter(userId).data.collectorVerificationStatus == 'PENDING_REVIEW'
+        && hasValidHistoryAfter(userId, 'attempt_1', 'SUBMITTED', 1);
+
+      // Updates to Collector Submission:
+      // Branch A: Collector Resubmission (Allowed ONLY when current status == 'REJECTED')
+      // Branch B: Trusted Administrator Approval or Rejection
+      allow update: if (
+        isActiveCollectorOwner(userId)
+        && resource.data.status == 'REJECTED'
+        && userDoc(userId).data.collectorVerificationStatus == 'REJECTED'
+        && request.resource.data.keys().hasOnly([
+             'userId', 'vehicleType', 'vehiclePlateNumber', 'licenseNumber',
+             'serviceZoneId', 'status', 'submissionAttempt', 'submittedAtEpochMs',
+             'reviewedByUid', 'reviewedAtEpochMs', 'rejectionReason', 'adminNotes',
+             'lastRejectionReason', 'lastReviewedByUid', 'lastReviewedAtEpochMs'
+           ])
+        && request.resource.data.userId == userId
+        && request.resource.data.status == 'PENDING_REVIEW'
+        && request.resource.data.submissionAttempt == resource.data.submissionAttempt + 1
+        && request.resource.data.submittedAtEpochMs is int
+        && request.resource.data.submittedAtEpochMs > 0
+        && isValidNonEmptyString(request.resource.data.vehicleType, 2, 40)
+        && isValidNonEmptyString(request.resource.data.vehiclePlateNumber, 3, 20)
+        && isValidNonEmptyString(request.resource.data.licenseNumber, 4, 40)
+        && isValidNonEmptyString(request.resource.data.serviceZoneId, 2, 60)
+        // Preserve previous rejection metadata for audit continuity
+        && request.resource.data.lastRejectionReason == resource.data.rejectionReason
+        && request.resource.data.lastReviewedByUid == resource.data.reviewedByUid
+        && request.resource.data.lastReviewedAtEpochMs == resource.data.reviewedAtEpochMs
+        // Reset active review decision fields for the new cycle; preserve adminNotes untouched
+        && request.resource.data.reviewedByUid == null
+        && request.resource.data.reviewedAtEpochMs == null
+        && request.resource.data.rejectionReason == null
+        && request.resource.data.adminNotes == resource.data.adminNotes
+        // Atomic WriteBatch integrity checks:
+        // 1. Parent /users/{userId} must transition to PENDING_REVIEW.
+        // 2. History entry for the incremented attempt must be created in the same batch.
+        && userDocAfter(userId).data.collectorVerificationStatus == 'PENDING_REVIEW'
+        && hasValidHistoryAfter(
+             userId,
+             'attempt_' + string(request.resource.data.submissionAttempt),
+             'RESUBMITTED',
+             request.resource.data.submissionAttempt
+           )
+      ) || (
+        isAdmin()
+        && request.resource.data.userId == userId
+        && request.resource.data.submissionAttempt == resource.data.submissionAttempt
+        && request.resource.data.status in ['APPROVED', 'REJECTED']
+        && request.resource.data.reviewedByUid == request.auth.uid
+        && request.resource.data.reviewedAtEpochMs is int
+        && request.resource.data.reviewedAtEpochMs > 0
+        && (
+             (request.resource.data.status == 'APPROVED'
+              && request.resource.data.rejectionReason == null
+              && userDocAfter(userId).data.collectorVerificationStatus == 'APPROVED'
+              && userDocAfter(userId).data.isVerified == true)
+             ||
+             (request.resource.data.status == 'REJECTED'
+              && isValidNonEmptyString(request.resource.data.rejectionReason, 3, 500)
+              && userDocAfter(userId).data.collectorVerificationStatus == 'REJECTED'
+              && userDocAfter(userId).data.isVerified == false)
+           )
+      );
+
+      allow delete: if isAdmin();
+
+      // =======================================================================
+      // 3a. IMMUTABLE SUBMISSION HISTORY: /collector_submissions/{userId}/history/{attemptId}
+      // =======================================================================
+      match /history/{attemptId} {
+        allow get, list: if isOwner(userId) || isAdmin();
+
+        allow create: if (
+          isActiveCollectorOwner(userId)
+          && request.resource.data.keys().hasOnly([
+               'attemptId', 'userId', 'eventType', 'vehicleType', 'vehiclePlateNumber',
+               'licenseNumber', 'serviceZoneId', 'submissionAttempt', 'timestampEpochMs',
+               'actorUid', 'rejectionReason'
+             ])
+          && request.resource.data.attemptId == attemptId
+          && request.resource.data.userId == userId
+          && request.resource.data.actorUid == userId
+          && request.resource.data.eventType in ['SUBMITTED', 'RESUBMITTED']
+          && request.resource.data.submissionAttempt is int
+          && request.resource.data.submissionAttempt >= 1
+          && attemptId == 'attempt_' + string(request.resource.data.submissionAttempt)
+          && request.resource.data.timestampEpochMs is int
+          && request.resource.data.timestampEpochMs > 0
+          && request.resource.data.rejectionReason == null
+          && existsAfter(/databases/$(database)/documents/collector_submissions/$(userId))
+          && submissionDocAfter(userId).data.submissionAttempt == request.resource.data.submissionAttempt
+          && submissionDocAfter(userId).data.status == 'PENDING_REVIEW'
+        ) || (
+          isAdmin()
+          && request.resource.data.keys().hasOnly([
+               'attemptId', 'userId', 'eventType', 'vehicleType', 'vehiclePlateNumber',
+               'licenseNumber', 'serviceZoneId', 'submissionAttempt', 'timestampEpochMs',
+               'actorUid', 'rejectionReason'
+             ])
+          && request.resource.data.attemptId == attemptId
+          && request.resource.data.userId == userId
+          && request.resource.data.actorUid == request.auth.uid
+          && request.resource.data.eventType in ['APPROVED', 'REJECTED']
+        );
+
+        // History entries are strictly append-only and can NEVER be modified or deleted by anyone
+        allow update, delete: if false;
+      }
+    }
+
+    // =========================================================================
+    // 4. PRIVATE MODERATION DATA: /user_moderation/{userId}
+    // =========================================================================
+    match /user_moderation/{userId} {
+      // Strictly inaccessible to ordinary users (including the target user)
+      allow get, list: if isAdmin();
+
+      allow create, update: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+             'userId', 'action', 'accountStatus', 'reason', 'adminNotes',
+             'suspendedUntilEpochMs', 'bannedUntil', 'contractUntil',
+             'deletedAt', 'moderatedByUid', 'moderatedAtEpochMs'
+           ])
+        && request.resource.data.userId == userId
+        && request.resource.data.moderatedByUid == request.auth.uid
+        && request.resource.data.moderatedAtEpochMs is int
+        && request.resource.data.moderatedAtEpochMs > 0;
+
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 5. APPEND-ONLY ADMINISTRATIVE AUDIT LOGS: /admin_actions_log/{logId} & /audit_logs/{logId}
+    // =========================================================================
+    match /admin_actions_log/{logId} {
+      allow get, list: if isAdmin();
+      allow create: if isAdmin()
+        && (
+             ('adminId' in request.resource.data && request.resource.data.adminId == request.auth.uid)
+             || ('actorId' in request.resource.data && request.resource.data.actorId == request.auth.uid)
+           );
+      // Administrative audit records can NEVER be altered or deleted after creation
+      allow update, delete: if false;
+    }
+
+    match /audit_logs/{logId} {
+      allow get, list: if isAdmin();
+      allow create: if isAdmin()
+        || (isAuthenticated() && request.resource.data.uid == request.auth.uid);
+      allow update, delete: if false;
+    }
+
+    // =========================================================================
+    // 6. EXISTING OPERATIONAL COLLECTIONS (HARDENED AGAINST UNAUTHORIZED ACCESS)
+    // =========================================================================
+
+    function canReadWasteRequest(reqData) {
+      return isAdmin()
+        || (isAuthenticated() && reqData.clientUid == request.auth.uid)
+        || isApprovedActiveCollector(request.auth.uid);
+    }
+
+    function canCreateWasteRequest(reqData) {
+      return isAdmin()
+        || (isActiveResident(request.auth.uid)
+            && reqData.clientUid == request.auth.uid
+            && reqData.status in ['PENDING_DISPATCH', 'FLAGGED_FOR_REVIEW']);
+    }
+
+    function canUpdateWasteRequest(existingData, newData) {
+      return isAdmin()
+        || (isActiveResident(request.auth.uid)
+            && existingData.clientUid == request.auth.uid
+            && newData.clientUid == existingData.clientUid
+            && newData.assignedTruckId == existingData.assignedTruckId)
+        || (isApprovedActiveCollector(request.auth.uid)
+            && existingData.assignedTruckId == request.auth.uid
+            && newData.clientUid == existingData.clientUid
+            && newData.assignedTruckId == existingData.assignedTruckId);
+    }
+
+    // Both legacy naming variants ("waste_requests" and "wasteRequests") are protected identically
+    match /waste_requests/{requestId} {
+      allow get, list: if canReadWasteRequest(resource.data);
+      allow create: if canCreateWasteRequest(request.resource.data);
+      allow update: if canUpdateWasteRequest(resource.data, request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /wasteRequests/{requestId} {
+      allow get, list: if canReadWasteRequest(resource.data);
+      allow create: if canCreateWasteRequest(request.resource.data);
+      allow update: if canUpdateWasteRequest(resource.data, request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    // Live Collector Telemetry: only approved, active collectors can publish their own location
+    match /live_locations/{collectorId} {
+      allow get, list: if isAuthenticated();
+      allow create, update: if isAdmin()
+        || (isApprovedActiveCollector(collectorId)
+            && request.resource.data.collectorId == collectorId);
+      allow delete: if isAdmin() || isOwner(collectorId);
+    }
+
+    // Disputes & Append-Only Dispute Notes
+    match /disputes/{disputeId} {
+      allow get, list: if isAdmin()
+        || (isAuthenticated()
+            && (resource.data.residentId == request.auth.uid
+                || resource.data.collectorId == request.auth.uid));
+      allow create: if isAdmin()
+        || (isAuthenticated()
+            && isEmailVerifiedInToken()
+            && request.resource.data.residentId == request.auth.uid);
+      allow update, delete: if isAdmin();
+
+      match /notes/{noteId} {
+        allow get, list: if isAdmin();
+        allow create: if isAdmin()
+          && request.resource.data.adminId == request.auth.uid;
+        allow update, delete: if false;
+      }
+    }
+
+    match /service_disputes/{disputeId} {
+      allow get, list: if isAdmin()
+        || (isAuthenticated() && resource.data.reporterId == request.auth.uid);
+      allow create: if isAdmin()
+        || (isAuthenticated()
+            && isEmailVerifiedInToken()
+            && request.resource.data.reporterId == request.auth.uid);
+      allow update, delete: if isAdmin();
+    }
+
+    match /operational_units/{unitId} {
+      allow get, list: if isAuthenticated();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 7. DEFAULT-DENY FALLBACK FOR ALL UNRECOGNIZED PATHS
+    // =========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

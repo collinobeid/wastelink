@@ -9,3 +9,13 @@
 .externalNativeBuild
 .cxx
 local.properties
+node_modules/
+.firebase/
+firebase-debug.log
+firebase-debug.*.log
+firestore-debug.log
+firestore-debug.*.log
+ui-debug.log
+ui-debug.*.log
+*service-account*.json
+*adminsdk*.json
