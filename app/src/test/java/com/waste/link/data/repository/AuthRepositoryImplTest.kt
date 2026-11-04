@@ -1100,6 +1100,227 @@ class AuthRepositoryImplTest {
         assertEquals(AccountStatus.SUSPENDED, lock.status)
         assertEquals(Destinations.ACCOUNT_STATUS_LOCK, lock.route)
     }
+
+    // =========================================================================
+    // Scenario 27: Cached ACTIVE snapshot does not promote AuthenticatedCachedOffline to Authenticated
+    // =========================================================================
+    @Test
+    fun `27 - Cached ACTIVE snapshot does not promote AuthenticatedCachedOffline to Authenticated`() = runBlocking {
+        val userUid = "offline-active-user-27"
+        val userEmail = "offline27@wastelink.co.tz"
+
+        fakeRemote.seedAuthAccount(uid = userUid, email = userEmail, password = "Pass123!", isEmailVerified = true)
+        fakeRemote.seedCanonicalResidentProfile(userUid, userEmail)
+        fakeRemote.cachedUserDocuments[userUid] = fakeRemote.serverUserDocuments[userUid]!!
+        fakeRemote.setActiveSession(userUid)
+
+        // Simulate network failure so restoreSession falls back to local cache
+        fakeRemote.alwaysFailFetchServerWith = RemoteAuthException(
+            code = RemoteAuthErrorCode.NETWORK_UNAVAILABLE,
+            message = "Offline"
+        )
+        val initialSession = repository.restoreSession()
+        assertTrue("Initial session must be AuthenticatedCachedOffline", initialSession is SessionState.AuthenticatedCachedOffline)
+
+        // Snapshot listener fires with cached ACTIVE snapshot
+        val cachedDoc = fakeRemote.cachedUserDocuments[userUid]!!
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.Found(data = cachedDoc, isFromCache = true, hasPendingWrites = false)
+        )
+
+        // Must NOT promote to SessionState.Authenticated
+        val currentSession = repository.sessionState.value
+        assertTrue("Cached ACTIVE snapshot must keep AuthenticatedCachedOffline", currentSession is SessionState.AuthenticatedCachedOffline)
+        assertFalse(repository.isServerVerifiedSession())
+    }
+
+    // =========================================================================
+    // Scenario 28: Cached ACTIVE snapshot cannot reinstate AuthenticatedRestricted account
+    // =========================================================================
+    @Test
+    fun `28 - Cached ACTIVE snapshot cannot reinstate AuthenticatedRestricted account`() = runBlocking {
+        val userUid = "restricted-user-28"
+        val userEmail = "restricted28@wastelink.co.tz"
+
+        fakeRemote.seedAuthAccount(uid = userUid, email = userEmail, password = "Pass123!", isEmailVerified = true)
+        fakeRemote.seedCanonicalResidentProfile(
+            uid = userUid,
+            email = userEmail,
+            accountStatus = AccountStatus.SUSPENDED,
+            statusReason = "Suspended by municipal moderator"
+        )
+        fakeRemote.setActiveSession(userUid)
+
+        val initialSession = repository.restoreSession()
+        assertTrue("Initial session must be AuthenticatedRestricted", initialSession is SessionState.AuthenticatedRestricted)
+
+        // A stale cached snapshot claiming ACTIVE arrives
+        val staleActiveDoc = fakeRemote.serverUserDocuments[userUid]!!.toMutableMap().apply {
+            put("accountStatus", "ACTIVE")
+            put("status", "ACTIVE")
+        }
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.Found(data = staleActiveDoc, isFromCache = true, hasPendingWrites = false)
+        )
+
+        // Must remain AuthenticatedRestricted; cached data cannot overturn restriction
+        val afterSnapshot = repository.sessionState.value
+        assertTrue("Stale cached ACTIVE snapshot must NOT reinstate restricted session", afterSnapshot is SessionState.AuthenticatedRestricted)
+        assertEquals(AccountStatus.SUSPENDED, (afterSnapshot as SessionState.AuthenticatedRestricted).accountStatus)
+    }
+
+    // =========================================================================
+    // Scenario 29: Server-confirmed ACTIVE snapshot reinstates AuthenticatedRestricted account
+    // =========================================================================
+    @Test
+    fun `29 - Server-confirmed ACTIVE snapshot reinstates AuthenticatedRestricted account`() = runBlocking {
+        val userUid = "reinstated-user-29"
+        val userEmail = "reinstated29@wastelink.co.tz"
+
+        fakeRemote.seedAuthAccount(uid = userUid, email = userEmail, password = "Pass123!", isEmailVerified = true)
+        fakeRemote.seedCanonicalResidentProfile(
+            uid = userUid,
+            email = userEmail,
+            accountStatus = AccountStatus.SUSPENDED,
+            statusReason = "Under review"
+        )
+        fakeRemote.setActiveSession(userUid)
+
+        val initialSession = repository.restoreSession()
+        assertTrue(initialSession is SessionState.AuthenticatedRestricted)
+
+        // Municipal moderator updates server to ACTIVE
+        val reinstatedDoc = fakeRemote.serverUserDocuments[userUid]!!.toMutableMap().apply {
+            put("accountStatus", "ACTIVE")
+            put("status", "ACTIVE")
+            put("statusReason", null)
+        }
+        fakeRemote.serverUserDocuments[userUid] = reinstatedDoc
+
+        // Server-authoritative snapshot arrives (!isFromCache && !hasPendingWrites)
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.Found(data = reinstatedDoc, isFromCache = false, hasPendingWrites = false)
+        )
+
+        // Session must be reinstated to Authenticated
+        val reinstatedSession = repository.sessionState.value
+        assertTrue("Server-authoritative snapshot must reinstate session", reinstatedSession is SessionState.Authenticated)
+        assertEquals(AccountStatus.ACTIVE, (reinstatedSession as SessionState.Authenticated).user.accountStatus)
+        assertTrue(repository.isServerVerifiedSession())
+    }
+
+    // =========================================================================
+    // Scenario 30: Snapshot with pending local writes does not grant server-verified authorization
+    // =========================================================================
+    @Test
+    fun `30 - Snapshot with pending local writes does not grant server-verified authorization`() = runBlocking {
+        val userUid = "pending-writes-user-30"
+        val userEmail = "pending30@wastelink.co.tz"
+
+        fakeRemote.seedAuthAccount(uid = userUid, email = userEmail, password = "Pass123!", isEmailVerified = true)
+        fakeRemote.seedCanonicalResidentProfile(userUid, userEmail)
+        fakeRemote.cachedUserDocuments[userUid] = fakeRemote.serverUserDocuments[userUid]!!
+        fakeRemote.setActiveSession(userUid)
+
+        fakeRemote.alwaysFailFetchServerWith = RemoteAuthException(
+            code = RemoteAuthErrorCode.NETWORK_UNAVAILABLE,
+            message = "Offline"
+        )
+        val initialSession = repository.restoreSession()
+        assertTrue(initialSession is SessionState.AuthenticatedCachedOffline)
+
+        // Snapshot arrives with pending local writes
+        val doc = fakeRemote.serverUserDocuments[userUid]!!
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.Found(data = doc, isFromCache = false, hasPendingWrites = true)
+        )
+
+        // Must NOT promote to Authenticated because writes have not been acknowledged by server
+        val afterSnapshot = repository.sessionState.value
+        assertTrue("Pending writes snapshot must not promote session to Authenticated", afterSnapshot is SessionState.AuthenticatedCachedOffline)
+        assertFalse(repository.isServerVerifiedSession())
+    }
+
+    // =========================================================================
+    // Scenario 31: Metadata-only transition from cache to server promotes AuthenticatedCachedOffline to Authenticated
+    // =========================================================================
+    @Test
+    fun `31 - Metadata-only transition from cache to server promotes AuthenticatedCachedOffline to Authenticated`() = runBlocking {
+        val userUid = "cache-to-server-31"
+        val userEmail = "transition31@wastelink.co.tz"
+
+        fakeRemote.seedAuthAccount(uid = userUid, email = userEmail, password = "Pass123!", isEmailVerified = true)
+        fakeRemote.seedCanonicalResidentProfile(userUid, userEmail)
+        fakeRemote.cachedUserDocuments[userUid] = fakeRemote.serverUserDocuments[userUid]!!
+        fakeRemote.setActiveSession(userUid)
+
+        fakeRemote.alwaysFailFetchServerWith = RemoteAuthException(
+            code = RemoteAuthErrorCode.NETWORK_UNAVAILABLE,
+            message = "Offline"
+        )
+        val initialSession = repository.restoreSession()
+        assertTrue(initialSession is SessionState.AuthenticatedCachedOffline)
+
+        val doc = fakeRemote.serverUserDocuments[userUid]!!
+
+        // Step 1: Cached event arrives first
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.Found(data = doc, isFromCache = true, hasPendingWrites = false)
+        )
+        assertTrue("Still cached offline", repository.sessionState.value is SessionState.AuthenticatedCachedOffline)
+
+        // Step 2: Network reconnects and server confirms metadata (isFromCache=false, hasPendingWrites=false)
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.Found(data = doc, isFromCache = false, hasPendingWrites = false)
+        )
+        val promotedSession = repository.sessionState.value
+        assertTrue("Server confirmation must promote to Authenticated", promotedSession is SessionState.Authenticated)
+        assertTrue(repository.isServerVerifiedSession())
+    }
+
+    // =========================================================================
+    // Scenario 32: Document deletion and malformed document handling via snapshot
+    // =========================================================================
+    @Test
+    fun `32 - Server-authoritative document deletion and malformed document transition session safely`() = runBlocking {
+        val userUid = "deletion-user-32"
+        val userEmail = "deletion32@wastelink.co.tz"
+
+        fakeRemote.seedAuthAccount(uid = userUid, email = userEmail, password = "Pass123!", isEmailVerified = true)
+        fakeRemote.seedCanonicalResidentProfile(userUid, userEmail)
+        fakeRemote.setActiveSession(userUid)
+
+        val initialSession = repository.restoreSession()
+        assertTrue(initialSession is SessionState.Authenticated)
+
+        // 1. Server-authoritative deletion snapshot
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.NotFound(isFromCache = false, hasPendingWrites = false)
+        )
+        val missingDocSession = repository.sessionState.value
+        assertTrue("Deleted document must transition to AuthenticatedProfileIncomplete", missingDocSession is SessionState.AuthenticatedProfileIncomplete)
+        assertEquals(ProfileIncompleteReason.DOCUMENT_MISSING, (missingDocSession as SessionState.AuthenticatedProfileIncomplete).reason)
+
+        // 2. Malformed document snapshot
+        val malformedDoc = mapOf<String, Any?>(
+            "id" to userUid,
+            "role" to "UNKNOWN_ROLE_ABC"
+        )
+        fakeRemote.emitUserDocumentSnapshot(
+            uid = userUid,
+            result = RemoteDocumentResult.Found(data = malformedDoc, isFromCache = false, hasPendingWrites = false)
+        )
+        val malformedSession = repository.sessionState.value
+        assertTrue("Malformed document must transition to AuthenticatedProfileLoadError", malformedSession is SessionState.AuthenticatedProfileLoadError)
+        assertTrue((malformedSession as SessionState.AuthenticatedProfileLoadError).error is AuthError.MalformedProfile)
+    }
 }
 
 /**
@@ -1316,13 +1537,21 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
         }
     }
 
-    fun notifyUserDocumentSnapshot(uid: String) {
-        val doc = serverUserDocuments[uid]
+    fun notifyUserDocumentSnapshot(
+        uid: String,
+        isFromCache: Boolean = false,
+        hasPendingWrites: Boolean = false
+    ) {
+        val doc = if (isFromCache && cachedUserDocuments.containsKey(uid)) cachedUserDocuments[uid] else serverUserDocuments[uid]
         val result = if (doc != null) {
-            RemoteDocumentResult.Found(data = doc, isFromCache = false)
+            RemoteDocumentResult.Found(data = doc, isFromCache = isFromCache, hasPendingWrites = hasPendingWrites)
         } else {
-            RemoteDocumentResult.NotFound(isFromCache = false)
+            RemoteDocumentResult.NotFound(isFromCache = isFromCache, hasPendingWrites = hasPendingWrites)
         }
+        userDocListeners[uid]?.toList()?.forEach { it(result) }
+    }
+
+    fun emitUserDocumentSnapshot(uid: String, result: RemoteDocumentResult) {
         userDocListeners[uid]?.toList()?.forEach { it(result) }
     }
 

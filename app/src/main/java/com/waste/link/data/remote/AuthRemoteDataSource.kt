@@ -16,16 +16,29 @@ data class RemoteAuthUser(
 )
 
 /**
- * Result of reading a Firestore document with explicit cache/server provenance.
+ * Result of reading a Firestore document with explicit cache/server provenance
+ * and pending write metadata.
  */
 sealed interface RemoteDocumentResult {
+    val isFromCache: Boolean
+    val hasPendingWrites: Boolean get() = false
+
+    /**
+     * Returns true only when the document result is definitively confirmed by the server
+     * with no uncommitted local mutations.
+     */
+    val isServerAuthoritative: Boolean
+        get() = !isFromCache && !hasPendingWrites
+
     data class Found(
         val data: Map<String, Any?>,
-        val isFromCache: Boolean = false
+        override val isFromCache: Boolean = false,
+        override val hasPendingWrites: Boolean = false
     ) : RemoteDocumentResult
 
     data class NotFound(
-        val isFromCache: Boolean = false
+        override val isFromCache: Boolean = false,
+        override val hasPendingWrites: Boolean = false
     ) : RemoteDocumentResult
 }
 

@@ -164,41 +164,93 @@ class AuthRepositoryImpl(
             return
         }
 
-        if (docResult is RemoteDocumentResult.Found) {
-            when (val inspected = UserMapper.inspectFirestoreMap(docResult.data, uid)) {
-                is ProfileMappingResult.Valid -> {
-                    val user = inspected.user
-                    when (user.accountStatus) {
-                        AccountStatus.SUSPENDED,
-                        AccountStatus.BANNED,
-                        AccountStatus.RESTRICTED -> {
-                            val restrictedState = SessionState.AuthenticatedRestricted(
-                                user = user,
-                                isEmailVerified = currentAuth.isEmailVerified,
-                                accountStatus = user.accountStatus,
-                                statusReason = user.statusReason,
-                                suspendedUntilEpochMs = user.suspendedUntilEpochMs
-                            )
-                            _sessionState.value = restrictedState
-                        }
-                        AccountStatus.ACTIVE -> {
-                            val current = _sessionState.value
-                            if (current is SessionState.AuthenticatedRestricted || current is SessionState.AuthenticatedCachedOffline) {
-                                val activeState = SessionState.Authenticated(
+        when (docResult) {
+            is RemoteDocumentResult.NotFound -> {
+                if (docResult.isServerAuthoritative) {
+                    _sessionState.value = SessionState.AuthenticatedProfileIncomplete(
+                        uid = uid,
+                        email = currentAuth.email.orEmpty(),
+                        isEmailVerified = currentAuth.isEmailVerified,
+                        reason = ProfileIncompleteReason.DOCUMENT_MISSING,
+                        pendingDraft = pendingRegistrationState?.takeIf { it.uid == uid }?.draft
+                    )
+                }
+            }
+            is RemoteDocumentResult.Found -> {
+                when (val inspected = UserMapper.inspectFirestoreMap(docResult.data, uid)) {
+                    is ProfileMappingResult.Malformed -> {
+                        _sessionState.value = SessionState.AuthenticatedProfileLoadError(
+                            uid = uid,
+                            email = currentAuth.email.orEmpty(),
+                            error = AuthError.MalformedProfile(uid, inspected.reason)
+                        )
+                    }
+                    is ProfileMappingResult.Incomplete -> {
+                        _sessionState.value = SessionState.AuthenticatedProfileIncomplete(
+                            uid = uid,
+                            email = currentAuth.email.orEmpty(),
+                            isEmailVerified = currentAuth.isEmailVerified,
+                            reason = inspected.reason,
+                            pendingDraft = pendingRegistrationState?.takeIf { it.uid == uid }?.draft
+                        )
+                    }
+                    is ProfileMappingResult.Valid -> {
+                        val user = inspected.user
+                        when (user.accountStatus) {
+                            AccountStatus.SUSPENDED,
+                            AccountStatus.BANNED,
+                            AccountStatus.RESTRICTED -> {
+                                val restrictedState = SessionState.AuthenticatedRestricted(
                                     user = user,
                                     isEmailVerified = currentAuth.isEmailVerified,
-                                    hasAdminClaim = currentAuth.hasAdminClaim
+                                    accountStatus = user.accountStatus,
+                                    statusReason = user.statusReason,
+                                    suspendedUntilEpochMs = user.suspendedUntilEpochMs
                                 )
-                                _sessionState.value = activeState
-                            } else if (current is SessionState.Authenticated) {
-                                if (current.user != user) {
-                                    _sessionState.value = current.copy(user = user)
+                                _sessionState.value = restrictedState
+                            }
+                            AccountStatus.ACTIVE -> {
+                                val current = _sessionState.value
+                                if (docResult.isServerAuthoritative) {
+                                    if (user.role == UserRole.ADMIN && !currentAuth.hasAdminClaim) {
+                                        _sessionState.value = SessionState.AuthenticatedProfileLoadError(
+                                            uid = uid,
+                                            email = currentAuth.email.orEmpty(),
+                                            error = AuthError.UnauthorizedAdminClaim()
+                                        )
+                                    } else {
+                                        if (current is SessionState.AuthenticatedRestricted ||
+                                            current is SessionState.AuthenticatedCachedOffline ||
+                                            current is SessionState.AuthenticatedProfileIncomplete
+                                        ) {
+                                            _sessionState.value = SessionState.Authenticated(
+                                                user = user,
+                                                isEmailVerified = currentAuth.isEmailVerified,
+                                                hasAdminClaim = currentAuth.hasAdminClaim
+                                            )
+                                        } else if (current is SessionState.Authenticated) {
+                                            if (current.user != user || current.isEmailVerified != currentAuth.isEmailVerified) {
+                                                _sessionState.value = current.copy(
+                                                    user = user,
+                                                    isEmailVerified = currentAuth.isEmailVerified
+                                                )
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Cached or pending-write snapshot saying ACTIVE:
+                                    // Security Invariant: MUST NEVER promote AuthenticatedCachedOffline to Authenticated,
+                                    // and MUST NEVER reinstate an AuthenticatedRestricted account!
+                                    if (current is SessionState.AuthenticatedCachedOffline) {
+                                        if (current.cachedUser != user) {
+                                            _sessionState.value = current.copy(cachedUser = user)
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                else -> Unit
             }
         }
     }
@@ -650,7 +702,7 @@ class AuthRepositoryImpl(
             null
         }
 
-        if (existingCheck is RemoteDocumentResult.Found && !existingCheck.isFromCache) {
+        if (existingCheck is RemoteDocumentResult.Found && existingCheck.isServerAuthoritative) {
             val inspected = UserMapper.inspectFirestoreMap(existingCheck.data, authUser.uid)
             if (inspected is ProfileMappingResult.Valid) {
                 pendingRegistrationState = null
@@ -1360,11 +1412,11 @@ class AuthRepositoryImpl(
                             pendingLegacySignUp = null
                         }
 
-                        // If the document came from local cache because the server was unreachable:
+                        // If the document came from local cache or has pending writes because the server was unreachable:
                         // - If the cached document is already RESTRICTED/SUSPENDED/BANNED, enforce restriction immediately.
                         // - If the cached document is ACTIVE, return AuthenticatedCachedOffline (NEVER Authenticated)
                         //   so cached ACTIVE standing is never treated as proof that the account wasn't suspended/banned.
-                        if (rawDocResult.isFromCache) {
+                        if (!rawDocResult.isServerAuthoritative) {
                             return applyCachedOfflineUserToSessionState(
                                 user = domainUser,
                                 authUser = effectiveAuth,

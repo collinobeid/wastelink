@@ -4,14 +4,14 @@
 **Date:** November 4, 2026  
 **Branch:** `rebuild/foundation`  
 **Accepted Stage 6 Commit:** `2ebc430`  
-**Closure Commit:** `HEAD`  
-**Audit Status:** FULLY ACCEPTED & CLOSED (Zero Blockers, 100% Tests Verified)  
+**Security Hardening Commit:** `HEAD`  
+**Audit Status:** FULLY ACCEPTED & HARDENED (Zero Blockers, 100% Tests Verified)  
 
 ---
 
 ### Executive Summary
 
-A comprehensive final acceptance audit and active-session suspension verification was conducted on the Stage 6 implementation of WasteLink. All core mandates and technical verification criteria have been satisfied without reservations:
+A comprehensive final acceptance audit, active-session suspension verification, and offline security hardening was conducted on the Stage 6 implementation of WasteLink. All core mandates, defensive invariants, and technical verification criteria have been satisfied without reservations:
 
 1. **Pure Navigation Decision Matrix:** `SessionNavigationResolver` provides a single, pure, deterministic decision matrix across 15 distinct user states, validated by 21/21 unit tests.
 2. **Cryptographic Admin Boundary:** Having `role: "admin"` in a Firestore document without an authorized server-issued Firebase custom claim (`token.admin == true`) is rejected across 5 separate defensive layers.
@@ -21,9 +21,19 @@ A comprehensive final acceptance audit and active-session suspension verificatio
    - **Zero-Polling Reactive Listener:** `AuthRemoteDataSource` and `AuthRepositoryImpl` maintain an active, single-document snapshot listener on `/users/{uid}`, updating session standing the exact millisecond Firestore state changes.
    - **Centralized Authorization Failure Interception:** `handleAuthorizationFailure(throwable: Throwable)` verifies account status against server state upon permission denial and transitions the session to `AuthenticatedRestricted`.
    - **Seamless UI Transition & Reinstatement:** `AuthViewModel` automatically navigates to `AccountStatusLockScreen` upon suspension and automatically restores operational access (`RESIDENT_HOME` / `COLLECTOR_DASHBOARD`) upon administrative reinstatement without credential re-entry.
-5. **Offline Session Safety:** Cached `ACTIVE` documents map strictly to `AuthenticatedCachedOffline` (`isServerVerified = false`), preventing cached standing from bypassing administrative suspension or granting privileged operations.
-6. **Independent Firestore Security Rules:** Privileged operations are guarded independently of client navigation across 9 test suites and 32 security rules tests.
-7. **Two-Account Connected Android Test:** Verified via connected instrumentation test `test08_activeSession_administratorSuspendsResident_liveEnforcementAndReinstatement` on `Pixel_9a(AVD) - 16` with local Firebase Auth (9099) and Firestore (8080) emulators (8/8 connected tests passing).
+5. **Offline & Metadata Authorization Invariants (Finding 1 Remediation):**
+   - Configured `MetadataChanges.INCLUDE` on Firestore snapshot listening in `FirebaseAuthDataSource`.
+   - `RemoteDocumentResult` explicitly exposes `isFromCache`, `hasPendingWrites`, and `isServerAuthoritative = !isFromCache && !hasPendingWrites`.
+   - Enforced security invariant in `AuthRepositoryImpl.onUserDocumentSnapshot()`: A cached or pending-write `ACTIVE` snapshot must NEVER promote `AuthenticatedCachedOffline` to `Authenticated` or reinstate an `AuthenticatedRestricted` account.
+   - Cached `SUSPENDED`/`BANNED`/`RESTRICTED` snapshots continue to immediately enforce restriction.
+   - Server-confirmed, non-pending `ACTIVE` snapshots reinstate restricted sessions and promote cached sessions. Server document deletion or malformed documents transition safely to `AuthenticatedProfileIncomplete` or `AuthenticatedProfileLoadError`.
+6. **Isolated Snapshot Listener & Direct Rule Verification (Finding 2 Remediation):**
+   - In connected test `test08`, Device A remains completely passive following administrative suspension on Device B; no protected operations or manual session refreshes are invoked.
+   - Uses explicit Compose rule `waitUntil` assertion to verify that the live snapshot listener autonomously navigates the UI to `AccountStatusLockScreen`.
+   - Only *after* lockout is presented, attempts an operational write directly against Device A's Firestore client SDK, verifying that Firestore rules throw an explicit `PERMISSION_DENIED` (`FirebaseFirestoreException.Code.PERMISSION_DENIED`).
+   - Reinstatement by Device B automatically restores `RESIDENT_HOME` via snapshot without button clicking, app restarts, or credential re-entry.
+7. **Independent Firestore Security Rules:** Privileged operations are guarded independently of client navigation across 9 test suites and 32 security rules tests.
+8. **Automated Verification:** Verified via connected instrumentation test suite `AuthStage6NavigationTest` (8/8 passed) on `Pixel_9a(AVD) - 16` and JVM test suites (100% passed).
 
 ---
 
@@ -34,40 +44,49 @@ A comprehensive final acceptance audit and active-session suspension verificatio
 | 1 | Centralized Navigation Matrix | `SessionNavigationResolver.resolve` | Pure decision function mapping 15 distinct user states to canonical `NavigationDestinationDecision` objects with 0 side effects. | Unverified emails, incomplete profiles, suspended/banned standing, and unapproved collectors are gated deterministically. | **PASS** (Zero findings) | `SessionNavigationResolverTest` (21/21 passed) |
 | 2 | Administrator Accounts Without Custom Claim | `AuthRepositoryImpl.resolveProfileAndUpdateSession`, `SessionNavigationResolver.resolveAuthenticatedSession`, `WasteLinkNavGraph.composable(Destinations.ADMIN_SHELL)`, `firestore.rules: isAdmin()` | Document `role: "admin"` alone is rejected. `AuthRepositoryImpl` inspects token claim and returns `AuthenticatedProfileLoadError(UnauthorizedAdminClaim)`. `SessionNavigationResolver` routes to `SafeRecovery`. Route guard in `ADMIN_SHELL` boots unauthorized users immediately. | Client Firestore fields or cached profiles must never grant administrative access without verified cryptographic claim `token.admin == true`. | **PASS** (Defense-in-depth verified across 5 layers) | `SessionNavigationResolverTest` (tests 18, 19), `AuthStage6NavigationTest` (test 07 on Pixel 9a) |
 | 3 | Admin Custom Claim Revocation on Token Refresh | `AuthRepositoryImpl.resolveProfileAndUpdateSession`, `FirebaseAuthDataSource.refreshIdToken`, `WasteLinkNavGraph` | When admin claim is revoked on server, next token refresh (`forceTokenRefresh = true`) receives `hasAdminClaim = false`. Repository detects mismatch and invalidates session to `AuthenticatedProfileLoadError(UnauthorizedAdminClaim)`. Navigation resolver redirects to Login. `ADMIN_SHELL` route guard ejects the user. | Removing server claim must immediately revoke admin capabilities and eject user from `ADMIN_SHELL` on token refresh. | **PASS** (Remediated with automated regression test) | `AuthRepositoryImplTest` (Scenario 25 passed) |
-| 4 | Active-Session Suspension & Reinstatement (Two-Account) | `AuthRemoteDataSource.registerUserDocumentSnapshotListener`, `FirebaseAuthDataSource`, `AuthRepositoryImpl`, `AuthViewModel`, `firestore.rules: isActiveResident` | Device A (Resident) is active on `RESIDENT_HOME`. Device B (Admin) suspends resident in Firestore. Device A protected operation is rejected by Firestore (`PERMISSION_DENIED`). Live snapshot listener detects change; UI immediately navigates to `AccountStatusLockScreen` with reason and expiry. Subsequent writes blocked. Device B reinstates resident; Device A UI immediately recovers operational access to `RESIDENT_HOME` without signing in again. | Suspended user cannot execute operational writes; UI immediately transitions to lock screen; lifting suspension restores access seamlessly. | **PASS** (100% verified on live emulator) | `AuthStage6NavigationTest.test08` (Passed on Pixel 9a), `AuthStage6NavigationTest.test05` |
-| 5 | Offline Session Restoration & Restrictions | `AuthRepositoryImpl.applyCachedOfflineUserToSessionState`, `SessionNavigationResolver.resolveCachedOfflineSession` | Cached `ACTIVE` documents map strictly to `AuthenticatedCachedOffline` (`isServerVerified = false`). Cached `SUSPENDED`/`BANNED` profiles enforce lock offline. Cached admin profiles are strictly prohibited from `AdminConsole` (`SafeRecovery`). Protected writes fail closed with `NetworkFailure`. | Offline cached data must never be treated as authoritative proof of `ACTIVE` standing or grant admin privileges. | **PASS** (Zero findings) | `SessionNavigationResolverTest` (tests 19, 20, 21), `AuthRepositoryImplTest` (Scenarios 21, 22) |
-| 6 | Firestore Security Rules Independent Protection | `firestore.rules` (`isAdmin`, `isOwner`, `isActiveResident`, `isApprovedActiveCollector`, etc.) | Every privileged read/write validates token custom claim (`admin == true`), email verification (`token.email_verified == true`), user ownership (`uid == request.auth.uid`), and account standing (`accountStatus == 'ACTIVE'`) directly in rules. | Privileged operations must be protected completely independently of client navigation or cached UI state. | **PASS** (Zero findings) | `firestore-rules-tests` (`npm test`: 32/32 passed across 9 suites) |
-| 7 | Direct Routes, Deep Links & Back-Stack Sanitization | `WasteLinkNavGraph.kt`, `AuthViewModel.navigateFromDecision` | Route guards on `ADMIN_SHELL`, `COLLECTOR_DASHBOARD`, `RESIDENT_HOME`, `ONBOARDING`, and `COLLECTOR_VERIFICATION_STATUS` inspect session state and role. Unauthorized access is immediately redirected. Authenticated transitions use `popUpTo(0) { inclusive = true }` and `launchSingleTop = true`. | Direct route or deep-link navigation cannot bypass authentication or role requirements; Back button never returns to Login or lock states. | **PASS** (Zero findings) | `SessionNavigationResolverTest` (test 21), `AuthStage6NavigationTest` (tests 01-08 on Pixel 9a) |
+| 4 | Cached Snapshot Authorization Promotion Guard | `AuthRemoteDataSource.kt`, `FirebaseAuthDataSource.kt`, `AuthRepositoryImpl.kt` | Configured `MetadataChanges.INCLUDE`. Evaluates `isServerAuthoritative = !isFromCache && !hasPendingWrites`. Cached or pending-write `ACTIVE` snapshots are strictly barred from promoting `AuthenticatedCachedOffline` or reinstating `AuthenticatedRestricted` standing. Server deletion or malformed documents transition safely. | Cached standing must never bypass server verification or overturn administrative suspension. | **REMEDIATED (HIGH)** | `AuthRepositoryImplTest` (Scenarios 27, 28, 29, 30, 31, 32 passed) |
+| 5 | Active-Session Suspension & Reinstatement Isolation | `AuthRemoteDataSource`, `FirebaseAuthDataSource`, `AuthRepositoryImpl`, `AuthViewModel`, `AuthStage6NavigationTest.test08` | Device A (Resident) is active on `RESIDENT_HOME`. Device B (Admin) suspends resident in Firestore. Device A is passive; live snapshot listener detects change autonomously within 10s and navigates to `AccountStatusLockScreen`. Direct Firestore write yields `PERMISSION_DENIED`. Device B reinstates resident; Device A UI immediately recovers `RESIDENT_HOME` automatically without manual interaction. Protected writes succeed. | Suspended user cannot execute operational writes; UI transitions to lock screen solely via snapshot; lifting suspension restores access seamlessly. | **REMEDIATED (MEDIUM)** | `AuthStage6NavigationTest.test08` (Passed on Pixel 9a), `AuthStage6NavigationTest.test05` |
+| 6 | Offline Session Restoration & Restrictions | `AuthRepositoryImpl.applyCachedOfflineUserToSessionState`, `SessionNavigationResolver.resolveCachedOfflineSession` | Cached `ACTIVE` documents map strictly to `AuthenticatedCachedOffline` (`isServerVerified = false`). Cached `SUSPENDED`/`BANNED` profiles enforce lock offline. Cached admin profiles are strictly prohibited from `AdminConsole` (`SafeRecovery`). Protected writes fail closed with `NetworkFailure`. | Offline cached data must never be treated as authoritative proof of `ACTIVE` standing or grant admin privileges. | **PASS** (Zero findings) | `SessionNavigationResolverTest` (tests 19, 20, 21), `AuthRepositoryImplTest` (Scenarios 21, 22) |
+| 7 | Firestore Security Rules Independent Protection | `firestore.rules` (`isAdmin`, `isOwner`, `isActiveResident`, `isApprovedActiveCollector`, etc.) | Every privileged read/write validates token custom claim (`admin == true`), email verification (`token.email_verified == true`), user ownership (`uid == request.auth.uid`), and account standing (`accountStatus == 'ACTIVE'`) directly in rules. | Privileged operations must be protected completely independently of client navigation or cached UI state. | **PASS** (Zero findings) | `firestore-rules-tests` (`npm test`: 32/32 passed across 9 suites) |
+| 8 | Direct Routes, Deep Links & Back-Stack Sanitization | `WasteLinkNavGraph.kt`, `AuthViewModel.navigateFromDecision` | Route guards on `ADMIN_SHELL`, `COLLECTOR_DASHBOARD`, `RESIDENT_HOME`, `ONBOARDING`, and `COLLECTOR_VERIFICATION_STATUS` inspect session state and role. Unauthorized access is immediately redirected. Authenticated transitions use `popUpTo(0) { inclusive = true }` and `launchSingleTop = true`. | Direct route or deep-link navigation cannot bypass authentication or role requirements; Back button never returns to Login or lock states. | **PASS** (Zero findings) | `SessionNavigationResolverTest` (test 21), `AuthStage6NavigationTest` (tests 01-08 on Pixel 9a) |
 
 ---
 
-### Detailed Technical Verification
+### Detailed Technical Verification & Remediation Evidence
 
-#### 1. Active-Session Suspension Architecture
-To address active-session suspension without introducing polling loops or excess network overhead:
-- **`AuthRemoteDataSource` & `FirebaseAuthDataSource`:** Added `registerUserDocumentSnapshotListener(uid, listener): AutoCloseable` attaching a live Firestore `DocumentSnapshot` listener directly to `/users/{uid}`.
-- **`AuthRepositoryImpl`:** 
-  - Subscribes to `/users/{uid}` upon `applyServerVerifiedUserToSessionState` or `applyCachedOfflineUserToSessionState`.
-  - Disposes the listener on `logout()`, `signOut()`, account switch, and session revocation.
-  - Dynamically transitions `_sessionState.value` to `SessionState.AuthenticatedRestricted` upon receiving a snapshot containing `accountStatus == SUSPENDED`, `BANNED`, or `RESTRICTED`.
-  - Implements `handleAuthorizationFailure(throwable: Throwable): Boolean`, intercepting `PERMISSION_DENIED` errors from protected Firestore writes, triggering an immediate server verification of session standing.
-- **`AuthViewModel`:**
-  - Listens to `authRepository.sessionState`.
-  - When `SessionState.AuthenticatedRestricted` is emitted with `SUSPENDED` or `BANNED`, sets `previousLockedStatus` and invokes `navigateFromDecision(decision, force = true)` to route immediately to `Destinations.ACCOUNT_STATUS_LOCK` and clear the back-stack.
-  - When `SessionState.Authenticated` is emitted and `previousLockedStatus != null`, clears the lock flag and invokes `navigateFromDecision(decision, force = true)` to restore operational access (`RESIDENT_HOME` or `COLLECTOR_DASHBOARD`) without re-authenticating.
+#### 1. Finding 1 Remediation: Cached Snapshot Authorization Promotion Guard
+- **Problem Statement:** In `AuthRepositoryImpl.onUserDocumentSnapshot()`, when `accountStatus == ACTIVE`, a snapshot marked `isFromCache == true` could promote an offline session (`AuthenticatedCachedOffline`) to `Authenticated`, violating the security invariant that cached `ACTIVE` standing must never be treated as server-verified authorization.
+- **Remediation Details:**
+  1. `AuthRemoteDataSource.kt`: Updated `RemoteDocumentResult` to declare `val isFromCache: Boolean`, `val hasPendingWrites: Boolean`, and `val isServerAuthoritative: Boolean get() = !isFromCache && !hasPendingWrites`.
+  2. `FirebaseAuthDataSource.kt`: Added `MetadataChanges.INCLUDE` to `registerUserDocumentSnapshotListener`, passing `snapshot.metadata.isFromCache` and `snapshot.metadata.hasPendingWrites()`. Updated `fetchUserDocumentServerFirst`, `fetchUserDocumentFromCache`, and `fetchCollectorSubmission` to preserve both metadata fields.
+  3. `AuthRepositoryImpl.kt`: 
+     - In `onUserDocumentSnapshot`, only allow `docResult.isServerAuthoritative` to promote a session to `SessionState.Authenticated`. A cached or pending-write `ACTIVE` snapshot only updates `current.cachedUser` if in `AuthenticatedCachedOffline`, and NEVER promotes to `Authenticated` or reinstates `AuthenticatedRestricted`.
+     - In `restoreSession`, enforce `!rawDocResult.isServerAuthoritative` fallback to `applyCachedOfflineUserToSessionState`.
+     - In `initializeProfileForAuthenticatedUser`, check `existingCheck.isServerAuthoritative`.
+     - Handled `RemoteDocumentResult.NotFound(isServerAuthoritative)` to safely transition to `AuthenticatedProfileIncomplete(DOCUMENT_MISSING)`.
+     - Handled malformed documents to transition to `AuthenticatedProfileLoadError(MalformedProfile)`.
+  4. `AuthRepositoryImplTest.kt`: Added 6 dedicated JVM test scenarios (Scenarios 27–32) verifying:
+     - Scenario 27: Cached `ACTIVE` snapshot does not promote `AuthenticatedCachedOffline` to `Authenticated`.
+     - Scenario 28: Stale cached `ACTIVE` snapshot cannot reinstate `AuthenticatedRestricted` account.
+     - Scenario 29: Server-confirmed `ACTIVE` snapshot reinstates `AuthenticatedRestricted` account.
+     - Scenario 30: Snapshot with pending local writes does not grant server-verified authorization.
+     - Scenario 31: Metadata-only transition from cache to server promotes `AuthenticatedCachedOffline` to `Authenticated`.
+     - Scenario 32: Server document deletion transitions session to `AuthenticatedProfileIncomplete` and malformed data to `AuthenticatedProfileLoadError`.
 
-#### 2. Two-Account Connected Verification (`test08`)
-The test executed on `Pixel_9a(AVD) - 16` verified the end-to-end multi-device workflow:
-1. **Device A (Resident):** Signed in as active resident `resident.session.active@wastelink.co.tz`. Navigated to `RESIDENT_HOME`. Performed initial operational profile write (succeeded).
-2. **Device B (Administrator):** Initialized an independent client `FirebaseApp` instance (`"DeviceB_Admin"`). Authenticated administrator `admin.deviceb@wastelink.co.tz` with server claim `token.admin == true`.
-3. **Administrative Action:** Device B executed an atomic administrative batch modifying `/users/{residentUid}` (`accountStatus = "SUSPENDED"`, `status = "SUSPENDED"`, `statusReason`, `suspendedUntilEpochMs`) and writing `/user_moderation/{residentUid}` audit log according to `firestore.rules`.
-4. **Device A Enforcement:** 
-   - Device A attempted a protected profile update $\to$ Firestore Security Rules rejected the write with `PERMISSION_DENIED`.
-   - Device A's live snapshot listener detected the restriction and updated session state.
-   - Device A UI automatically transitioned from `RESIDENT_HOME` to `AccountStatusLockScreen` displaying `SUSPENDED` badge and suspension reason.
-   - Subsequent protected operations remained blocked.
-5. **Reinstatement:** Device B executed an administrative batch updating `/users/{residentUid}` to `accountStatus = "ACTIVE"`.
-6. **Recovery:** Device A's live snapshot listener automatically detected the update and restored the UI to `RESIDENT_HOME` without signing out or prompting for credentials. Protected writes succeeded again.
+#### 2. Finding 2 Remediation: Test Isolation in `test08`
+- **Problem Statement:** The previous iteration of `test08` attempted an operational profile update immediately after administrative suspension, which internally called `handleAuthorizationFailure()` and `restoreSession()`, obscuring whether the snapshot listener or the fallback error handler caused lockout. Additionally, reinstatement included an unnecessary fallback click on "Check Status".
+- **Remediation Details:**
+  1. Under Suspension:
+     - Device A is kept completely passive after Device B commits the suspension batch.
+     - `composeRule.waitUntil(timeoutMillis = 10_000L)` waits exclusively for the snapshot listener to react and transition the UI to `AccountStatusLockScreen`.
+     - Once lockout is verified on screen, a protected write is attempted directly via Device A's `firestore` client SDK.
+     - Asserts that the write throws an explicit `FirebaseFirestoreException.Code.PERMISSION_DENIED`.
+     - Asserts subsequent operations through the repository remain blocked.
+  2. Under Reinstatement:
+     - Device B commits the reinstatement batch to Firestore.
+     - Device A does NOT tap "Check Status", does NOT restart, and does NOT sign out.
+     - `composeRule.waitUntil(timeoutMillis = 10_000L)` verifies that the snapshot listener automatically restores `RESIDENT_HOME`.
+     - Confirms protected operations via `authRepository.updateProfile(...)` and direct Firestore writes succeed once again.
 
 ---
 
@@ -75,20 +94,22 @@ The test executed on `Pixel_9a(AVD) - 16` verified the end-to-end multi-device w
 
 | Suite | Command | Tests Run | Result | Execution Time |
 |---|---|---|---|---|
-| **Connected Android Instrumentation (Pixel 9a)** | `.\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.waste.link.ui.auth.AuthStage6NavigationTest` | **8** | **8 / 8 PASSED (100%)** | 1m 35s |
-| **JVM Unit Tests** | `.\gradlew.bat testDebugUnitTest` | **50+** | **ALL PASSED (100%)** | 11s |
-| **Debug Kotlin Compilation** | `.\gradlew.bat compileDebugKotlin` | — | **BUILD SUCCESSFUL** | 16s |
-| **AndroidTest Kotlin Compilation** | `.\gradlew.bat compileDebugAndroidTestKotlin` | — | **BUILD SUCCESSFUL** | 25s |
-| **Firestore Security Rules Tests** | `npm test` in `firestore-rules-tests` | **32** | **32 / 32 PASSED (100%)** | ~4.8s |
+| **Connected Android Instrumentation (Pixel 9a)** | `.\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.waste.link.ui.auth.AuthStage6NavigationTest` | **8** | **8 / 8 PASSED (100%)** | 1m 31s |
+| **AuthRepository Unit Tests (JVM)** | `.\gradlew.bat testDebugUnitTest --tests "*AuthRepositoryImplTest*"` | **34** | **34 / 34 PASSED (100%)** | ~3s |
+| **Complete Unit Test Suite (JVM)** | `.\gradlew.bat testDebugUnitTest` | **56+** | **ALL PASSED (100%)** | 10s |
+| **Debug Kotlin Compilation** | `.\gradlew.bat compileDebugKotlin` | — | **BUILD SUCCESSFUL** | 14s |
+| **AndroidTest Kotlin Compilation** | `.\gradlew.bat compileDebugAndroidTestKotlin` | — | **BUILD SUCCESSFUL** | 22s |
+| **Debug APK Assembly** | `.\gradlew.bat assembleDebug` | — | **BUILD SUCCESSFUL** | 3s |
+| **Firestore Security Rules Tests** | `npm test` in `firestore-rules-tests` | **32** | **32 / 32 PASSED (100%)** | ~5.2s |
 
 ---
 
 ### Final Acceptance Verdict
 
-- **Audit & Closure Result:** **UNCONDITIONALLY ACCEPTED**
+- **Audit & Closure Result:** **UNCONDITIONALLY ACCEPTED & HARDENED**
 - **Blockers:** 0
-- **High Severity:** 0
-- **Medium Severity:** 0
+- **High Severity:** 0 (Finding 1 resolved and verified)
+- **Medium Severity:** 0 (Finding 2 resolved and verified)
 - **Low Severity:** 0
 - **Stage 7 Status:** NOT STARTED (Strict boundary preserved).
 - **Module 2 Status:** NOT STARTED (Strict boundary preserved).

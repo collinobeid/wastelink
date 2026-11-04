@@ -5,6 +5,7 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.UserProfileChangeRequest
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.MetadataChanges
 import com.google.firebase.firestore.Source
 import kotlinx.coroutines.tasks.await
 import java.util.concurrent.atomic.AtomicBoolean
@@ -72,19 +73,31 @@ class FirebaseAuthDataSource @Inject constructor(
     ): AutoCloseable {
         val registration = firestore.collection(USERS_COLLECTION)
             .document(uid)
-            .addSnapshotListener { snapshot, error ->
-                if (error != null || snapshot == null) {
+            .addSnapshotListener(MetadataChanges.INCLUDE) { snapshot, error ->
+                if (error != null) {
+                    listener(RemoteDocumentResult.NotFound(isFromCache = false))
                     return@addSnapshotListener
                 }
+                if (snapshot == null) return@addSnapshotListener
+
+                val hasPendingWrites = snapshot.metadata.hasPendingWrites()
+                val isFromCache = snapshot.metadata.isFromCache
+
                 if (snapshot.exists() && snapshot.data != null) {
                     listener(
                         RemoteDocumentResult.Found(
                             data = snapshot.data!!,
-                            isFromCache = snapshot.metadata.isFromCache
+                            isFromCache = isFromCache,
+                            hasPendingWrites = hasPendingWrites
                         )
                     )
                 } else {
-                    listener(RemoteDocumentResult.NotFound(isFromCache = snapshot.metadata.isFromCache))
+                    listener(
+                        RemoteDocumentResult.NotFound(
+                            isFromCache = isFromCache,
+                            hasPendingWrites = hasPendingWrites
+                        )
+                    )
                 }
             }
 
@@ -171,10 +184,14 @@ class FirebaseAuthDataSource @Inject constructor(
         return if (snapshot.exists() && snapshot.data != null) {
             RemoteDocumentResult.Found(
                 data = snapshot.data!!,
-                isFromCache = snapshot.metadata.isFromCache
+                isFromCache = snapshot.metadata.isFromCache,
+                hasPendingWrites = snapshot.metadata.hasPendingWrites()
             )
         } else {
-            RemoteDocumentResult.NotFound(isFromCache = snapshot.metadata.isFromCache)
+            RemoteDocumentResult.NotFound(
+                isFromCache = snapshot.metadata.isFromCache,
+                hasPendingWrites = snapshot.metadata.hasPendingWrites()
+            )
         }
     }
 
@@ -188,10 +205,14 @@ class FirebaseAuthDataSource @Inject constructor(
             if (snapshot.exists() && snapshot.data != null) {
                 RemoteDocumentResult.Found(
                     data = snapshot.data!!,
-                    isFromCache = true
+                    isFromCache = true,
+                    hasPendingWrites = snapshot.metadata.hasPendingWrites()
                 )
             } else {
-                RemoteDocumentResult.NotFound(isFromCache = true)
+                RemoteDocumentResult.NotFound(
+                    isFromCache = true,
+                    hasPendingWrites = snapshot.metadata.hasPendingWrites()
+                )
             }
         } catch (_: Exception) {
             RemoteDocumentResult.NotFound(isFromCache = true)
@@ -225,10 +246,14 @@ class FirebaseAuthDataSource @Inject constructor(
             if (snapshot.exists() && snapshot.data != null) {
                 RemoteDocumentResult.Found(
                     data = snapshot.data!!,
-                    isFromCache = false
+                    isFromCache = snapshot.metadata.isFromCache,
+                    hasPendingWrites = snapshot.metadata.hasPendingWrites()
                 )
             } else {
-                RemoteDocumentResult.NotFound(isFromCache = false)
+                RemoteDocumentResult.NotFound(
+                    isFromCache = snapshot.metadata.isFromCache,
+                    hasPendingWrites = snapshot.metadata.hasPendingWrites()
+                )
             }
         } catch (_: Exception) {
             try {
@@ -237,9 +262,16 @@ class FirebaseAuthDataSource @Inject constructor(
                     .get(Source.CACHE)
                     .await()
                 if (cached.exists() && cached.data != null) {
-                    RemoteDocumentResult.Found(data = cached.data!!, isFromCache = true)
+                    RemoteDocumentResult.Found(
+                        data = cached.data!!,
+                        isFromCache = true,
+                        hasPendingWrites = cached.metadata.hasPendingWrites()
+                    )
                 } else {
-                    RemoteDocumentResult.NotFound(isFromCache = true)
+                    RemoteDocumentResult.NotFound(
+                        isFromCache = true,
+                        hasPendingWrites = cached.metadata.hasPendingWrites()
+                    )
                 }
             } catch (_: Exception) {
                 RemoteDocumentResult.NotFound(isFromCache = true)

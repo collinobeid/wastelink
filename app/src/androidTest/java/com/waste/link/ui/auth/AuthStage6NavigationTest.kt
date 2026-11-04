@@ -15,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -29,6 +30,7 @@ import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
 import com.waste.link.data.remote.FirebaseEmulatorConfig
 import com.waste.link.data.repository.AuthRepository
 import com.waste.link.data.repository.AuthRepositoryImpl
@@ -44,6 +46,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.tasks.await
 import org.json.JSONObject
 import org.junit.After
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.FixMethodOrder
@@ -651,24 +654,13 @@ class AuthStage6NavigationTest {
         )
         suspendBatch.commit().await()
 
-        // Step 3: Device A (Resident) — Without signing out or restarting the application:
-        // Attempt a protected operation
-        val updateAttempt = authRepository.updateProfile(
-            fullName = "Amina Resident Blocked",
-            phoneNumber = "+255711223344",
-            defaultZoneId = "zone_kinondoni",
-            preferredLanguage = "en"
-        )
-        // Verify Firestore rejects the operation with PERMISSION_DENIED
-        assertTrue(
-            "Protected operation must be rejected when account is suspended: $updateAttempt",
-            updateAttempt is com.waste.link.domain.model.ProfileUpdateOutcome.Failure
-        )
-
-        // Verify live snapshot listener or authorization-failure handler transitions UI to AccountStatusLockScreen
-        composeRule.waitForIdle()
-        Thread.sleep(1_500L)
-        composeRule.waitForIdle()
+        // Step 3: Device A (Resident) — Isolation Verification:
+        // Do NOT call restoreSession(), refreshAccountStatus(), or any protected operation.
+        // Wait exclusively for the live Firestore snapshot listener to detect suspension and
+        // automatically transition the active UI to AccountStatusLockScreen.
+        composeRule.waitUntil(timeoutMillis = 10_000L) {
+            composeRule.onAllNodesWithTag(AuthTestTags.ACCOUNT_LOCK_SCREEN).fetchSemanticsNodes().isNotEmpty()
+        }
 
         composeRule.onNodeWithTag(AuthTestTags.ACCOUNT_LOCK_SCREEN).assertIsDisplayed()
         composeRule.onNodeWithTag(AuthTestTags.ACCOUNT_LOCK_STATUS_BADGE).assertIsDisplayed()
@@ -676,16 +668,39 @@ class AuthStage6NavigationTest {
         composeRule.onNodeWithTag(AuthTestTags.ACCOUNT_LOCK_REASON).assertIsDisplayed()
         composeRule.onNodeWithText("Suspended by municipal moderator for investigation").assertIsDisplayed()
 
-        // Step 4: Subsequent protected operations remain blocked
-        val secondUpdateAttempt = authRepository.updateProfile(
-            fullName = "Still Blocked",
+        // Step 4: After lockout is displayed, verify Firestore security rules enforce restriction
+        // by attempting a protected write directly using Device A's Firestore client
+        val directWriteException = try {
+            firestore.collection("users").document(residentUid).update(
+                mapOf(
+                    "fullName" to "Direct Write While Suspended",
+                    "name" to "Direct Write While Suspended",
+                    "updatedAtEpochMs" to System.currentTimeMillis()
+                )
+            ).await()
+            null
+        } catch (e: Throwable) {
+            e
+        }
+        assertNotNull("Direct Firestore write while suspended must fail", directWriteException)
+        val isPermissionDenied = (directWriteException as? FirebaseFirestoreException)?.code ==
+            FirebaseFirestoreException.Code.PERMISSION_DENIED ||
+            directWriteException?.message?.contains("PERMISSION_DENIED", ignoreCase = true) == true
+        assertTrue(
+            "Expected PERMISSION_DENIED on direct write while suspended, got: $directWriteException",
+            isPermissionDenied
+        )
+
+        // Subsequent protected operations via repository also fail
+        val updateAttempt = authRepository.updateProfile(
+            fullName = "Amina Resident Blocked",
             phoneNumber = "+255711223344",
             defaultZoneId = "zone_kinondoni",
             preferredLanguage = "en"
         )
         assertTrue(
-            "Subsequent protected operation must also be rejected: $secondUpdateAttempt",
-            secondUpdateAttempt is com.waste.link.domain.model.ProfileUpdateOutcome.Failure
+            "Subsequent protected operation via repository must also be rejected: $updateAttempt",
+            updateAttempt is com.waste.link.domain.model.ProfileUpdateOutcome.Failure
         )
 
         // Step 5: Device B (Administrator) reinstates the resident account
@@ -714,25 +729,17 @@ class AuthStage6NavigationTest {
         )
         reinstateBatch.commit().await()
 
-        // Wait for live snapshot or tap "Check Status"
-        composeRule.waitForIdle()
-        Thread.sleep(1_500L)
-        composeRule.waitForIdle()
-
-        try {
-            val refreshNode = composeRule.onNodeWithTag(AuthTestTags.ACCOUNT_LOCK_BTN_REFRESH)
-            refreshNode.performScrollTo().performClick()
-            composeRule.waitForIdle()
-            Thread.sleep(1_500L)
-            composeRule.waitForIdle()
-        } catch (_: Throwable) {
-            // Live snapshot already reacted and restored RESIDENT_HOME automatically
+        // Step 6: Under Reinstatement:
+        // Do NOT tap Check Status, do NOT restart, do NOT sign out.
+        // Wait via composeRule.waitUntil for live snapshot to restore RESIDENT_HOME automatically.
+        composeRule.waitUntil(timeoutMillis = 10_000L) {
+            composeRule.onAllNodesWithTag(TAG_RESIDENT_ENTRY).fetchSemanticsNodes().isNotEmpty()
         }
 
-        // Confirm the resident has recovered operational access to RESIDENT_HOME without signing out
+        // Confirm the resident has recovered operational access to RESIDENT_HOME without signing out or manual refresh
         composeRule.onNodeWithTag(TAG_RESIDENT_ENTRY).assertIsDisplayed()
 
-        // Confirm protected operations now succeed again
+        // Confirm protected operations succeed again
         val finalUpdate = authRepository.updateProfile(
             fullName = "Amina Reinstated",
             phoneNumber = "+255711223344",
@@ -743,6 +750,21 @@ class AuthStage6NavigationTest {
             "Protected operation should succeed after reinstatement: $finalUpdate",
             finalUpdate is com.waste.link.domain.model.ProfileUpdateOutcome.Success
         )
+
+        // Confirm direct write to Firestore succeeds now that account is ACTIVE
+        val directWriteSuccess = try {
+            firestore.collection("users").document(residentUid).update(
+                mapOf(
+                    "fullName" to "Amina Direct Reinstated",
+                    "name" to "Amina Direct Reinstated",
+                    "updatedAtEpochMs" to System.currentTimeMillis()
+                )
+            ).await()
+            true
+        } catch (_: Throwable) {
+            false
+        }
+        assertTrue("Direct Firestore write must succeed after reinstatement", directWriteSuccess)
     }
 
     // =========================================================================
