@@ -26,7 +26,12 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.waste.link.domain.model.AccountStatus
+import com.waste.link.domain.model.CollectorVerificationStatus
+import com.waste.link.domain.model.OnboardingStatus
+import com.waste.link.domain.model.UserRole
 import com.waste.link.ui.admin.AdminShellScreen
+import com.waste.link.ui.auth.AccountStatusLockScreen
 import com.waste.link.ui.auth.AuthNavigationEvent
 import com.waste.link.ui.auth.AuthPrimaryGreen
 import com.waste.link.ui.auth.AuthViewModel
@@ -47,6 +52,7 @@ object Destinations {
     const val COMPLETE_PROFILE = "complete_profile"
     const val ONBOARDING = "onboarding"
     const val COLLECTOR_VERIFICATION_STATUS = "collector_verification_status"
+    const val ACCOUNT_STATUS_LOCK = "account_status_lock"
     const val RESIDENT_HOME = "resident_home"
     const val COLLECTOR_DASHBOARD = "collector_dashboard"
     const val ADMIN_SHELL = "admin_shell"
@@ -262,50 +268,156 @@ fun WasteLinkNavGraph(
         }
 
         composable(Destinations.ONBOARDING) {
-            OnboardingScreen(
-                uiState = uiState,
-                onResidentZoneChanged = authViewModel::onResidentZoneChanged,
-                onResidentAddressChanged = authViewModel::onResidentAddressChanged,
-                onCompleteResidentOnboarding = { authViewModel.completeResidentOnboarding() },
-                onCollectorVehicleTypeChanged = authViewModel::onCollectorVehicleTypeChanged,
-                onCollectorPlateNumberChanged = authViewModel::onCollectorPlateNumberChanged,
-                onCollectorLicenseNumberChanged = authViewModel::onCollectorLicenseNumberChanged,
-                onCollectorServiceZoneChanged = authViewModel::onCollectorServiceZoneChanged,
-                onCollectorReviewToggled = authViewModel::onCollectorReviewToggled,
-                onSubmitCollectorOnboarding = authViewModel::submitCollectorOnboarding,
-                onResubmitCollectorOnboarding = authViewModel::resubmitCollectorOnboarding,
-                onCompleteOnboarding = { authViewModel.completeStage4Onboarding() },
-                onLogoutClick = authViewModel::logout
-            )
+            val user = uiState.currentUser
+            if (user == null) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.LOGIN) {
+                        popUpTo(0) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else if (user.accountStatus == AccountStatus.SUSPENDED || user.accountStatus == AccountStatus.BANNED) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.ACCOUNT_STATUS_LOCK) {
+                        popUpTo(Destinations.ONBOARDING) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else if (user.role == UserRole.RESIDENT && user.onboardingStatus == OnboardingStatus.COMPLETED) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.RESIDENT_HOME) {
+                        popUpTo(Destinations.ONBOARDING) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else if (user.role == UserRole.COLLECTOR && user.collectorVerificationStatus == CollectorVerificationStatus.APPROVED) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.COLLECTOR_DASHBOARD) {
+                        popUpTo(Destinations.ONBOARDING) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else {
+                OnboardingScreen(
+                    uiState = uiState,
+                    onResidentZoneChanged = authViewModel::onResidentZoneChanged,
+                    onResidentAddressChanged = authViewModel::onResidentAddressChanged,
+                    onCompleteResidentOnboarding = { authViewModel.completeResidentOnboarding() },
+                    onCollectorVehicleTypeChanged = authViewModel::onCollectorVehicleTypeChanged,
+                    onCollectorPlateNumberChanged = authViewModel::onCollectorPlateNumberChanged,
+                    onCollectorLicenseNumberChanged = authViewModel::onCollectorLicenseNumberChanged,
+                    onCollectorServiceZoneChanged = authViewModel::onCollectorServiceZoneChanged,
+                    onCollectorReviewToggled = authViewModel::onCollectorReviewToggled,
+                    onSubmitCollectorOnboarding = authViewModel::submitCollectorOnboarding,
+                    onResubmitCollectorOnboarding = authViewModel::resubmitCollectorOnboarding,
+                    onCompleteOnboarding = { authViewModel.completeStage4Onboarding() },
+                    onLogoutClick = authViewModel::logout
+                )
+            }
         }
 
         composable(Destinations.COLLECTOR_VERIFICATION_STATUS) {
-            CollectorVerificationStatusScreen(
+            val user = uiState.currentUser
+            if (user == null) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.LOGIN) {
+                        popUpTo(0) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else if (user.accountStatus == AccountStatus.SUSPENDED || user.accountStatus == AccountStatus.BANNED) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.ACCOUNT_STATUS_LOCK) {
+                        popUpTo(Destinations.COLLECTOR_VERIFICATION_STATUS) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else if (user.role == UserRole.RESIDENT) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.RESIDENT_HOME) {
+                        popUpTo(Destinations.COLLECTOR_VERIFICATION_STATUS) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else {
+                CollectorVerificationStatusScreen(
+                    uiState = uiState,
+                    onRefreshStatus = authViewModel::refreshCollectorVerificationStatus,
+                    onEditAndResubmit = authViewModel::startCollectorEditAndResubmit,
+                    onNavigateToDashboard = {
+                        navController.navigate(Destinations.COLLECTOR_DASHBOARD) {
+                            popUpTo(0) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    },
+                    onNavigateToOnboarding = {
+                        navController.navigate(Destinations.ONBOARDING) {
+                            popUpTo(0) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    },
+                    onLogoutClick = authViewModel::logout
+                )
+            }
+        }
+
+        composable(Destinations.ACCOUNT_STATUS_LOCK) {
+            AccountStatusLockScreen(
                 uiState = uiState,
-                onRefreshStatus = authViewModel::refreshCollectorVerificationStatus,
-                onEditAndResubmit = authViewModel::startCollectorEditAndResubmit,
-                onNavigateToDashboard = {
-                    navController.navigate(Destinations.COLLECTOR_DASHBOARD) {
-                        popUpTo(0) { inclusive = true }
-                        launchSingleTop = true
-                    }
-                },
-                onNavigateToOnboarding = {
-                    navController.navigate(Destinations.ONBOARDING) {
-                        popUpTo(0) { inclusive = true }
-                        launchSingleTop = true
-                    }
+                onRefreshStatus = authViewModel::refreshAccountStatus,
+                onContactSupport = {
+                    // Formal support / compliance inquiry handled via system intent or support dialog
                 },
                 onLogoutClick = authViewModel::logout
             )
         }
 
         composable(Destinations.RESIDENT_HOME) {
-            MainScreen(
-                rootNavController = navController,
-                onNewRequest = { /* Handled in Resident module */ },
-                onNavigateToAdmin = { navController.navigate(Destinations.ADMIN_SHELL) }
-            )
+            val user = uiState.currentUser
+            if (user == null) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.LOGIN) {
+                        popUpTo(0) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else if (user.accountStatus == AccountStatus.SUSPENDED || user.accountStatus == AccountStatus.BANNED) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.ACCOUNT_STATUS_LOCK) {
+                        popUpTo(Destinations.RESIDENT_HOME) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else if (user.role == UserRole.COLLECTOR) {
+                LaunchedEffect(Unit) {
+                    val fallback = if (user.collectorVerificationStatus == CollectorVerificationStatus.APPROVED) {
+                        Destinations.COLLECTOR_DASHBOARD
+                    } else {
+                        Destinations.COLLECTOR_VERIFICATION_STATUS
+                    }
+                    navController.navigate(fallback) {
+                        popUpTo(Destinations.RESIDENT_HOME) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else if (user.role == UserRole.RESIDENT && user.onboardingStatus != OnboardingStatus.COMPLETED) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.ONBOARDING) {
+                        popUpTo(Destinations.RESIDENT_HOME) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else {
+                MainScreen(
+                    rootNavController = navController,
+                    onNewRequest = { /* Handled in Resident module */ },
+                    onNavigateToAdmin = {
+                        if (uiState.hasAdminClaim && uiState.currentUser?.role == UserRole.ADMIN) {
+                            navController.navigate(Destinations.ADMIN_SHELL)
+                        }
+                    }
+                )
+            }
         }
 
         composable(Destinations.SETTINGS) {
@@ -320,8 +432,29 @@ fun WasteLinkNavGraph(
 
         composable(Destinations.COLLECTOR_DASHBOARD) {
             val user = uiState.currentUser
-            if (user != null && user.role == com.waste.link.domain.model.UserRole.COLLECTOR &&
-                user.collectorVerificationStatus != com.waste.link.domain.model.CollectorVerificationStatus.APPROVED
+            if (user == null) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.LOGIN) {
+                        popUpTo(0) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else if (user.accountStatus == AccountStatus.SUSPENDED || user.accountStatus == AccountStatus.BANNED) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.ACCOUNT_STATUS_LOCK) {
+                        popUpTo(Destinations.COLLECTOR_DASHBOARD) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else if (user.role == UserRole.RESIDENT) {
+                LaunchedEffect(Unit) {
+                    navController.navigate(Destinations.RESIDENT_HOME) {
+                        popUpTo(Destinations.COLLECTOR_DASHBOARD) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                }
+            } else if (user.role == UserRole.COLLECTOR &&
+                user.collectorVerificationStatus != CollectorVerificationStatus.APPROVED
             ) {
                 LaunchedEffect(Unit) {
                     navController.navigate(Destinations.COLLECTOR_VERIFICATION_STATUS) {
@@ -344,11 +477,25 @@ fun WasteLinkNavGraph(
         }
 
         composable(Destinations.ADMIN_SHELL) {
-            AdminShellScreen(
-                onLogout = {
-                    authViewModel.logout()
+            if (!uiState.hasAdminClaim || uiState.currentUser?.role != UserRole.ADMIN) {
+                LaunchedEffect(Unit) {
+                    val fallback = when (uiState.currentUser?.role) {
+                        UserRole.COLLECTOR -> Destinations.COLLECTOR_DASHBOARD
+                        UserRole.RESIDENT -> Destinations.RESIDENT_HOME
+                        else -> Destinations.LOGIN
+                    }
+                    navController.navigate(fallback) {
+                        popUpTo(Destinations.ADMIN_SHELL) { inclusive = true }
+                        launchSingleTop = true
+                    }
                 }
-            )
+            } else {
+                AdminShellScreen(
+                    onLogout = {
+                        authViewModel.logout()
+                    }
+                )
+            }
         }
     }
 }

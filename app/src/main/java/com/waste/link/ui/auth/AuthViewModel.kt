@@ -27,6 +27,8 @@ import com.waste.link.domain.model.UserRole
 import com.waste.link.domain.validation.AuthValidator
 import com.waste.link.domain.validation.ValidationResult
 import com.waste.link.ui.Destinations
+import com.waste.link.ui.navigation.NavigationDestinationDecision
+import com.waste.link.ui.navigation.SessionNavigationResolver
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -342,6 +344,8 @@ class AuthViewModel @Inject constructor(
     // 1. Session Restoration & Initial Route Resolution
     // =========================================================================
 
+    private var currentNavigationTarget: NavigationDestinationDecision? = null
+
     fun restoreSessionOnLaunch() {
         if (_uiState.value.isSubmitting) return
         _uiState.update { it.copy(isInitialSessionLoading = true) }
@@ -349,79 +353,130 @@ class AuthViewModel @Inject constructor(
         viewModelScope.launch {
             val restored = authRepository.restoreSession()
             _uiState.update { it.copy(isInitialSessionLoading = false) }
-            handleRestoredSessionNavigation(restored)
+            val decision = SessionNavigationResolver.resolve(restored)
+            navigateFromDecision(decision)
+        }
+    }
+
+    fun refreshAccountStatus() {
+        if (_uiState.value.isSubmitting) return
+        _uiState.update { it.copy(isSubmitting = true) }
+
+        viewModelScope.launch {
+            val restored = authRepository.restoreSession()
+            _uiState.update { it.copy(isSubmitting = false) }
+            val decision = SessionNavigationResolver.resolve(restored)
+            navigateFromDecision(decision, force = true)
+        }
+    }
+
+    fun navigateFromDecision(decision: NavigationDestinationDecision, force: Boolean = false) {
+        if (!force && decision == currentNavigationTarget) {
+            return
+        }
+        currentNavigationTarget = decision
+
+        when (decision) {
+            is NavigationDestinationDecision.Login -> {
+                if (decision.loadError != null && decision.prefillEmail != null) {
+                    _uiState.update {
+                        it.copy(
+                            loginEmail = decision.prefillEmail,
+                            loginBanner = buildProfileLoadFailedBanner(AuthError.NetworkFailure(decision.loadError))
+                        )
+                    }
+                }
+                emitNavigation(
+                    AuthNavigationEvent.NavigateToLogin(
+                        prefillEmail = decision.prefillEmail,
+                        clearBackStack = decision.clearBackStack
+                    )
+                )
+            }
+            is NavigationDestinationDecision.VerifyEmail -> {
+                _uiState.update {
+                    it.copy(
+                        verificationEmailAddress = decision.email,
+                        initialVerificationEmailSent = decision.initialEmailSent
+                    )
+                }
+                emitNavigation(
+                    AuthNavigationEvent.NavigateToVerifyEmail(
+                        email = decision.email,
+                        initialEmailSent = decision.initialEmailSent
+                    )
+                )
+            }
+            is NavigationDestinationDecision.CompleteProfile -> {
+                emitNavigation(
+                    AuthNavigationEvent.NavigateToCompleteProfile(
+                        uid = decision.uid,
+                        email = decision.email,
+                        reason = decision.reason
+                    )
+                )
+            }
+            is NavigationDestinationDecision.ResidentOnboarding -> {
+                emitNavigation(AuthNavigationEvent.NavigateToOnboarding(decision.role))
+            }
+            is NavigationDestinationDecision.CollectorOnboarding -> {
+                emitNavigation(AuthNavigationEvent.NavigateToOnboarding(decision.role))
+            }
+            is NavigationDestinationDecision.CollectorStatus -> {
+                emitNavigation(AuthNavigationEvent.NavigateToCollectorVerificationStatus)
+            }
+            is NavigationDestinationDecision.ResidentHome -> {
+                emitNavigation(
+                    AuthNavigationEvent.NavigateToDestination(
+                        route = Destinations.RESIDENT_HOME,
+                        clearBackStack = decision.clearBackStack
+                    )
+                )
+            }
+            is NavigationDestinationDecision.CollectorDashboard -> {
+                emitNavigation(
+                    AuthNavigationEvent.NavigateToDestination(
+                        route = Destinations.COLLECTOR_DASHBOARD,
+                        clearBackStack = decision.clearBackStack
+                    )
+                )
+            }
+            is NavigationDestinationDecision.AdminConsole -> {
+                emitNavigation(
+                    AuthNavigationEvent.NavigateToDestination(
+                        route = Destinations.ADMIN_SHELL,
+                        clearBackStack = decision.clearBackStack
+                    )
+                )
+            }
+            is NavigationDestinationDecision.AccountStatusLock -> {
+                _uiState.update {
+                    it.copy(
+                        lockedAccountStatus = decision.status,
+                        lockedStatusReason = decision.reason,
+                        lockedSuspendedUntilEpochMs = decision.suspendedUntilEpochMs
+                    )
+                }
+                emitNavigation(
+                    AuthNavigationEvent.NavigateToDestination(
+                        route = Destinations.ACCOUNT_STATUS_LOCK,
+                        clearBackStack = decision.clearBackStack
+                    )
+                )
+            }
+            is NavigationDestinationDecision.SafeRecovery -> {
+                emitNavigation(
+                    AuthNavigationEvent.NavigateToLogin(
+                        clearBackStack = decision.clearBackStack
+                    )
+                )
+            }
         }
     }
 
     private fun handleRestoredSessionNavigation(session: SessionState) {
-        when (session) {
-            is SessionState.Unauthenticated,
-            is SessionState.AuthenticationRevoked -> {
-                emitNavigation(AuthNavigationEvent.NavigateToLogin(clearBackStack = true))
-            }
-            is SessionState.Authenticated -> {
-                navigateForAuthenticatedUser(
-                    user = session.user,
-                    isEmailVerified = session.isEmailVerified,
-                    hasAdminClaim = session.hasAdminClaim
-                )
-            }
-            is SessionState.AuthenticatedCachedOffline -> {
-                // Offline read-only fallback: route to cached user's screen without forcing sign-out
-                navigateForAuthenticatedUser(
-                    user = session.cachedUser,
-                    isEmailVerified = session.isEmailVerified,
-                    hasAdminClaim = false
-                )
-            }
-            is SessionState.AuthenticatedRestricted -> {
-                if (session.accountStatus == AccountStatus.RESTRICTED) {
-                    navigateForAuthenticatedUser(
-                        user = session.user,
-                        isEmailVerified = session.isEmailVerified,
-                        hasAdminClaim = false
-                    )
-                } else {
-                    // SUSPENDED or BANNED: present the account lock status on LoginScreen without silent sign-out
-                    _uiState.update {
-                        it.copy(
-                            lockedAccountStatus = session.accountStatus,
-                            lockedStatusReason = session.statusReason,
-                            lockedSuspendedUntilEpochMs = session.suspendedUntilEpochMs,
-                            loginBanner = buildAccountLockedBanner(
-                                accountStatus = session.accountStatus,
-                                statusReason = session.statusReason,
-                                suspendedUntilEpochMs = session.suspendedUntilEpochMs
-                            )
-                        )
-                    }
-                    emitNavigation(AuthNavigationEvent.NavigateToLogin(clearBackStack = true))
-                }
-            }
-            is SessionState.AuthenticatedProfileIncomplete -> {
-                emitNavigation(
-                    AuthNavigationEvent.NavigateToCompleteProfile(
-                        uid = session.uid,
-                        email = session.email,
-                        reason = session.reason
-                    )
-                )
-            }
-            is SessionState.AuthenticatedProfileLoadError -> {
-                _uiState.update {
-                    it.copy(
-                        loginEmail = session.email,
-                        loginBanner = buildProfileLoadFailedBanner(session.error)
-                    )
-                }
-                emitNavigation(
-                    AuthNavigationEvent.NavigateToLogin(
-                        prefillEmail = session.email,
-                        clearBackStack = true
-                    )
-                )
-            }
-        }
+        val decision = SessionNavigationResolver.resolve(session)
+        navigateFromDecision(decision)
     }
 
     private fun navigateForAuthenticatedUser(
@@ -429,65 +484,30 @@ class AuthViewModel @Inject constructor(
         isEmailVerified: Boolean,
         hasAdminClaim: Boolean
     ) {
-        if (user.role != UserRole.ADMIN && !isEmailVerified) {
-            _uiState.update {
-                it.copy(
-                    verificationEmailAddress = user.email,
-                    initialVerificationEmailSent = true
-                )
-            }
-            emitNavigation(
-                AuthNavigationEvent.NavigateToVerifyEmail(
-                    email = user.email,
-                    initialEmailSent = true
-                )
+        val session = when (user.accountStatus) {
+            AccountStatus.RESTRICTED -> SessionState.AuthenticatedRestricted(
+                user = user,
+                isEmailVerified = isEmailVerified,
+                accountStatus = AccountStatus.RESTRICTED,
+                statusReason = user.statusReason,
+                suspendedUntilEpochMs = user.suspendedUntilEpochMs
             )
-            return
-        }
-
-        if (user.role == UserRole.COLLECTOR) {
-            when (user.collectorVerificationStatus) {
-                CollectorVerificationStatus.NOT_SUBMITTED -> {
-                    emitNavigation(AuthNavigationEvent.NavigateToOnboarding(user.role))
-                    return
-                }
-                CollectorVerificationStatus.PENDING_REVIEW,
-                CollectorVerificationStatus.REJECTED -> {
-                    emitNavigation(AuthNavigationEvent.NavigateToCollectorVerificationStatus)
-                    return
-                }
-                CollectorVerificationStatus.APPROVED -> {
-                    emitNavigation(
-                        AuthNavigationEvent.NavigateToDestination(
-                            route = Destinations.COLLECTOR_DASHBOARD,
-                            clearBackStack = true
-                        )
-                    )
-                    return
-                }
-                else -> {
-                    emitNavigation(AuthNavigationEvent.NavigateToOnboarding(user.role))
-                    return
-                }
-            }
-        }
-
-        if (user.role == UserRole.RESIDENT && user.onboardingStatus != OnboardingStatus.COMPLETED) {
-            emitNavigation(AuthNavigationEvent.NavigateToOnboarding(user.role))
-            return
-        }
-
-        val destination = when (user.role) {
-            UserRole.ADMIN -> if (hasAdminClaim) Destinations.ADMIN_SHELL else Destinations.RESIDENT_HOME
-            UserRole.COLLECTOR -> Destinations.COLLECTOR_DASHBOARD
-            UserRole.RESIDENT -> Destinations.RESIDENT_HOME
-        }
-        emitNavigation(
-            AuthNavigationEvent.NavigateToDestination(
-                route = destination,
-                clearBackStack = true
+            AccountStatus.SUSPENDED,
+            AccountStatus.BANNED -> SessionState.AuthenticatedRestricted(
+                user = user,
+                isEmailVerified = isEmailVerified,
+                accountStatus = user.accountStatus,
+                statusReason = user.statusReason,
+                suspendedUntilEpochMs = user.suspendedUntilEpochMs
             )
-        )
+            AccountStatus.ACTIVE -> SessionState.Authenticated(
+                user = user,
+                isEmailVerified = isEmailVerified,
+                hasAdminClaim = hasAdminClaim
+            )
+        }
+        val decision = SessionNavigationResolver.resolve(session)
+        navigateFromDecision(decision)
     }
 
     // =========================================================================
@@ -1962,6 +1982,7 @@ class AuthViewModel @Inject constructor(
     // =========================================================================
 
     fun logout() {
+        currentNavigationTarget = null
         loginRateLimitJob?.cancel()
         regRateLimitJob?.cancel()
         resendCooldownJob?.cancel()

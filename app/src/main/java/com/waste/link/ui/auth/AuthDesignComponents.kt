@@ -172,6 +172,15 @@ object AuthTestTags {
     const val COL_STATUS_BTN_DASHBOARD = "AUTH_COL_STATUS_BTN_DASHBOARD"
     const val COL_STATUS_BTN_LOGOUT = "AUTH_COL_STATUS_BTN_LOGOUT"
     const val COL_STATUS_BANNER = "AUTH_COL_STATUS_BANNER"
+
+    // Account Status Lock Screen (Suspended & Banned)
+    const val ACCOUNT_LOCK_SCREEN = "AUTH_ACCOUNT_LOCK_SCREEN"
+    const val ACCOUNT_LOCK_STATUS_BADGE = "AUTH_ACCOUNT_LOCK_STATUS_BADGE"
+    const val ACCOUNT_LOCK_REASON = "AUTH_ACCOUNT_LOCK_REASON"
+    const val ACCOUNT_LOCK_EXPIRY = "AUTH_ACCOUNT_LOCK_EXPIRY"
+    const val ACCOUNT_LOCK_BTN_REFRESH = "AUTH_LOCK_BTN_REFRESH"
+    const val ACCOUNT_LOCK_BTN_APPEAL = "AUTH_LOCK_BTN_APPEAL"
+    const val ACCOUNT_LOCK_BTN_LOGOUT = "AUTH_LOCK_BTN_LOGOUT"
 }
 
 // Refined Dark Forest & Emerald Palette Tokens derived from Color.kt
