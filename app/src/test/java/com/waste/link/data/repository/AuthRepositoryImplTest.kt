@@ -754,12 +754,20 @@ class AuthRepositoryImplTest {
         assertTrue(offlineNoCacheSession is SessionState.AuthenticatedProfileLoadError)
         assertNotNull(fakeRemote.currentUser) // Must NOT destroy valid Firebase session!
 
-        // Case E: Temporary network failure WITH local Firestore cache -> Authenticated(isFromCache = true)
+        // Case E: Temporary network failure WITH local Firestore cache -> AuthenticatedCachedOffline (NEVER Authenticated)
         fakeRemote.setActiveSession("sess_uid_1")
         fakeRemote.cachedUserDocuments["sess_uid_1"] = fakeRemote.serverUserDocuments["sess_uid_1"]!!
         val offlineCachedSession = repository.restoreSession()
-        assertTrue(offlineCachedSession is SessionState.Authenticated)
-        assertTrue((offlineCachedSession as SessionState.Authenticated).isFromCache)
+        assertTrue(
+            "Expected AuthenticatedCachedOffline, got $offlineCachedSession",
+            offlineCachedSession is SessionState.AuthenticatedCachedOffline
+        )
+        assertFalse(offlineCachedSession.isServerVerified)
+        assertFalse(offlineCachedSession.canPerformProtectedOperations)
+        assertFalse(repository.isServerVerifiedSession())
+        // Server-verified getCurrentUser() must be null while offline; read-only getCachedOrVerifiedUser() returns cached snapshot
+        assertNull(repository.getCurrentUser())
+        assertEquals("sess_uid_1", repository.getCachedOrVerifiedUser()?.id)
     }
 
     // =========================================================================
@@ -827,6 +835,115 @@ class AuthRepositoryImplTest {
     }
 
     // =========================================================================
+    // Scenario 25: Offline cached ACTIVE session is not treated as server-verified
+    //              and blocks protected mutations or login bypass when suspended on server
+    // =========================================================================
+    @Test
+    fun `25 - Cached ACTIVE profile is not treated as proof of server standing and blocks protected writes while offline`() = runBlocking {
+        fakeRemote.seedAuthAccount(
+            uid = "cache_safety_25",
+            email = "safety25@wastelink.co.tz",
+            password = "SafetyPass123",
+            isEmailVerified = true
+        )
+        fakeRemote.seedCanonicalResidentProfile("cache_safety_25", "safety25@wastelink.co.tz")
+
+        // Populate local cache with ACTIVE profile, then suspend user on server and go offline
+        fakeRemote.cachedUserDocuments["cache_safety_25"] = fakeRemote.serverUserDocuments["cache_safety_25"]!!
+        fakeRemote.seedCanonicalResidentProfile(
+            uid = "cache_safety_25",
+            email = "safety25@wastelink.co.tz",
+            accountStatus = AccountStatus.SUSPENDED,
+            statusReason = "Suspended on server while client offline",
+            suspendedUntilEpochMs = 1750000000000L
+        )
+        fakeRemote.alwaysFailFetchServerWith = RemoteAuthException(
+            code = RemoteAuthErrorCode.NETWORK_UNAVAILABLE,
+            message = "Server unreachable"
+        )
+
+        // 1. Fresh login while offline MUST NOT fall back to stale ACTIVE cache
+        val offlineLogin = repository.login("safety25@wastelink.co.tz", "SafetyPass123")
+        assertTrue(offlineLogin is LoginOutcome.ProfileLoadFailed)
+
+        // 2. Session restoration while offline produces AuthenticatedCachedOffline (isServerVerified = false)
+        val restored = repository.restoreSession()
+        assertTrue(restored is SessionState.AuthenticatedCachedOffline)
+        assertFalse(restored.isServerVerified)
+        assertFalse(restored.canPerformProtectedOperations)
+
+        // 3. Protected profile update is rejected while in AuthenticatedCachedOffline
+        val offlineUpdate = repository.updateProfile(
+            fullName = "Updated While Offline",
+            phoneNumber = "+255712345678",
+            defaultZoneId = "zone_temeke"
+        )
+        assertTrue(offlineUpdate is ProfileUpdateOutcome.Failure)
+        assertTrue((offlineUpdate as ProfileUpdateOutcome.Failure).error is AuthError.NetworkFailure)
+
+        // 4. When server connectivity returns, attempting a protected update or restoreSession detects server SUSPENDED status
+        fakeRemote.alwaysFailFetchServerWith = null
+        val revalidatedSession = repository.restoreSession()
+        assertTrue(revalidatedSession is SessionState.AuthenticatedRestricted)
+        assertEquals(AccountStatus.SUSPENDED, (revalidatedSession as SessionState.AuthenticatedRestricted).accountStatus)
+    }
+
+    // =========================================================================
+    // Scenario 26: FirebaseAuth state listener synchronizes sign-in, external sign-out,
+    //              disabled account, revoked session, and unregisters cleanly without leaks
+    // =========================================================================
+    @Test
+    fun `26 - FirebaseAuth listener synchronizes external sign-out, account switch, disabled account, and revoked token`() = runBlocking {
+        assertEquals(1, fakeRemote.activeAuthListenerCount)
+
+        fakeRemote.seedAuthAccount(
+            uid = "listen_uid_1",
+            email = "listen1@wastelink.co.tz",
+            password = "ListenPass123",
+            isEmailVerified = false
+        )
+        fakeRemote.seedCanonicalResidentProfile("listen_uid_1", "listen1@wastelink.co.tz")
+
+        val loginOutcome = repository.login("listen1@wastelink.co.tz", "ListenPass123")
+        assertTrue(loginOutcome is LoginOutcome.Authenticated)
+        assertTrue(repository.sessionState.value is SessionState.Authenticated)
+
+        // 1. External token update (email verified via listener notification) updates sessionState
+        fakeRemote.setServerEmailVerified("listen_uid_1", true)
+        fakeRemote.notifyListenersOfCurrentAccountUpdate()
+        assertTrue((repository.sessionState.value as SessionState.Authenticated).isEmailVerified)
+
+        // 2. External sign-out on FirebaseAuth immediately transitions sessionState to Unauthenticated
+        fakeRemote.signOut()
+        assertEquals(SessionState.Unauthenticated, repository.sessionState.value)
+        assertNull(repository.getCurrentUser())
+
+        // 3. Re-sign-in, then disable account on server -> restoreSession transitions to AuthenticationRevoked(UserDisabled)
+        repository.login("listen1@wastelink.co.tz", "ListenPass123")
+        fakeRemote.setAccountDisabled("listen_uid_1", true)
+        val disabledSession = repository.restoreSession()
+        assertTrue(
+            "Expected AuthenticationRevoked, got $disabledSession",
+            disabledSession is SessionState.AuthenticationRevoked
+        )
+        assertTrue((disabledSession as SessionState.AuthenticationRevoked).error is AuthError.UserDisabled)
+        assertNull(fakeRemote.currentUser)
+
+        // 4. Re-enable, sign in, then expire/revoke token -> restoreSession transitions to AuthenticationRevoked(SessionRevoked)
+        fakeRemote.setAccountDisabled("listen_uid_1", false)
+        repository.login("listen1@wastelink.co.tz", "ListenPass123")
+        fakeRemote.setTokenRevoked("listen_uid_1", true)
+        val revokedSession = repository.restoreSession()
+        assertTrue(revokedSession is SessionState.AuthenticationRevoked)
+        assertTrue((revokedSession as SessionState.AuthenticationRevoked).error is AuthError.SessionRevoked)
+        assertNull(fakeRemote.currentUser)
+
+        // 5. Closing repository unregisters the listener cleanly without leaking
+        repository.close()
+        assertEquals(0, fakeRemote.activeAuthListenerCount)
+    }
+
+    // =========================================================================
     // Helper: Asserts that a written /users/{uid} map satisfies Stage 2.1 firestore.rules
     // =========================================================================
     private fun assertFirestoreDocumentSatisfiesSelfCreateRules(
@@ -881,16 +998,21 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
         var phoneNumber: String? = null,
         var isEmailVerified: Boolean = false,
         var hasAdminClaim: Boolean = false,
-        var isDisabled: Boolean = false
+        var isDisabled: Boolean = false,
+        var isTokenRevoked: Boolean = false
     )
 
     private val authAccountsByEmail = mutableMapOf<String, StoredAuthAccount>()
     private val authAccountsByUid = mutableMapOf<String, StoredAuthAccount>()
+    private val authListeners = mutableListOf<(RemoteAuthUser?) -> Unit>()
     val serverUserDocuments = mutableMapOf<String, Map<String, Any?>>()
     val cachedUserDocuments = mutableMapOf<String, Map<String, Any?>>()
 
     var currentUser: RemoteAuthUser? = null
     private var nextGeneratedUidIndex = 1
+
+    val activeAuthListenerCount: Int
+        get() = authListeners.size
 
     var createAuthUserCallCount = 0
     var writeUserDocumentCallCount = 0
@@ -928,10 +1050,33 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
     fun setActiveSession(uid: String) {
         val account = authAccountsByUid[uid] ?: error("Unknown uid $uid")
         currentUser = account.toRemoteUser()
+        notifyAuthListeners()
     }
 
     fun setServerEmailVerified(uid: String, verified: Boolean) {
         authAccountsByUid[uid]?.isEmailVerified = verified
+    }
+
+    fun setAccountDisabled(uid: String, disabled: Boolean) {
+        authAccountsByUid[uid]?.isDisabled = disabled
+    }
+
+    fun setTokenRevoked(uid: String, revoked: Boolean) {
+        authAccountsByUid[uid]?.isTokenRevoked = revoked
+    }
+
+    fun notifyListenersOfCurrentAccountUpdate() {
+        val current = currentUser ?: return
+        val updated = authAccountsByUid[current.uid]?.toRemoteUser()
+        currentUser = updated
+        notifyAuthListeners()
+    }
+
+    private fun notifyAuthListeners() {
+        val snapshot = currentUser
+        for (listener in authListeners.toList()) {
+            listener(snapshot)
+        }
     }
 
     fun seedCanonicalResidentProfile(
@@ -1000,6 +1145,13 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
 
     override fun getCurrentAuthUser(): RemoteAuthUser? = currentUser
 
+    override fun registerAuthStateListener(listener: (RemoteAuthUser?) -> Unit): AutoCloseable {
+        authListeners.add(listener)
+        return AutoCloseable {
+            authListeners.remove(listener)
+        }
+    }
+
     override suspend fun createAuthUser(email: String, password: String): RemoteAuthUser {
         createAuthUserCallCount++
         val normalized = email.trim().lowercase()
@@ -1022,6 +1174,7 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
         authAccountsByUid[uid] = account
         val remoteUser = account.toRemoteUser()
         currentUser = remoteUser
+        notifyAuthListeners()
         return remoteUser
     }
 
@@ -1047,8 +1200,10 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
             )
         }
 
+        account.isTokenRevoked = false
         val remoteUser = account.toRemoteUser()
         currentUser = remoteUser
+        notifyAuthListeners()
         return remoteUser
     }
 
@@ -1065,8 +1220,15 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
                 message = "User account has been disabled."
             )
         }
+        if (stored.isTokenRevoked) {
+            throw RemoteAuthException(
+                code = RemoteAuthErrorCode.TOKEN_EXPIRED,
+                message = "The user's credential is no longer valid. The user must sign in again."
+            )
+        }
         val reloaded = stored.toRemoteUser()
         currentUser = reloaded
+        notifyAuthListeners()
         return reloaded
     }
 
@@ -1112,6 +1274,7 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
 
     override fun signOut() {
         currentUser = null
+        notifyAuthListeners()
     }
 
     override suspend fun deleteCurrentAuthUser() {
@@ -1123,6 +1286,7 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
             authAccountsByEmail.remove(it.email)
         }
         currentUser = null
+        notifyAuthListeners()
     }
 
     override suspend fun fetchUserDocumentServerFirst(uid: String): RemoteDocumentResult {
@@ -1162,6 +1326,10 @@ private class FakeAuthRemoteDataSource : AuthRemoteDataSource {
             )
         existing.putAll(fields)
         serverUserDocuments[uid] = existing
+    }
+
+    override fun simulateNextProfileWriteFailureOnce(failure: Throwable) {
+        nextWriteUserError = failure
     }
 
     private fun StoredAuthAccount.toRemoteUser(): RemoteAuthUser {

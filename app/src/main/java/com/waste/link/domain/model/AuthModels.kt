@@ -211,14 +211,13 @@ sealed interface ProfileInitializationOutcome {
  */
 sealed interface LoginOutcome {
     /**
-     * Authentication succeeded and a valid canonical [User] profile with `AccountStatus.ACTIVE`
-     * (or `RESTRICTED` when operational access is evaluated downstream) was resolved.
+     * Authentication succeeded and a **server-verified** canonical [User] profile with
+     * `AccountStatus.ACTIVE` was resolved directly from Firestore (`Source.SERVER`).
      */
     data class Authenticated(
         val user: User,
         val isEmailVerified: Boolean,
-        val hasAdminClaim: Boolean = false,
-        val isFromCache: Boolean = false
+        val hasAdminClaim: Boolean = false
     ) : LoginOutcome
 
     /**
@@ -248,9 +247,9 @@ sealed interface LoginOutcome {
     ) : LoginOutcome
 
     /**
-     * Authentication succeeded, but loading `/users/{uid}` failed due to a transient network outage
-     * (`NetworkFailure`), `PermissionDenied`, or a genuinely corrupted document (`MalformedProfile`).
-     * Never fabricates a fallback user.
+     * Authentication succeeded, but loading `/users/{uid}` from the server failed due to a transient
+     * network outage (`NetworkFailure`), `PermissionDenied`, or a genuinely corrupted document (`MalformedProfile`).
+     * Never fabricates a fallback user or trusts stale local cache during login.
      */
     data class ProfileLoadFailed(
         val uid: String,
@@ -268,22 +267,56 @@ sealed interface LoginOutcome {
 }
 
 /**
- * Authoritative session state resolved on startup (`restoreSession`) and updated across
- * authentication lifecycle transitions.
+ * Authoritative session state resolved on startup (`restoreSession`) and synchronized with
+ * `FirebaseAuth` state transitions.
+ *
+ * Session Safety Rule:
+ * - [Authenticated] represents ONLY a **server-verified** `ACTIVE` profile (`isServerVerified == true`).
+ * - [AuthenticatedCachedOffline] represents an unverified offline snapshot (`isServerVerified == false`)
+ *   loaded from local Firestore cache when the server is unreachable. A cached `ACTIVE` record is never
+ *   treated as proof that the account has not since been suspended or banned on the server; protected
+ *   mutations require server authorization.
  */
 sealed interface SessionState {
+    val isServerVerified: Boolean
+        get() = false
+
+    val canPerformProtectedOperations: Boolean
+        get() = false
+
     /** No active Firebase Authentication user session exists. */
     data object Unauthenticated : SessionState
 
     /**
-     * Active Firebase Authentication session with a valid, `ACTIVE` canonical [User] profile.
+     * Active Firebase Authentication session with a **server-verified** `ACTIVE` canonical [User] profile.
      */
     data class Authenticated(
         val user: User,
         val isEmailVerified: Boolean,
-        val hasAdminClaim: Boolean = false,
-        val isFromCache: Boolean = false
-    ) : SessionState
+        val hasAdminClaim: Boolean = false
+    ) : SessionState {
+        override val isServerVerified: Boolean = true
+        override val canPerformProtectedOperations: Boolean = true
+    }
+
+    /**
+     * Active Firebase Authentication session restored while offline using a locally cached [User] snapshot.
+     *
+     * Security & Session Safety Guarantees:
+     * - [isServerVerified] is strictly `false`.
+     * - [canPerformProtectedOperations] is strictly `false`.
+     * - Permitted offline behavior: read-only display of cached user identity without forcing sign-out.
+     * - Protected mutations and role-privileged writes require server re-verification (`restoreSession`)
+     *   and are independently guarded by `firestore.rules` on the backend.
+     */
+    data class AuthenticatedCachedOffline(
+        val cachedUser: User,
+        val isEmailVerified: Boolean,
+        val networkError: AuthError.NetworkFailure
+    ) : SessionState {
+        override val isServerVerified: Boolean = false
+        override val canPerformProtectedOperations: Boolean = false
+    }
 
     /**
      * Active Firebase Authentication session where the user's `/users/{uid}` profile has
@@ -311,8 +344,8 @@ sealed interface SessionState {
 
     /**
      * Active Firebase Authentication session where `/users/{uid}` could not be loaded due to
-     * temporary network unavailability (`NetworkFailure`), `PermissionDenied`, or `MalformedProfile`.
-     * Preserves the Firebase session without signing the user out.
+     * temporary network unavailability (`NetworkFailure` with no local cache), `PermissionDenied`,
+     * or `MalformedProfile`. Preserves the Firebase session without signing the user out.
      */
     data class AuthenticatedProfileLoadError(
         val uid: String,

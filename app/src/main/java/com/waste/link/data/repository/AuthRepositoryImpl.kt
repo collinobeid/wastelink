@@ -29,11 +29,12 @@ import com.waste.link.domain.validation.ValidationResult
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Production implementation of [AuthRepository] for WasteLink Module 1, Stage 3.
+ * Production implementation of [AuthRepository] for WasteLink Module 1, Stage 3.1.
  *
  * Security & Architectural Guarantees:
  * 1. Writes `/users/{uid}` exclusively using the canonical [User] domain model and [UserMapper.toFirestoreMap]
@@ -44,14 +45,17 @@ import javax.inject.Singleton
  *    calling `createUserWithEmailAndPassword` a second time.
  * 4. Detects missing or legacy incomplete `/users/{uid}` profiles on login and session restoration
  *    (`ProfileIncomplete`) without fabricating placeholder user data and without signing the user out.
- * 5. Treats Firebase Authentication (`isEmailVerified` and refreshed ID token claims) as the sole
- *    authority for email verification, and never writes `isVerified = true` from the client.
+ * 5. Explicitly separates server-verified sessions ([SessionState.Authenticated]) from read-only
+ *    offline cached sessions ([SessionState.AuthenticatedCachedOffline]); a cached `ACTIVE` profile
+ *    is never treated as proof that the account has not since been suspended or banned on the server.
+ * 6. Actively observes `FirebaseAuth` state and token changes (`registerAuthStateListener`) without
+ *    leaking listeners or retaining stale user/draft state across sign-outs or account switches.
  */
 @Singleton
 class AuthRepositoryImpl(
     private val remoteDataSource: AuthRemoteDataSource,
     private val clock: () -> Long
-) : AuthRepository {
+) : AuthRepository, AutoCloseable {
 
     @Inject
     constructor(remoteDataSource: AuthRemoteDataSource) : this(
@@ -80,6 +84,96 @@ class AuthRepositoryImpl(
     @Volatile
     private var pendingLegacySignUp: PendingLegacySignUp? = null
 
+    private val isHandlingRevocation = AtomicBoolean(false)
+
+    private val authStateSubscription: AutoCloseable =
+        remoteDataSource.registerAuthStateListener(::onRemoteAuthStateChanged)
+
+    /**
+     * Unregisters the underlying Firebase Auth listener when this repository instance is disposed.
+     */
+    override fun close() {
+        authStateSubscription.close()
+    }
+
+    /**
+     * Synchronizes in-memory session and draft state whenever Firebase Authentication
+     * notifies of a sign-in, sign-out, user switch, or ID token update.
+     */
+    private fun onRemoteAuthStateChanged(remoteUser: RemoteAuthUser?) {
+        if (remoteUser == null) {
+            pendingRegistrationState = null
+            pendingLegacySignUp = null
+            // Preserve AuthenticationRevoked when signOut() was triggered by a revocation/disabled check
+            if (!isHandlingRevocation.get() && _sessionState.value !is SessionState.AuthenticationRevoked) {
+                _sessionState.value = SessionState.Unauthenticated
+            }
+            return
+        }
+
+        // Clear any pending drafts that belonged to a different UID
+        if (pendingRegistrationState != null && pendingRegistrationState?.uid != remoteUser.uid) {
+            pendingRegistrationState = null
+        }
+        if (pendingLegacySignUp != null && pendingLegacySignUp?.uid != remoteUser.uid) {
+            pendingLegacySignUp = null
+        }
+
+        // Synchronize current SessionState with the active Firebase user
+        when (val current = _sessionState.value) {
+            is SessionState.Authenticated -> {
+                if (current.user.id != remoteUser.uid) {
+                    // User switched accounts externally; invalidate stale profile immediately
+                    _sessionState.value = SessionState.Unauthenticated
+                } else if (current.isEmailVerified != remoteUser.isEmailVerified) {
+                    _sessionState.value = current.copy(isEmailVerified = remoteUser.isEmailVerified)
+                }
+            }
+            is SessionState.AuthenticatedCachedOffline -> {
+                if (current.cachedUser.id != remoteUser.uid) {
+                    _sessionState.value = SessionState.Unauthenticated
+                } else if (current.isEmailVerified != remoteUser.isEmailVerified) {
+                    _sessionState.value = current.copy(isEmailVerified = remoteUser.isEmailVerified)
+                }
+            }
+            is SessionState.AuthenticatedRestricted -> {
+                if (current.user.id != remoteUser.uid) {
+                    _sessionState.value = SessionState.Unauthenticated
+                } else if (current.isEmailVerified != remoteUser.isEmailVerified) {
+                    _sessionState.value = current.copy(isEmailVerified = remoteUser.isEmailVerified)
+                }
+            }
+            is SessionState.AuthenticatedProfileIncomplete -> {
+                if (current.uid != remoteUser.uid) {
+                    _sessionState.value = SessionState.Unauthenticated
+                } else if (current.isEmailVerified != remoteUser.isEmailVerified) {
+                    _sessionState.value = current.copy(isEmailVerified = remoteUser.isEmailVerified)
+                }
+            }
+            is SessionState.AuthenticatedProfileLoadError -> {
+                if (current.uid != remoteUser.uid) {
+                    _sessionState.value = SessionState.Unauthenticated
+                }
+            }
+            is SessionState.AuthenticationRevoked,
+            SessionState.Unauthenticated -> Unit
+        }
+    }
+
+    private fun handleRevokedOrDisabledSession(error: AuthError): SessionState.AuthenticationRevoked {
+        isHandlingRevocation.set(true)
+        try {
+            pendingRegistrationState = null
+            pendingLegacySignUp = null
+            val revokedState = SessionState.AuthenticationRevoked(error)
+            _sessionState.value = revokedState
+            remoteDataSource.signOut()
+            return revokedState
+        } finally {
+            isHandlingRevocation.set(false)
+        }
+    }
+
     // =========================================================================
     // 1. Canonical State & Inspection
     // =========================================================================
@@ -90,6 +184,19 @@ class AuthRepositoryImpl(
             is SessionState.AuthenticatedRestricted -> current.user
             else -> null
         }
+    }
+
+    override fun getCachedOrVerifiedUser(): User? {
+        return when (val current = _sessionState.value) {
+            is SessionState.Authenticated -> current.user
+            is SessionState.AuthenticatedCachedOffline -> current.cachedUser
+            is SessionState.AuthenticatedRestricted -> current.user
+            else -> null
+        }
+    }
+
+    override fun isServerVerifiedSession(): Boolean {
+        return _sessionState.value is SessionState.Authenticated
     }
 
     override fun getPendingRegistrationDraft(): RegistrationDraft? {
@@ -106,6 +213,7 @@ class AuthRepositoryImpl(
         if (remoteVerified != null) return remoteVerified
         return when (val state = _sessionState.value) {
             is SessionState.Authenticated -> state.isEmailVerified
+            is SessionState.AuthenticatedCachedOffline -> state.isEmailVerified
             is SessionState.AuthenticatedRestricted -> state.isEmailVerified
             is SessionState.AuthenticatedProfileIncomplete -> state.isEmailVerified
             else -> false
@@ -416,15 +524,14 @@ class AuthRepositoryImpl(
             null
         }
 
-        if (existingCheck is RemoteDocumentResult.Found) {
+        if (existingCheck is RemoteDocumentResult.Found && !existingCheck.isFromCache) {
             val inspected = UserMapper.inspectFirestoreMap(existingCheck.data, authUser.uid)
             if (inspected is ProfileMappingResult.Valid) {
                 pendingRegistrationState = null
                 pendingLegacySignUp = null
-                applyResolvedUserToSessionState(
+                applyServerVerifiedUserToSessionState(
                     user = inspected.user,
-                    authUser = authUser,
-                    isFromCache = existingCheck.isFromCache
+                    authUser = authUser
                 )
                 return ProfileInitializationOutcome.Success(
                     user = inspected.user,
@@ -489,10 +596,9 @@ class AuthRepositoryImpl(
             emailSent = true
         }
 
-        applyResolvedUserToSessionState(
+        applyServerVerifiedUserToSessionState(
             user = newUser,
-            authUser = authUser,
-            isFromCache = false
+            authUser = authUser
         )
 
         return ProfileInitializationOutcome.Success(
@@ -553,21 +659,20 @@ class AuthRepositoryImpl(
                 uidContext = signedInUser.uid
             )
             if (FirebaseErrorMapper.isSessionRevokedOrDisabled(mappedError)) {
-                remoteDataSource.signOut()
-                _sessionState.value = SessionState.AuthenticationRevoked(mappedError)
+                handleRevokedOrDisabledSession(mappedError)
                 return LoginOutcome.Failure(mappedError)
             }
             // On transient network failure during reload, proceed with signedInUser
             signedInUser
         }
 
-        // 4. Resolve /users/{uid} from Firestore
-        return when (val session = resolveProfileAndUpdateSession(effectiveAuthUser)) {
+        // 4. Resolve /users/{uid} strictly from the server (allowCacheFallback = false during login
+        //    so stale local cache can never mask a server-side suspension or ban).
+        return when (val session = resolveProfileAndUpdateSession(effectiveAuthUser, allowCacheFallback = false)) {
             is SessionState.Authenticated -> LoginOutcome.Authenticated(
                 user = session.user,
                 isEmailVerified = session.isEmailVerified,
-                hasAdminClaim = session.hasAdminClaim,
-                isFromCache = session.isFromCache
+                hasAdminClaim = session.hasAdminClaim
             )
             is SessionState.AuthenticatedRestricted -> LoginOutcome.AccountLocked(
                 user = session.user,
@@ -587,6 +692,11 @@ class AuthRepositoryImpl(
                 uid = session.uid,
                 email = session.email,
                 error = session.error
+            )
+            is SessionState.AuthenticatedCachedOffline -> LoginOutcome.ProfileLoadFailed(
+                uid = effectiveAuthUser.uid,
+                email = normalizedEmail,
+                error = session.networkError
             )
             is SessionState.AuthenticationRevoked -> LoginOutcome.Failure(session.error)
             SessionState.Unauthenticated -> LoginOutcome.Failure(AuthError.Unauthenticated())
@@ -641,8 +751,7 @@ class AuthRepositoryImpl(
                 uidContext = currentUser.uid
             )
             if (FirebaseErrorMapper.isSessionRevokedOrDisabled(mappedError)) {
-                remoteDataSource.signOut()
-                _sessionState.value = SessionState.AuthenticationRevoked(mappedError)
+                handleRevokedOrDisabledSession(mappedError)
             }
             return EmailVerificationOutcome.Failure(mappedError)
         }
@@ -670,6 +779,11 @@ class AuthRepositoryImpl(
                 _sessionState.value = existingState.copy(
                     isEmailVerified = finalUser.isEmailVerified,
                     hasAdminClaim = finalUser.hasAdminClaim
+                )
+            }
+            is SessionState.AuthenticatedCachedOffline -> {
+                _sessionState.value = existingState.copy(
+                    isEmailVerified = finalUser.isEmailVerified
                 )
             }
             is SessionState.AuthenticatedRestricted -> {
@@ -731,6 +845,8 @@ class AuthRepositoryImpl(
     override suspend fun restoreSession(): SessionState {
         val currentAuthUser = remoteDataSource.getCurrentAuthUser()
         if (currentAuthUser == null) {
+            pendingRegistrationState = null
+            pendingLegacySignUp = null
             _sessionState.value = SessionState.Unauthenticated
             return SessionState.Unauthenticated
         }
@@ -740,6 +856,8 @@ class AuthRepositoryImpl(
         val effectiveAuthUser = try {
             val reloaded = remoteDataSource.reloadCurrentAuthUser(forceTokenRefresh = false)
             if (reloaded == null) {
+                pendingRegistrationState = null
+                pendingLegacySignUp = null
                 _sessionState.value = SessionState.Unauthenticated
                 return SessionState.Unauthenticated
             }
@@ -755,26 +873,21 @@ class AuthRepositoryImpl(
                 uidContext = currentAuthUser.uid
             )
             if (FirebaseErrorMapper.isSessionRevokedOrDisabled(mappedError)) {
-                remoteDataSource.signOut()
-                pendingRegistrationState = null
-                pendingLegacySignUp = null
-                val revokedState = SessionState.AuthenticationRevoked(mappedError)
-                _sessionState.value = revokedState
-                return revokedState
+                return handleRevokedOrDisabledSession(mappedError)
             }
             // Temporary network failure during reload: keep currentAuthUser and resolve profile
             currentAuthUser
         }
 
-        return resolveProfileAndUpdateSession(effectiveAuthUser)
+        return resolveProfileAndUpdateSession(effectiveAuthUser, allowCacheFallback = true)
     }
 
     override suspend fun logout(): LogoutOutcome {
         return try {
-            remoteDataSource.signOut()
             pendingRegistrationState = null
             pendingLegacySignUp = null
             _sessionState.value = SessionState.Unauthenticated
+            remoteDataSource.signOut()
             LogoutOutcome.Success
         } catch (e: Throwable) {
             LogoutOutcome.Failure(FirebaseErrorMapper.toAuthError(e))
@@ -795,16 +908,11 @@ class AuthRepositoryImpl(
             return ProfileUpdateOutcome.Failure(AuthError.EmailNotVerified())
         }
 
-        val currentProfile = getCurrentUser() ?: run {
-            val state = resolveProfileAndUpdateSession(authUser)
-            (state as? SessionState.Authenticated)?.user
-                ?: return ProfileUpdateOutcome.Failure(
-                    AuthError.ProfileNotFound(authUser.uid, authUser.email.orEmpty())
-                )
-        }
+        val serverVerifiedProfile = requireServerVerifiedActiveProfile(authUser)
+            ?: return ProfileUpdateOutcome.Failure(resolveNonVerifiedProfileUpdateError(authUser))
 
         val normalizedZone = defaultZoneId?.trim()?.takeIf { it.isNotEmpty() }
-        val updatedAt = maxOf(clock(), currentProfile.updatedAtEpochMs + 1L)
+        val updatedAt = maxOf(clock(), serverVerifiedProfile.updatedAtEpochMs + 1L)
 
         val updateFields = mutableMapOf<String, Any?>(
             "onboardingStatus" to OnboardingStatus.COMPLETED.name,
@@ -814,12 +922,12 @@ class AuthRepositoryImpl(
 
         return try {
             remoteDataSource.updateUserDocument(authUser.uid, updateFields)
-            val updatedUser = currentProfile.copy(
+            val updatedUser = serverVerifiedProfile.copy(
                 onboardingStatus = OnboardingStatus.COMPLETED,
                 defaultZoneId = normalizedZone,
                 updatedAtEpochMs = updatedAt
             )
-            applyResolvedUserToSessionState(updatedUser, authUser, isFromCache = false)
+            applyServerVerifiedUserToSessionState(updatedUser, authUser)
             ProfileUpdateOutcome.Success(updatedUser)
         } catch (e: Throwable) {
             ProfileUpdateOutcome.Failure(
@@ -862,17 +970,12 @@ class AuthRepositoryImpl(
         val normalizedPhone = (phoneResult as ValidationResult.Valid).value
         val normalizedZone = defaultZoneId?.trim()?.takeIf { it.isNotEmpty() }
 
-        val currentProfile = getCurrentUser() ?: run {
-            val state = resolveProfileAndUpdateSession(authUser)
-            (state as? SessionState.Authenticated)?.user
-                ?: return ProfileUpdateOutcome.Failure(
-                    AuthError.ProfileNotFound(authUser.uid, authUser.email.orEmpty())
-                )
-        }
+        val serverVerifiedProfile = requireServerVerifiedActiveProfile(authUser)
+            ?: return ProfileUpdateOutcome.Failure(resolveNonVerifiedProfileUpdateError(authUser))
 
         val normalizedLang = preferredLanguage?.trim()?.takeIf { it.isNotEmpty() }
-            ?: currentProfile.preferredLanguage
-        val updatedAt = maxOf(clock(), currentProfile.updatedAtEpochMs + 1L)
+            ?: serverVerifiedProfile.preferredLanguage
+        val updatedAt = maxOf(clock(), serverVerifiedProfile.updatedAtEpochMs + 1L)
 
         val updateFields = mapOf<String, Any?>(
             "fullName" to normalizedName,
@@ -886,14 +989,14 @@ class AuthRepositoryImpl(
 
         return try {
             remoteDataSource.updateUserDocument(authUser.uid, updateFields)
-            val updatedUser = currentProfile.copy(
+            val updatedUser = serverVerifiedProfile.copy(
                 fullName = normalizedName,
                 phoneNumber = normalizedPhone,
                 defaultZoneId = normalizedZone,
                 preferredLanguage = normalizedLang,
                 updatedAtEpochMs = updatedAt
             )
-            applyResolvedUserToSessionState(updatedUser, authUser, isFromCache = false)
+            applyServerVerifiedUserToSessionState(updatedUser, authUser)
             ProfileUpdateOutcome.Success(updatedUser)
         } catch (e: Throwable) {
             ProfileUpdateOutcome.Failure(
@@ -906,29 +1009,67 @@ class AuthRepositoryImpl(
         }
     }
 
+    /**
+     * Ensures protected operations only execute when the user's `ACTIVE` standing has been
+     * verified against `Source.SERVER` (never trusting [SessionState.AuthenticatedCachedOffline]).
+     */
+    private suspend fun requireServerVerifiedActiveProfile(authUser: RemoteAuthUser): User? {
+        val current = _sessionState.value
+        if (current is SessionState.Authenticated && current.user.id == authUser.uid) {
+            return current.user
+        }
+        val resolved = resolveProfileAndUpdateSession(authUser, allowCacheFallback = false)
+        return (resolved as? SessionState.Authenticated)?.user
+    }
+
+    private fun resolveNonVerifiedProfileUpdateError(authUser: RemoteAuthUser): AuthError {
+        return when (val state = _sessionState.value) {
+            is SessionState.AuthenticatedCachedOffline -> state.networkError
+            is SessionState.AuthenticatedProfileLoadError -> state.error
+            is SessionState.AuthenticatedRestricted -> AuthError.AccountLockedError(
+                accountStatus = state.accountStatus,
+                statusReason = state.statusReason,
+                suspendedUntilEpochMs = state.suspendedUntilEpochMs
+            )
+            is SessionState.AuthenticationRevoked -> state.error
+            else -> AuthError.ProfileNotFound(authUser.uid, authUser.email.orEmpty())
+        }
+    }
+
     // =========================================================================
     // 9. Internal Profile Resolution & Bounded Retry Engine
     // =========================================================================
 
     /**
-     * Fetches `/users/{uid}` from Firestore with a bounded retry on transient network failure
-     * and offline cache fallback, then maps the document into the authoritative [SessionState].
+     * Fetches `/users/{uid}` from Firestore with a bounded retry on transient network failure,
+     * then maps the document into the authoritative [SessionState].
      *
-     * Never fabricates a synthetic default user when `/users/{uid}` is missing, malformed, or unreachable.
+     * Session Safety Rules:
+     * - When [allowCacheFallback] is `false` (during `login()` and before protected writes),
+     *   stale local cache is never consulted.
+     * - When [allowCacheFallback] is `true` (during `restoreSession()`), a cached `ACTIVE` document
+     *   maps strictly to [SessionState.AuthenticatedCachedOffline] (`isServerVerified == false`),
+     *   never [SessionState.Authenticated].
+     * - Never fabricates a synthetic default user when `/users/{uid}` is missing, malformed, or unreachable.
      */
     private suspend fun resolveProfileAndUpdateSession(
-        authUser: RemoteAuthUser
+        authUser: RemoteAuthUser,
+        allowCacheFallback: Boolean
     ): SessionState {
         val resolvedEmail = authUser.email?.trim()?.lowercase().orEmpty()
 
         val documentResult = fetchUserDocumentWithBoundedRetry(
             uid = authUser.uid,
-            emailContext = resolvedEmail
+            emailContext = resolvedEmail,
+            allowCacheFallback = allowCacheFallback
         )
 
-        val rawDocResult = when (documentResult) {
-            is DocumentFetchOutcome.Success -> documentResult.result
+        val (rawDocResult, serverNetworkError) = when (documentResult) {
+            is DocumentFetchOutcome.Success -> documentResult.result to documentResult.fallbackReason
             is DocumentFetchOutcome.Failure -> {
+                if (FirebaseErrorMapper.isSessionRevokedOrDisabled(documentResult.error)) {
+                    return handleRevokedOrDisabledSession(documentResult.error)
+                }
                 val errorState = SessionState.AuthenticatedProfileLoadError(
                     uid = authUser.uid,
                     email = resolvedEmail,
@@ -1019,10 +1160,22 @@ class AuthRepositoryImpl(
                             pendingLegacySignUp = null
                         }
 
-                        applyResolvedUserToSessionState(
+                        // If the document came from local cache because the server was unreachable:
+                        // - If the cached document is already RESTRICTED/SUSPENDED/BANNED, enforce restriction immediately.
+                        // - If the cached document is ACTIVE, return AuthenticatedCachedOffline (NEVER Authenticated)
+                        //   so cached ACTIVE standing is never treated as proof that the account wasn't suspended/banned.
+                        if (rawDocResult.isFromCache) {
+                            return applyCachedOfflineUserToSessionState(
+                                user = domainUser,
+                                authUser = effectiveAuth,
+                                networkError = serverNetworkError
+                                    ?: AuthError.NetworkFailure("Offline: account standing has not been verified with the server.")
+                            )
+                        }
+
+                        applyServerVerifiedUserToSessionState(
                             user = domainUser,
-                            authUser = effectiveAuth,
-                            isFromCache = rawDocResult.isFromCache
+                            authUser = effectiveAuth
                         )
                     }
                 }
@@ -1030,17 +1183,40 @@ class AuthRepositoryImpl(
         }
     }
 
-    private fun applyResolvedUserToSessionState(
+    private fun applyServerVerifiedUserToSessionState(
         user: User,
-        authUser: RemoteAuthUser,
-        isFromCache: Boolean
+        authUser: RemoteAuthUser
     ): SessionState {
         val nextState = when (user.accountStatus) {
             AccountStatus.ACTIVE -> SessionState.Authenticated(
                 user = user,
                 isEmailVerified = authUser.isEmailVerified,
-                hasAdminClaim = authUser.hasAdminClaim,
-                isFromCache = isFromCache
+                hasAdminClaim = authUser.hasAdminClaim
+            )
+            AccountStatus.RESTRICTED,
+            AccountStatus.SUSPENDED,
+            AccountStatus.BANNED -> SessionState.AuthenticatedRestricted(
+                user = user,
+                isEmailVerified = authUser.isEmailVerified,
+                accountStatus = user.accountStatus,
+                statusReason = user.statusReason,
+                suspendedUntilEpochMs = user.suspendedUntilEpochMs
+            )
+        }
+        _sessionState.value = nextState
+        return nextState
+    }
+
+    private fun applyCachedOfflineUserToSessionState(
+        user: User,
+        authUser: RemoteAuthUser,
+        networkError: AuthError.NetworkFailure
+    ): SessionState {
+        val nextState = when (user.accountStatus) {
+            AccountStatus.ACTIVE -> SessionState.AuthenticatedCachedOffline(
+                cachedUser = user,
+                isEmailVerified = authUser.isEmailVerified,
+                networkError = networkError
             )
             AccountStatus.RESTRICTED,
             AccountStatus.SUSPENDED,
@@ -1057,13 +1233,18 @@ class AuthRepositoryImpl(
     }
 
     private sealed interface DocumentFetchOutcome {
-        data class Success(val result: RemoteDocumentResult) : DocumentFetchOutcome
+        data class Success(
+            val result: RemoteDocumentResult,
+            val fallbackReason: AuthError.NetworkFailure? = null
+        ) : DocumentFetchOutcome
+
         data class Failure(val error: AuthError) : DocumentFetchOutcome
     }
 
     private suspend fun fetchUserDocumentWithBoundedRetry(
         uid: String,
-        emailContext: String
+        emailContext: String,
+        allowCacheFallback: Boolean
     ): DocumentFetchOutcome {
         var lastError: AuthError? = null
 
@@ -1085,15 +1266,20 @@ class AuthRepositoryImpl(
             }
         }
 
-        // If server is unreachable after bounded retry, check local Firestore cache before failing
-        val cached = try {
-            remoteDataSource.fetchUserDocumentFromCache(uid)
-        } catch (_: Throwable) {
-            RemoteDocumentResult.NotFound(isFromCache = true)
-        }
+        if (allowCacheFallback) {
+            val cached = try {
+                remoteDataSource.fetchUserDocumentFromCache(uid)
+            } catch (_: Throwable) {
+                RemoteDocumentResult.NotFound(isFromCache = true)
+            }
 
-        if (cached is RemoteDocumentResult.Found) {
-            return DocumentFetchOutcome.Success(cached)
+            if (cached is RemoteDocumentResult.Found) {
+                return DocumentFetchOutcome.Success(
+                    result = cached.copy(isFromCache = true),
+                    fallbackReason = lastError as? AuthError.NetworkFailure
+                        ?: AuthError.NetworkFailure()
+                )
+            }
         }
 
         return DocumentFetchOutcome.Failure(
@@ -1236,7 +1422,8 @@ class AuthRepositoryImpl(
 
         val fetchOutcome = fetchUserDocumentWithBoundedRetry(
             uid = trimmedUid,
-            emailContext = ""
+            emailContext = "",
+            allowCacheFallback = false
         )
         val docResult = when (fetchOutcome) {
             is DocumentFetchOutcome.Success -> fetchOutcome.result
@@ -1267,10 +1454,10 @@ class AuthRepositoryImpl(
 
     @Deprecated("Use logout() in new code")
     override fun signOut() {
-        remoteDataSource.signOut()
         pendingRegistrationState = null
         pendingLegacySignUp = null
         _sessionState.value = SessionState.Unauthenticated
+        remoteDataSource.signOut()
     }
 
     override fun isUserSignedIn(): Boolean {
@@ -1293,12 +1480,10 @@ class AuthRepositoryImpl(
 
     override suspend fun deleteAccount(): Result<Unit> {
         return try {
-            // Note: firestore.rules denies client-side hard deletion of /users/{uid} audit records;
-            // deleteAccount only deletes the Firebase Auth credential and clears local state.
-            remoteDataSource.deleteCurrentAuthUser()
             pendingRegistrationState = null
             pendingLegacySignUp = null
             _sessionState.value = SessionState.Unauthenticated
+            remoteDataSource.deleteCurrentAuthUser()
             Result.success(Unit)
         } catch (e: Throwable) {
             val mapped = FirebaseErrorMapper.toAuthError(e)

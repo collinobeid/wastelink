@@ -16,16 +16,18 @@ import com.waste.link.domain.model.UserRole
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * Canonical Authentication & User Profile Repository for WasteLink (Module 1, Stage 3).
+ * Canonical Authentication & User Profile Repository for WasteLink (Module 1, Stage 3.1).
  *
  * Responsibilities:
  * - Validated Resident and Collector registration with canonical `/users/{uid}` creation.
  * - Same-session and cross-session Ghost Account detection and idempotent recovery.
  * - Login with deterministic separation of authentication errors, missing profiles,
  *   malformed profiles, account restrictions (`RESTRICTED`, `SUSPENDED`, `BANNED`), and network failures.
+ * - Explicit separation between server-verified sessions ([SessionState.Authenticated]) and
+ *   read-only offline cached sessions ([SessionState.AuthenticatedCachedOffline]).
+ * - Active observation of Firebase Auth state and ID token changes without leaking listeners.
  * - Authoritative Firebase Auth email verification and ID token refresh.
  * - Enumeration-safe password reset.
- * - Session inspection and offline-resilient session restoration.
  * - Clean logout clearing in-memory draft and session state without deleting Firestore documents.
  */
 interface AuthRepository {
@@ -37,8 +39,23 @@ interface AuthRepository {
     /** Reactive stream of the current authoritative [SessionState]. */
     val sessionState: StateFlow<SessionState>
 
-    /** Returns the currently resolved canonical [User] if in an authenticated profile state, or `null`. */
+    /**
+     * Returns the currently resolved canonical [User] ONLY when the session has been verified
+     * against the server ([SessionState.Authenticated] or [SessionState.AuthenticatedRestricted]).
+     * Returns `null` when unauthenticated or when only an unverified offline cache is available.
+     */
     fun getCurrentUser(): User?
+
+    /**
+     * Returns the cached or server-verified [User] for read-only display purposes when offline.
+     * Must never be used as authorization proof that the account is still `ACTIVE` on the server.
+     */
+    fun getCachedOrVerifiedUser(): User?
+
+    /**
+     * Returns `true` only when the current session is [SessionState.Authenticated] (`isServerVerified == true`).
+     */
+    fun isServerVerifiedSession(): Boolean
 
     /** Returns the cached [RegistrationDraft] if a same-session partial registration is pending recovery. */
     fun getPendingRegistrationDraft(): RegistrationDraft?
@@ -117,7 +134,7 @@ interface AuthRepository {
     // =========================================================================
 
     /**
-     * Authenticates a user with email and password, fetches `/users/{uid}` from Firestore,
+     * Authenticates a user with email and password, fetches `/users/{uid}` from Firestore (`Source.SERVER`),
      * and resolves their canonical [User] profile, account standing, and onboarding status.
      */
     suspend fun login(
@@ -158,7 +175,8 @@ interface AuthRepository {
 
     /**
      * Inspects and restores the current Firebase session and `/users/{uid}` profile.
-     * Preserves valid sessions across temporary offline/network errors.
+     * Distinguishes server-verified [SessionState.Authenticated] from offline cached
+     * [SessionState.AuthenticatedCachedOffline].
      */
     suspend fun restoreSession(): SessionState
 
@@ -172,12 +190,12 @@ interface AuthRepository {
     // 8. Self-Service Profile Lifecycle Operations
     // =========================================================================
 
-    /** Marks Resident onboarding as `COMPLETED` and optionally sets `defaultZoneId`. */
+    /** Marks Resident onboarding as `COMPLETED` and optionally sets `defaultZoneId`. Requires server-verified session. */
     suspend fun completeResidentOnboarding(
         defaultZoneId: String? = null
     ): ProfileUpdateOutcome
 
-    /** Updates mutable self-service profile fields (`fullName`, `phoneNumber`, `defaultZoneId`, `preferredLanguage`). */
+    /** Updates mutable self-service profile fields (`fullName`, `phoneNumber`, `defaultZoneId`, `preferredLanguage`). Requires server-verified session. */
     suspend fun updateProfile(
         fullName: String,
         phoneNumber: String,

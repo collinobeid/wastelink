@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        Debug-only manifest override enabling cleartext HTTP strictly for local
+        Firebase Auth (10.0.2.2:9099) and Firestore (10.0.2.2:8080) Emulator testing.
+        Production release builds use app/src/main/AndroidManifest.xml where cleartext is disabled.
+    -->
+    <application android:usesCleartextTraffic="true" />
+
+</manifest>
