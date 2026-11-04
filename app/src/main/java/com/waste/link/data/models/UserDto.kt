@@ -5,9 +5,26 @@ import com.google.firebase.firestore.DocumentSnapshot
 import com.waste.link.domain.model.AccountStatus
 import com.waste.link.domain.model.CollectorVerificationStatus
 import com.waste.link.domain.model.OnboardingStatus
+import com.waste.link.domain.model.ProfileIncompleteReason
 import com.waste.link.domain.model.User
 import com.waste.link.domain.model.UserRole
+import com.waste.link.domain.validation.AuthValidator
 import java.util.Date
+
+/**
+ * Detailed classification of a Firestore `/users/{uid}` document lookup.
+ */
+sealed interface ProfileMappingResult {
+    data class Valid(val user: User) : ProfileMappingResult
+
+    data class Incomplete(
+        val reason: ProfileIncompleteReason,
+        val partialFullName: String? = null,
+        val partialPhoneNumber: String? = null
+    ) : ProfileMappingResult
+
+    data class Malformed(val reason: String) : ProfileMappingResult
+}
 
 /**
  * Firestore Data Transfer Object for `/users/{userId}` documents.
@@ -59,11 +76,54 @@ object UserMapper {
     private const val LEGACY_FABRICATED_PHONE = "Not provided"
 
     /**
+     * Constructs a brand-new canonical [User] profile for registration or Ghost Account recovery.
+     *
+     * Guaranteed to satisfy Stage 2.1 `firestore.rules` (`isValidSelfProfileCreate`).
+     */
+    fun createInitialProfile(
+        uid: String,
+        fullName: String,
+        email: String,
+        phoneNumber: String,
+        role: UserRole,
+        nowEpochMs: Long = System.currentTimeMillis()
+    ): User {
+        require(role.isSelfRegistrable) {
+            "Role $role cannot be used for self-registration or client profile recovery"
+        }
+        val effectiveNow = if (nowEpochMs > 0L) nowEpochMs else 1L
+        return User(
+            id = uid.trim(),
+            fullName = fullName.trim(),
+            email = email.trim().lowercase(),
+            phoneNumber = phoneNumber.trim(),
+            role = role,
+            accountStatus = AccountStatus.ACTIVE,
+            statusReason = null,
+            suspendedUntilEpochMs = null,
+            onboardingStatus = OnboardingStatus.NOT_STARTED,
+            isPhoneVerified = false,
+            collectorVerificationStatus = if (role == UserRole.COLLECTOR) {
+                CollectorVerificationStatus.NOT_SUBMITTED
+            } else {
+                CollectorVerificationStatus.NOT_APPLICABLE
+            },
+            collectorRejectionReason = null,
+            defaultZoneId = null,
+            vehicleType = null,
+            vehiclePlateNumber = null,
+            preferredLanguage = "en",
+            createdAtEpochMs = effectiveNow,
+            updatedAtEpochMs = effectiveNow
+        )
+    }
+
+    /**
      * Converts a [UserDto] to the canonical [User] domain model.
      *
      * Returns `null` if:
-     * - The user ID (`id`, `uid`, or [fallbackDocumentId]) is missing/blank.
-     * - The email is missing/blank.
+     * - The user ID (`id`, `uid`, or [fallbackDocumentId]) is missing/blank or mismatches [fallbackDocumentId].
+     * - The email is missing/blank or structurally invalid.
      * - The full name (`fullName` or `name`) is missing/blank.
      * - The document matches the legacy fabricated ghost-account placeholder (`name == "User"` and `phone == "Not provided"`).
      * - The role is missing, `"unassigned"`, or an unrecognized value (preventing silent privilege escalation).
@@ -74,8 +134,23 @@ object UserMapper {
         legacyCreatedAtRaw: Any? = null,
         legacyUpdatedAtRaw: Any? = null
     ): User? {
-        val resolvedId = firstNonBlank(dto.id, dto.uid, fallbackDocumentId) ?: return null
+        val trimmedFallbackId = firstNonBlank(fallbackDocumentId)
+        val trimmedId = firstNonBlank(dto.id)
+        val trimmedUid = firstNonBlank(dto.uid)
+
+        if (trimmedId != null && trimmedUid != null && trimmedId != trimmedUid) {
+            return null
+        }
+        if (trimmedFallbackId != null) {
+            if (trimmedId != null && trimmedId != trimmedFallbackId) return null
+            if (trimmedUid != null && trimmedUid != trimmedFallbackId) return null
+        }
+
+        val resolvedId = firstNonBlank(trimmedId, trimmedUid, trimmedFallbackId) ?: return null
         val resolvedEmail = firstNonBlank(dto.email)?.lowercase() ?: return null
+        if (AuthValidator.validateEmail(resolvedEmail).isInvalid) {
+            return null
+        }
         val resolvedName = firstNonBlank(dto.fullName, dto.name) ?: return null
         val rawPhone = firstNonBlank(dto.phoneNumber, dto.phone)
 
@@ -148,6 +223,109 @@ object UserMapper {
             createdAtEpochMs = resolvedCreatedAt,
             updatedAtEpochMs = resolvedUpdatedAt
         )
+    }
+
+    /**
+     * Inspects a Firestore `/users/{uid}` document map and classifies it into:
+     * - [ProfileMappingResult.Valid]: Complete canonical or legacy user profile.
+     * - [ProfileMappingResult.Incomplete]: Missing document or legacy incomplete Ghost Account placeholder
+     *   (`role == "unassigned"` or `name == "User"` + `phone == "Not provided"`).
+     * - [ProfileMappingResult.Malformed]: Document exists in Firestore but contains corrupted, missing,
+     *   or invalid identity/role fields.
+     */
+    fun inspectFirestoreMap(
+        data: Map<String, Any?>?,
+        expectedUid: String
+    ): ProfileMappingResult {
+        if (data == null) {
+            return ProfileMappingResult.Incomplete(
+                reason = ProfileIncompleteReason.DOCUMENT_MISSING
+            )
+        }
+
+        val normalizedExpectedUid = expectedUid.trim()
+        val rawId = data["id"]
+        val rawUid = data["uid"]
+
+        if (rawId != null && rawId !is String) {
+            return ProfileMappingResult.Malformed("Field 'id' must be a string.")
+        }
+        if (rawUid != null && rawUid !is String) {
+            return ProfileMappingResult.Malformed("Field 'uid' must be a string.")
+        }
+
+        val docId = firstNonBlank(rawId as? String)
+        val docUid = firstNonBlank(rawUid as? String)
+
+        if (docId != null && docId != normalizedExpectedUid) {
+            return ProfileMappingResult.Malformed("Document 'id' ($docId) does not match authenticated UID ($normalizedExpectedUid).")
+        }
+        if (docUid != null && docUid != normalizedExpectedUid) {
+            return ProfileMappingResult.Malformed("Document 'uid' ($docUid) does not match authenticated UID ($normalizedExpectedUid).")
+        }
+
+        val rawFullName = data["fullName"]
+        val rawName = data["name"]
+        if (rawFullName != null && rawFullName !is String) {
+            return ProfileMappingResult.Malformed("Field 'fullName' must be a string.")
+        }
+        if (rawName != null && rawName !is String) {
+            return ProfileMappingResult.Malformed("Field 'name' must be a string.")
+        }
+
+        val resolvedName = firstNonBlank(rawFullName as? String, rawName as? String)
+        val rawPhone = firstNonBlank(data["phoneNumber"] as? String, data["phone"] as? String)
+
+        // Check for legacy fabricated placeholder (`name == "User"` and `phone == "Not provided"`)
+        if (resolvedName != null &&
+            resolvedName.equals(LEGACY_FABRICATED_NAME, ignoreCase = true) &&
+            rawPhone.equals(LEGACY_FABRICATED_PHONE, ignoreCase = true)
+        ) {
+            return ProfileMappingResult.Incomplete(
+                reason = ProfileIncompleteReason.LEGACY_FABRICATED_PLACEHOLDER
+            )
+        }
+
+        val rawRole = data["role"]
+        if (rawRole != null && rawRole !is String) {
+            return ProfileMappingResult.Malformed("Field 'role' must be a string.")
+        }
+        val roleStr = firstNonBlank(rawRole as? String)
+        if (roleStr != null && roleStr.equals("unassigned", ignoreCase = true)) {
+            return ProfileMappingResult.Incomplete(
+                reason = ProfileIncompleteReason.LEGACY_UNASSIGNED_ROLE,
+                partialFullName = resolvedName?.takeUnless { it.equals(LEGACY_FABRICATED_NAME, ignoreCase = true) },
+                partialPhoneNumber = rawPhone?.takeUnless { it.equals(LEGACY_FABRICATED_PHONE, ignoreCase = true) }
+            )
+        }
+
+        val rawEmail = data["email"]
+        if (rawEmail != null && rawEmail !is String) {
+            return ProfileMappingResult.Malformed("Field 'email' must be a string.")
+        }
+        val resolvedEmail = firstNonBlank(rawEmail as? String)?.lowercase()
+            ?: return ProfileMappingResult.Malformed("Required field 'email' is missing or blank.")
+
+        if (AuthValidator.validateEmail(resolvedEmail).isInvalid) {
+            return ProfileMappingResult.Malformed("Field 'email' ('$resolvedEmail') is not a valid email address.")
+        }
+
+        if (resolvedName == null) {
+            return ProfileMappingResult.Malformed("Required field 'fullName' / 'name' is missing or blank.")
+        }
+
+        if (roleStr == null) {
+            return ProfileMappingResult.Malformed("Required field 'role' is missing or blank.")
+        }
+
+        if (UserRole.fromFirestoreValue(roleStr) == null) {
+            return ProfileMappingResult.Malformed("Unrecognized or corrupted user role '$roleStr'.")
+        }
+
+        val mappedUser = fromFirestoreMap(data, fallbackDocumentId = normalizedExpectedUid)
+            ?: return ProfileMappingResult.Malformed("Failed to map Firestore profile fields into canonical User.")
+
+        return ProfileMappingResult.Valid(mappedUser)
     }
 
     /**

@@ -1,5 +1,7 @@
 package com.waste.link.di
 
+import com.waste.link.data.remote.AuthRemoteDataSource
+import com.waste.link.data.remote.FirebaseAuthRemoteDataSource
 import com.waste.link.data.repository.AuthRepository
 import com.waste.link.data.repository.AuthRepositoryImpl
 import com.waste.link.data.repository.WasteRequestRepository
@@ -13,6 +15,12 @@ import javax.inject.Singleton
 @Module
 @InstallIn(SingletonComponent::class)
 abstract class RepositoryModule {
+
+    @Binds
+    @Singleton
+    abstract fun bindAuthRemoteDataSource(
+        firebaseAuthRemoteDataSource: FirebaseAuthRemoteDataSource
+    ): AuthRemoteDataSource
 
     @Binds
     @Singleton

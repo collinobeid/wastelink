@@ -1,173 +1,1308 @@
 package com.waste.link.data.repository
 
-import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.firestore.FirebaseFirestore
 import com.waste.link.data.models.AppUser
-import kotlinx.coroutines.tasks.await
+import com.waste.link.data.models.ProfileMappingResult
+import com.waste.link.data.models.UserMapper
+import com.waste.link.data.remote.AuthRemoteDataSource
+import com.waste.link.data.remote.FirebaseErrorMapper
+import com.waste.link.data.remote.RemoteAuthUser
+import com.waste.link.data.remote.RemoteDocumentResult
+import com.waste.link.domain.model.AccountStatus
+import com.waste.link.domain.model.AuthError
+import com.waste.link.domain.model.EmailVerificationOutcome
+import com.waste.link.domain.model.FieldValidationFailure
+import com.waste.link.domain.model.LoginOutcome
+import com.waste.link.domain.model.LogoutOutcome
+import com.waste.link.domain.model.OnboardingStatus
+import com.waste.link.domain.model.PasswordResetOutcome
+import com.waste.link.domain.model.ProfileIncompleteReason
+import com.waste.link.domain.model.ProfileInitializationOutcome
+import com.waste.link.domain.model.ProfileRecoveryInput
+import com.waste.link.domain.model.ProfileUpdateOutcome
+import com.waste.link.domain.model.RegistrationDraft
+import com.waste.link.domain.model.RegistrationOutcome
+import com.waste.link.domain.model.SessionState
+import com.waste.link.domain.model.User
+import com.waste.link.domain.model.UserRole
+import com.waste.link.domain.validation.AuthValidator
+import com.waste.link.domain.validation.ValidationResult
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import javax.inject.Inject
+import javax.inject.Singleton
 
-class AuthRepositoryImpl @Inject constructor(
-    private val auth: FirebaseAuth,
-    private val firestore: FirebaseFirestore
+/**
+ * Production implementation of [AuthRepository] for WasteLink Module 1, Stage 3.
+ *
+ * Security & Architectural Guarantees:
+ * 1. Writes `/users/{uid}` exclusively using the canonical [User] domain model and [UserMapper.toFirestoreMap]
+ *    conforming to Stage 2.1 `firestore.rules`.
+ * 2. Never allows client self-registration as [UserRole.ADMIN].
+ * 3. Preserves authenticated session and [RegistrationDraft] on same-session Firestore write failure
+ *    so `retryProfileInitialization()` can complete `/users/{uid}` creation idempotently without
+ *    calling `createUserWithEmailAndPassword` a second time.
+ * 4. Detects missing or legacy incomplete `/users/{uid}` profiles on login and session restoration
+ *    (`ProfileIncomplete`) without fabricating placeholder user data and without signing the user out.
+ * 5. Treats Firebase Authentication (`isEmailVerified` and refreshed ID token claims) as the sole
+ *    authority for email verification, and never writes `isVerified = true` from the client.
+ */
+@Singleton
+class AuthRepositoryImpl(
+    private val remoteDataSource: AuthRemoteDataSource,
+    private val clock: () -> Long
 ) : AuthRepository {
 
+    @Inject
+    constructor(remoteDataSource: AuthRemoteDataSource) : this(
+        remoteDataSource = remoteDataSource,
+        clock = { System.currentTimeMillis() }
+    )
+
+    private data class PendingRegistrationState(
+        val uid: String,
+        val draft: RegistrationDraft
+    )
+
+    private data class PendingLegacySignUp(
+        val uid: String,
+        val fullName: String,
+        val email: String,
+        val phoneNumber: String
+    )
+
+    private val _sessionState = MutableStateFlow<SessionState>(SessionState.Unauthenticated)
+    override val sessionState: StateFlow<SessionState> = _sessionState.asStateFlow()
+
+    @Volatile
+    private var pendingRegistrationState: PendingRegistrationState? = null
+
+    @Volatile
+    private var pendingLegacySignUp: PendingLegacySignUp? = null
+
+    // =========================================================================
+    // 1. Canonical State & Inspection
+    // =========================================================================
+
+    override fun getCurrentUser(): User? {
+        return when (val current = _sessionState.value) {
+            is SessionState.Authenticated -> current.user
+            is SessionState.AuthenticatedRestricted -> current.user
+            else -> null
+        }
+    }
+
+    override fun getPendingRegistrationDraft(): RegistrationDraft? {
+        val currentUid = remoteDataSource.getCurrentAuthUser()?.uid
+        val pending = pendingRegistrationState
+        if (pending != null && (currentUid == null || pending.uid == currentUid)) {
+            return pending.draft
+        }
+        return (_sessionState.value as? SessionState.AuthenticatedProfileIncomplete)?.pendingDraft
+    }
+
+    override fun isEmailVerified(): Boolean {
+        val remoteVerified = remoteDataSource.getCurrentAuthUser()?.isEmailVerified
+        if (remoteVerified != null) return remoteVerified
+        return when (val state = _sessionState.value) {
+            is SessionState.Authenticated -> state.isEmailVerified
+            is SessionState.AuthenticatedRestricted -> state.isEmailVerified
+            is SessionState.AuthenticatedProfileIncomplete -> state.isEmailVerified
+            else -> false
+        }
+    }
+
+    // =========================================================================
+    // 2. Canonical Registration Engine
+    // =========================================================================
+
+    override suspend fun registerResident(
+        fullName: String,
+        email: String,
+        phoneNumber: String,
+        password: String,
+        confirmPassword: String
+    ): RegistrationOutcome {
+        return registerUser(
+            fullName = fullName,
+            email = email,
+            phoneNumber = phoneNumber,
+            password = password,
+            confirmPassword = confirmPassword,
+            role = UserRole.RESIDENT
+        )
+    }
+
+    override suspend fun registerCollector(
+        fullName: String,
+        email: String,
+        phoneNumber: String,
+        password: String,
+        confirmPassword: String
+    ): RegistrationOutcome {
+        return registerUser(
+            fullName = fullName,
+            email = email,
+            phoneNumber = phoneNumber,
+            password = password,
+            confirmPassword = confirmPassword,
+            role = UserRole.COLLECTOR
+        )
+    }
+
+    override suspend fun registerUser(
+        fullName: String,
+        email: String,
+        phoneNumber: String,
+        password: String,
+        confirmPassword: String,
+        role: UserRole
+    ): RegistrationOutcome {
+        // 1. Role security check before any other processing or network call
+        val roleCheck = AuthValidator.validateSelfRegistrationRole(role)
+        if (roleCheck is ValidationResult.Invalid) {
+            return RegistrationOutcome.Failure(
+                AuthError.UnauthorizedRoleSelection(roleCheck.message)
+            )
+        }
+
+        // 2. Comprehensive input validation via AuthValidator before any Firebase call
+        val validationFailures = mutableListOf<FieldValidationFailure>()
+
+        val nameResult = AuthValidator.validateFullName(fullName)
+        if (nameResult is ValidationResult.Invalid) {
+            validationFailures.add(
+                FieldValidationFailure("fullName", nameResult.error, nameResult.message)
+            )
+        }
+
+        val emailResult = AuthValidator.validateEmail(email)
+        if (emailResult is ValidationResult.Invalid) {
+            validationFailures.add(
+                FieldValidationFailure("email", emailResult.error, emailResult.message)
+            )
+        }
+
+        val phoneResult = AuthValidator.validateAndNormalizePhone(phoneNumber)
+        if (phoneResult is ValidationResult.Invalid) {
+            validationFailures.add(
+                FieldValidationFailure("phoneNumber", phoneResult.error, phoneResult.message)
+            )
+        }
+
+        val passwordResult = AuthValidator.validatePassword(password)
+        if (passwordResult is ValidationResult.Invalid) {
+            validationFailures.add(
+                FieldValidationFailure("password", passwordResult.error, passwordResult.message)
+            )
+        }
+
+        val confirmResult = AuthValidator.validatePasswordConfirmation(password, confirmPassword)
+        if (confirmResult is ValidationResult.Invalid) {
+            validationFailures.add(
+                FieldValidationFailure("confirmPassword", confirmResult.error, confirmResult.message)
+            )
+        }
+
+        if (validationFailures.isNotEmpty()) {
+            return RegistrationOutcome.Failure(
+                AuthError.ValidationFailed(errors = validationFailures)
+            )
+        }
+
+        val normalizedName = (nameResult as ValidationResult.Valid).value
+        val normalizedEmail = (emailResult as ValidationResult.Valid).value
+        val normalizedPhone = (phoneResult as ValidationResult.Valid).value
+
+        val draft = RegistrationDraft(
+            fullName = normalizedName,
+            email = normalizedEmail,
+            phoneNumber = normalizedPhone,
+            role = role
+        )
+
+        // 3. Create Firebase Auth user (or reuse already-created session from same-session partial failure)
+        val existingSessionUser = remoteDataSource.getCurrentAuthUser()
+        val pendingState = pendingRegistrationState
+        val authUser = if (
+            existingSessionUser != null &&
+            existingSessionUser.email?.lowercase() == normalizedEmail &&
+            pendingState != null &&
+            pendingState.uid == existingSessionUser.uid
+        ) {
+            existingSessionUser
+        } else {
+            try {
+                remoteDataSource.createAuthUser(normalizedEmail, password)
+            } catch (e: Throwable) {
+                val mappedError = FirebaseErrorMapper.toAuthError(
+                    throwable = e,
+                    emailContext = normalizedEmail
+                )
+                return RegistrationOutcome.Failure(mappedError)
+            }
+        }
+
+        // Preserve authenticated session + registration draft immediately in case Firestore fails
+        pendingRegistrationState = PendingRegistrationState(
+            uid = authUser.uid,
+            draft = draft
+        )
+
+        // Best-effort Firebase Auth display name update (non-fatal if offline)
+        try {
+            remoteDataSource.updateAuthDisplayName(normalizedName)
+        } catch (_: Throwable) {
+            // Non-fatal; Firestore /users/{uid}.fullName is the canonical display name
+        }
+
+        // 4. Initialize canonical /users/{uid} Firestore document and trigger verification email
+        return when (val initOutcome = initializeProfileForAuthenticatedUser(authUser, draft)) {
+            is ProfileInitializationOutcome.Success -> {
+                RegistrationOutcome.Success(
+                    user = initOutcome.user,
+                    verificationEmailSent = initOutcome.verificationEmailSent,
+                    emailSendError = initOutcome.emailSendError
+                )
+            }
+            is ProfileInitializationOutcome.Failure -> {
+                _sessionState.value = SessionState.AuthenticatedProfileIncomplete(
+                    uid = authUser.uid,
+                    email = normalizedEmail,
+                    isEmailVerified = authUser.isEmailVerified,
+                    reason = ProfileIncompleteReason.PROFILE_WRITE_FAILED,
+                    pendingDraft = draft
+                )
+                RegistrationOutcome.PartialSuccessProfilePending(
+                    uid = authUser.uid,
+                    email = normalizedEmail,
+                    draft = draft,
+                    profileError = initOutcome.error
+                )
+            }
+        }
+    }
+
+    // =========================================================================
+    // 3. Ghost Account Recovery (Same-Session & Cross-Session)
+    // =========================================================================
+
+    override suspend fun retryProfileInitialization(
+        overrideDraft: RegistrationDraft?
+    ): ProfileInitializationOutcome {
+        val authUser = remoteDataSource.getCurrentAuthUser()
+            ?: return ProfileInitializationOutcome.Failure(AuthError.Unauthenticated())
+
+        val candidateDraft = overrideDraft
+            ?: pendingRegistrationState?.takeIf { it.uid == authUser.uid }?.draft
+            ?: (_sessionState.value as? SessionState.AuthenticatedProfileIncomplete)?.pendingDraft
+            ?: return ProfileInitializationOutcome.Failure(
+                error = AuthError.ProfileNotFound(
+                    uid = authUser.uid,
+                    email = authUser.email.orEmpty(),
+                    message = "No pending registration draft found. Please provide profile details to complete recovery."
+                )
+            )
+
+        // Validate the draft before writing to Firestore
+        val validatedDraftResult = validateDraftForAuthenticatedUser(
+            authUser = authUser,
+            rawFullName = candidateDraft.fullName,
+            rawPhoneNumber = candidateDraft.phoneNumber,
+            role = candidateDraft.role
+        )
+        if (validatedDraftResult is ProfileDraftValidation.Invalid) {
+            return ProfileInitializationOutcome.Failure(
+                error = validatedDraftResult.error,
+                draft = candidateDraft
+            )
+        }
+
+        val validatedDraft = (validatedDraftResult as ProfileDraftValidation.Valid).draft
+        pendingRegistrationState = PendingRegistrationState(uid = authUser.uid, draft = validatedDraft)
+        return initializeProfileForAuthenticatedUser(authUser, validatedDraft)
+    }
+
+    override suspend fun completeMissingProfile(
+        input: ProfileRecoveryInput
+    ): ProfileInitializationOutcome {
+        val authUser = remoteDataSource.getCurrentAuthUser()
+            ?: return ProfileInitializationOutcome.Failure(AuthError.Unauthenticated())
+
+        val validatedDraftResult = validateDraftForAuthenticatedUser(
+            authUser = authUser,
+            rawFullName = input.fullName,
+            rawPhoneNumber = input.phoneNumber,
+            role = input.role
+        )
+        if (validatedDraftResult is ProfileDraftValidation.Invalid) {
+            return ProfileInitializationOutcome.Failure(error = validatedDraftResult.error)
+        }
+
+        val validatedDraft = (validatedDraftResult as ProfileDraftValidation.Valid).draft
+        pendingRegistrationState = PendingRegistrationState(uid = authUser.uid, draft = validatedDraft)
+        return initializeProfileForAuthenticatedUser(authUser, validatedDraft)
+    }
+
+    private sealed interface ProfileDraftValidation {
+        data class Valid(val draft: RegistrationDraft) : ProfileDraftValidation
+        data class Invalid(val error: AuthError) : ProfileDraftValidation
+    }
+
+    private fun validateDraftForAuthenticatedUser(
+        authUser: RemoteAuthUser,
+        rawFullName: String,
+        rawPhoneNumber: String,
+        role: UserRole
+    ): ProfileDraftValidation {
+        val roleResult = AuthValidator.validateSelfRegistrationRole(role)
+        if (roleResult is ValidationResult.Invalid) {
+            return ProfileDraftValidation.Invalid(
+                AuthError.UnauthorizedRoleSelection(roleResult.message)
+            )
+        }
+
+        val failures = mutableListOf<FieldValidationFailure>()
+
+        val nameResult = AuthValidator.validateFullName(rawFullName)
+        if (nameResult is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("fullName", nameResult.error, nameResult.message))
+        }
+
+        val phoneResult = AuthValidator.validateAndNormalizePhone(rawPhoneNumber)
+        if (phoneResult is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("phoneNumber", phoneResult.error, phoneResult.message))
+        }
+
+        val emailToValidate = authUser.email
+            ?: pendingRegistrationState?.takeIf { it.uid == authUser.uid }?.draft?.email
+        val emailResult = AuthValidator.validateEmail(emailToValidate)
+        if (emailResult is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("email", emailResult.error, emailResult.message))
+        }
+
+        if (failures.isNotEmpty()) {
+            return ProfileDraftValidation.Invalid(AuthError.ValidationFailed(failures))
+        }
+
+        return ProfileDraftValidation.Valid(
+            RegistrationDraft(
+                fullName = (nameResult as ValidationResult.Valid).value,
+                email = (emailResult as ValidationResult.Valid).value,
+                phoneNumber = (phoneResult as ValidationResult.Valid).value,
+                role = role
+            )
+        )
+    }
+
+    /**
+     * Idempotently ensures `/users/{uid}` exists with a valid canonical [User] profile.
+     *
+     * Idempotency Mechanism:
+     * 1. Queries `/users/{uid}` on the server first (`fetchUserDocumentServerFirst`).
+     * 2. If a valid canonical profile already exists at `/users/{uid}`, returns it immediately
+     *    with `wasAlreadyInitialized = true` without issuing a redundant overwrite.
+     * 3. Otherwise builds the canonical [User] via [UserMapper.createInitialProfile], writes
+     *    `/users/{uid}` via [UserMapper.toFirestoreMap], and triggers verification email if needed.
+     */
+    private suspend fun initializeProfileForAuthenticatedUser(
+        authUser: RemoteAuthUser,
+        draft: RegistrationDraft
+    ): ProfileInitializationOutcome {
+        // Step 1: Check if /users/{uid} was already created on a previous attempt
+        val existingCheck = try {
+            remoteDataSource.fetchUserDocumentServerFirst(authUser.uid)
+        } catch (_: Throwable) {
+            null
+        }
+
+        if (existingCheck is RemoteDocumentResult.Found) {
+            val inspected = UserMapper.inspectFirestoreMap(existingCheck.data, authUser.uid)
+            if (inspected is ProfileMappingResult.Valid) {
+                pendingRegistrationState = null
+                pendingLegacySignUp = null
+                applyResolvedUserToSessionState(
+                    user = inspected.user,
+                    authUser = authUser,
+                    isFromCache = existingCheck.isFromCache
+                )
+                return ProfileInitializationOutcome.Success(
+                    user = inspected.user,
+                    verificationEmailSent = authUser.isEmailVerified,
+                    emailSendError = null,
+                    wasAlreadyInitialized = true
+                )
+            }
+        }
+
+        // Step 2: Construct canonical User and write /users/{uid}
+        val newUser = UserMapper.createInitialProfile(
+            uid = authUser.uid,
+            fullName = draft.fullName,
+            email = draft.email,
+            phoneNumber = draft.phoneNumber,
+            role = draft.role,
+            nowEpochMs = clock()
+        )
+        val firestoreMap = UserMapper.toFirestoreMap(newUser)
+
+        try {
+            remoteDataSource.writeUserDocument(authUser.uid, firestoreMap)
+        } catch (e: Throwable) {
+            val mappedError = FirebaseErrorMapper.toAuthError(
+                throwable = e,
+                emailContext = draft.email,
+                uidContext = authUser.uid
+            )
+            _sessionState.value = SessionState.AuthenticatedProfileIncomplete(
+                uid = authUser.uid,
+                email = draft.email,
+                isEmailVerified = authUser.isEmailVerified,
+                reason = ProfileIncompleteReason.PROFILE_WRITE_FAILED,
+                pendingDraft = draft
+            )
+            return ProfileInitializationOutcome.Failure(
+                error = mappedError,
+                draft = draft
+            )
+        }
+
+        // Step 3: Profile creation succeeded; clear pending drafts and update session state
+        pendingRegistrationState = null
+        pendingLegacySignUp = null
+
+        var emailSent = false
+        var emailSendError: AuthError? = null
+        if (!authUser.isEmailVerified) {
+            try {
+                remoteDataSource.sendEmailVerification()
+                emailSent = true
+            } catch (e: Throwable) {
+                emailSent = false
+                emailSendError = FirebaseErrorMapper.toAuthError(
+                    throwable = e,
+                    emailContext = draft.email,
+                    uidContext = authUser.uid
+                )
+            }
+        } else {
+            emailSent = true
+        }
+
+        applyResolvedUserToSessionState(
+            user = newUser,
+            authUser = authUser,
+            isFromCache = false
+        )
+
+        return ProfileInitializationOutcome.Success(
+            user = newUser,
+            verificationEmailSent = emailSent,
+            emailSendError = emailSendError,
+            wasAlreadyInitialized = false
+        )
+    }
+
+    // =========================================================================
+    // 4. Login & Profile Resolution
+    // =========================================================================
+
+    override suspend fun login(
+        email: String,
+        password: String
+    ): LoginOutcome {
+        // 1. Validate inputs before calling Firebase Auth
+        val failures = mutableListOf<FieldValidationFailure>()
+
+        val emailResult = AuthValidator.validateEmail(email)
+        if (emailResult is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("email", emailResult.error, emailResult.message))
+        }
+
+        val passwordRequired = AuthValidator.validateRequired(password, "Password")
+        if (passwordRequired is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("password", passwordRequired.error, passwordRequired.message))
+        }
+
+        if (failures.isNotEmpty()) {
+            return LoginOutcome.Failure(AuthError.ValidationFailed(failures))
+        }
+
+        val normalizedEmail = (emailResult as ValidationResult.Valid).value
+
+        // 2. Authenticate with Firebase Auth
+        val signedInUser = try {
+            remoteDataSource.signInWithEmailAndPassword(normalizedEmail, password)
+        } catch (e: Throwable) {
+            val mappedError = FirebaseErrorMapper.toAuthError(
+                throwable = e,
+                emailContext = normalizedEmail
+            )
+            return LoginOutcome.Failure(mappedError)
+        }
+
+        // 3. Reload user to obtain freshest email verification and custom claims state
+        val effectiveAuthUser = try {
+            remoteDataSource.reloadCurrentAuthUser(
+                forceTokenRefresh = signedInUser.isEmailVerified
+            ) ?: signedInUser
+        } catch (e: Throwable) {
+            val mappedError = FirebaseErrorMapper.toAuthError(
+                throwable = e,
+                emailContext = normalizedEmail,
+                uidContext = signedInUser.uid
+            )
+            if (FirebaseErrorMapper.isSessionRevokedOrDisabled(mappedError)) {
+                remoteDataSource.signOut()
+                _sessionState.value = SessionState.AuthenticationRevoked(mappedError)
+                return LoginOutcome.Failure(mappedError)
+            }
+            // On transient network failure during reload, proceed with signedInUser
+            signedInUser
+        }
+
+        // 4. Resolve /users/{uid} from Firestore
+        return when (val session = resolveProfileAndUpdateSession(effectiveAuthUser)) {
+            is SessionState.Authenticated -> LoginOutcome.Authenticated(
+                user = session.user,
+                isEmailVerified = session.isEmailVerified,
+                hasAdminClaim = session.hasAdminClaim,
+                isFromCache = session.isFromCache
+            )
+            is SessionState.AuthenticatedRestricted -> LoginOutcome.AccountLocked(
+                user = session.user,
+                isEmailVerified = session.isEmailVerified,
+                accountStatus = session.accountStatus,
+                statusReason = session.statusReason,
+                suspendedUntilEpochMs = session.suspendedUntilEpochMs
+            )
+            is SessionState.AuthenticatedProfileIncomplete -> LoginOutcome.ProfileIncomplete(
+                uid = session.uid,
+                email = session.email,
+                isEmailVerified = session.isEmailVerified,
+                reason = session.reason,
+                suggestedDraft = session.pendingDraft
+            )
+            is SessionState.AuthenticatedProfileLoadError -> LoginOutcome.ProfileLoadFailed(
+                uid = session.uid,
+                email = session.email,
+                error = session.error
+            )
+            is SessionState.AuthenticationRevoked -> LoginOutcome.Failure(session.error)
+            SessionState.Unauthenticated -> LoginOutcome.Failure(AuthError.Unauthenticated())
+        }
+    }
+
+    // =========================================================================
+    // 5. Email Verification Operations
+    // =========================================================================
+
+    override suspend fun sendEmailVerification(): EmailVerificationOutcome {
+        return dispatchEmailVerificationInternal()
+    }
+
+    override suspend fun resendEmailVerification(): EmailVerificationOutcome {
+        return dispatchEmailVerificationInternal()
+    }
+
+    private suspend fun dispatchEmailVerificationInternal(): EmailVerificationOutcome {
+        val currentUser = remoteDataSource.getCurrentAuthUser()
+            ?: return EmailVerificationOutcome.Failure(AuthError.Unauthenticated())
+
+        val userEmail = currentUser.email.orEmpty()
+        if (currentUser.isEmailVerified) {
+            return EmailVerificationOutcome.AlreadyVerified(userEmail)
+        }
+
+        return try {
+            remoteDataSource.sendEmailVerification()
+            EmailVerificationOutcome.Sent(userEmail)
+        } catch (e: Throwable) {
+            val mappedError = FirebaseErrorMapper.toAuthError(
+                throwable = e,
+                emailContext = userEmail,
+                uidContext = currentUser.uid
+            )
+            EmailVerificationOutcome.Failure(mappedError)
+        }
+    }
+
+    override suspend fun refreshEmailVerificationStatus(): EmailVerificationOutcome {
+        val currentUser = remoteDataSource.getCurrentAuthUser()
+            ?: return EmailVerificationOutcome.Failure(AuthError.Unauthenticated())
+
+        val reloadedUser = try {
+            remoteDataSource.reloadCurrentAuthUser(forceTokenRefresh = false)
+                ?: return EmailVerificationOutcome.Failure(AuthError.Unauthenticated())
+        } catch (e: Throwable) {
+            val mappedError = FirebaseErrorMapper.toAuthError(
+                throwable = e,
+                emailContext = currentUser.email,
+                uidContext = currentUser.uid
+            )
+            if (FirebaseErrorMapper.isSessionRevokedOrDisabled(mappedError)) {
+                remoteDataSource.signOut()
+                _sessionState.value = SessionState.AuthenticationRevoked(mappedError)
+            }
+            return EmailVerificationOutcome.Failure(mappedError)
+        }
+
+        var tokenRefreshed = false
+        var finalUser = reloadedUser
+
+        if (reloadedUser.isEmailVerified) {
+            try {
+                finalUser = remoteDataSource.refreshIdToken() ?: reloadedUser
+                tokenRefreshed = true
+            } catch (e: Throwable) {
+                val mappedError = FirebaseErrorMapper.toAuthError(
+                    throwable = e,
+                    emailContext = reloadedUser.email,
+                    uidContext = reloadedUser.uid
+                )
+                return EmailVerificationOutcome.Failure(mappedError)
+            }
+        }
+
+        // Synchronize in-memory SessionState with the refreshed verification & claim status
+        when (val existingState = _sessionState.value) {
+            is SessionState.Authenticated -> {
+                _sessionState.value = existingState.copy(
+                    isEmailVerified = finalUser.isEmailVerified,
+                    hasAdminClaim = finalUser.hasAdminClaim
+                )
+            }
+            is SessionState.AuthenticatedRestricted -> {
+                _sessionState.value = existingState.copy(
+                    isEmailVerified = finalUser.isEmailVerified
+                )
+            }
+            is SessionState.AuthenticatedProfileIncomplete -> {
+                _sessionState.value = existingState.copy(
+                    isEmailVerified = finalUser.isEmailVerified
+                )
+            }
+            else -> Unit
+        }
+
+        return EmailVerificationOutcome.StatusRefreshed(
+            isEmailVerified = finalUser.isEmailVerified,
+            tokenRefreshed = tokenRefreshed
+        )
+    }
+
+    // =========================================================================
+    // 6. Password Recovery
+    // =========================================================================
+
+    override suspend fun sendPasswordReset(email: String): PasswordResetOutcome {
+        val emailResult = AuthValidator.validateEmail(email)
+        if (emailResult is ValidationResult.Invalid) {
+            return PasswordResetOutcome.Failure(
+                AuthError.ValidationFailed(
+                    listOf(FieldValidationFailure("email", emailResult.error, emailResult.message))
+                )
+            )
+        }
+
+        val normalizedEmail = (emailResult as ValidationResult.Valid).value
+
+        return try {
+            remoteDataSource.sendPasswordResetEmail(normalizedEmail)
+            PasswordResetOutcome.ResetEmailDispatched(normalizedEmail)
+        } catch (e: Throwable) {
+            val mappedError = FirebaseErrorMapper.toAuthError(
+                throwable = e,
+                emailContext = normalizedEmail
+            )
+            // Enumeration safety: never reveal whether an email address is registered
+            if (mappedError is AuthError.AccountNotFound) {
+                PasswordResetOutcome.ResetEmailDispatched(normalizedEmail)
+            } else {
+                PasswordResetOutcome.Failure(mappedError)
+            }
+        }
+    }
+
+    // =========================================================================
+    // 7. Session Management & Logout
+    // =========================================================================
+
+    override suspend fun restoreSession(): SessionState {
+        val currentAuthUser = remoteDataSource.getCurrentAuthUser()
+        if (currentAuthUser == null) {
+            _sessionState.value = SessionState.Unauthenticated
+            return SessionState.Unauthenticated
+        }
+
+        // Reload Firebase user to detect server-side revocation/disabling or updated verification status.
+        // Do NOT destroy a valid session if reload fails due to temporary offline/network error.
+        val effectiveAuthUser = try {
+            val reloaded = remoteDataSource.reloadCurrentAuthUser(forceTokenRefresh = false)
+            if (reloaded == null) {
+                _sessionState.value = SessionState.Unauthenticated
+                return SessionState.Unauthenticated
+            }
+            if (reloaded.isEmailVerified && !currentAuthUser.isEmailVerified) {
+                remoteDataSource.refreshIdToken() ?: reloaded
+            } else {
+                reloaded
+            }
+        } catch (e: Throwable) {
+            val mappedError = FirebaseErrorMapper.toAuthError(
+                throwable = e,
+                emailContext = currentAuthUser.email,
+                uidContext = currentAuthUser.uid
+            )
+            if (FirebaseErrorMapper.isSessionRevokedOrDisabled(mappedError)) {
+                remoteDataSource.signOut()
+                pendingRegistrationState = null
+                pendingLegacySignUp = null
+                val revokedState = SessionState.AuthenticationRevoked(mappedError)
+                _sessionState.value = revokedState
+                return revokedState
+            }
+            // Temporary network failure during reload: keep currentAuthUser and resolve profile
+            currentAuthUser
+        }
+
+        return resolveProfileAndUpdateSession(effectiveAuthUser)
+    }
+
+    override suspend fun logout(): LogoutOutcome {
+        return try {
+            remoteDataSource.signOut()
+            pendingRegistrationState = null
+            pendingLegacySignUp = null
+            _sessionState.value = SessionState.Unauthenticated
+            LogoutOutcome.Success
+        } catch (e: Throwable) {
+            LogoutOutcome.Failure(FirebaseErrorMapper.toAuthError(e))
+        }
+    }
+
+    // =========================================================================
+    // 8. Self-Service Profile Lifecycle Operations
+    // =========================================================================
+
+    override suspend fun completeResidentOnboarding(
+        defaultZoneId: String?
+    ): ProfileUpdateOutcome {
+        val authUser = remoteDataSource.getCurrentAuthUser()
+            ?: return ProfileUpdateOutcome.Failure(AuthError.Unauthenticated())
+
+        if (!authUser.isEmailVerified) {
+            return ProfileUpdateOutcome.Failure(AuthError.EmailNotVerified())
+        }
+
+        val currentProfile = getCurrentUser() ?: run {
+            val state = resolveProfileAndUpdateSession(authUser)
+            (state as? SessionState.Authenticated)?.user
+                ?: return ProfileUpdateOutcome.Failure(
+                    AuthError.ProfileNotFound(authUser.uid, authUser.email.orEmpty())
+                )
+        }
+
+        val normalizedZone = defaultZoneId?.trim()?.takeIf { it.isNotEmpty() }
+        val updatedAt = maxOf(clock(), currentProfile.updatedAtEpochMs + 1L)
+
+        val updateFields = mutableMapOf<String, Any?>(
+            "onboardingStatus" to OnboardingStatus.COMPLETED.name,
+            "defaultZoneId" to normalizedZone,
+            "updatedAtEpochMs" to updatedAt
+        )
+
+        return try {
+            remoteDataSource.updateUserDocument(authUser.uid, updateFields)
+            val updatedUser = currentProfile.copy(
+                onboardingStatus = OnboardingStatus.COMPLETED,
+                defaultZoneId = normalizedZone,
+                updatedAtEpochMs = updatedAt
+            )
+            applyResolvedUserToSessionState(updatedUser, authUser, isFromCache = false)
+            ProfileUpdateOutcome.Success(updatedUser)
+        } catch (e: Throwable) {
+            ProfileUpdateOutcome.Failure(
+                FirebaseErrorMapper.toAuthError(
+                    throwable = e,
+                    emailContext = authUser.email,
+                    uidContext = authUser.uid
+                )
+            )
+        }
+    }
+
+    override suspend fun updateProfile(
+        fullName: String,
+        phoneNumber: String,
+        defaultZoneId: String?,
+        preferredLanguage: String?
+    ): ProfileUpdateOutcome {
+        val authUser = remoteDataSource.getCurrentAuthUser()
+            ?: return ProfileUpdateOutcome.Failure(AuthError.Unauthenticated())
+
+        if (!authUser.isEmailVerified) {
+            return ProfileUpdateOutcome.Failure(AuthError.EmailNotVerified())
+        }
+
+        val failures = mutableListOf<FieldValidationFailure>()
+        val nameResult = AuthValidator.validateFullName(fullName)
+        if (nameResult is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("fullName", nameResult.error, nameResult.message))
+        }
+        val phoneResult = AuthValidator.validateAndNormalizePhone(phoneNumber)
+        if (phoneResult is ValidationResult.Invalid) {
+            failures.add(FieldValidationFailure("phoneNumber", phoneResult.error, phoneResult.message))
+        }
+        if (failures.isNotEmpty()) {
+            return ProfileUpdateOutcome.Failure(AuthError.ValidationFailed(failures))
+        }
+
+        val normalizedName = (nameResult as ValidationResult.Valid).value
+        val normalizedPhone = (phoneResult as ValidationResult.Valid).value
+        val normalizedZone = defaultZoneId?.trim()?.takeIf { it.isNotEmpty() }
+
+        val currentProfile = getCurrentUser() ?: run {
+            val state = resolveProfileAndUpdateSession(authUser)
+            (state as? SessionState.Authenticated)?.user
+                ?: return ProfileUpdateOutcome.Failure(
+                    AuthError.ProfileNotFound(authUser.uid, authUser.email.orEmpty())
+                )
+        }
+
+        val normalizedLang = preferredLanguage?.trim()?.takeIf { it.isNotEmpty() }
+            ?: currentProfile.preferredLanguage
+        val updatedAt = maxOf(clock(), currentProfile.updatedAtEpochMs + 1L)
+
+        val updateFields = mapOf<String, Any?>(
+            "fullName" to normalizedName,
+            "name" to normalizedName,
+            "phoneNumber" to normalizedPhone,
+            "phone" to normalizedPhone,
+            "defaultZoneId" to normalizedZone,
+            "preferredLanguage" to normalizedLang,
+            "updatedAtEpochMs" to updatedAt
+        )
+
+        return try {
+            remoteDataSource.updateUserDocument(authUser.uid, updateFields)
+            val updatedUser = currentProfile.copy(
+                fullName = normalizedName,
+                phoneNumber = normalizedPhone,
+                defaultZoneId = normalizedZone,
+                preferredLanguage = normalizedLang,
+                updatedAtEpochMs = updatedAt
+            )
+            applyResolvedUserToSessionState(updatedUser, authUser, isFromCache = false)
+            ProfileUpdateOutcome.Success(updatedUser)
+        } catch (e: Throwable) {
+            ProfileUpdateOutcome.Failure(
+                FirebaseErrorMapper.toAuthError(
+                    throwable = e,
+                    emailContext = authUser.email,
+                    uidContext = authUser.uid
+                )
+            )
+        }
+    }
+
+    // =========================================================================
+    // 9. Internal Profile Resolution & Bounded Retry Engine
+    // =========================================================================
+
+    /**
+     * Fetches `/users/{uid}` from Firestore with a bounded retry on transient network failure
+     * and offline cache fallback, then maps the document into the authoritative [SessionState].
+     *
+     * Never fabricates a synthetic default user when `/users/{uid}` is missing, malformed, or unreachable.
+     */
+    private suspend fun resolveProfileAndUpdateSession(
+        authUser: RemoteAuthUser
+    ): SessionState {
+        val resolvedEmail = authUser.email?.trim()?.lowercase().orEmpty()
+
+        val documentResult = fetchUserDocumentWithBoundedRetry(
+            uid = authUser.uid,
+            emailContext = resolvedEmail
+        )
+
+        val rawDocResult = when (documentResult) {
+            is DocumentFetchOutcome.Success -> documentResult.result
+            is DocumentFetchOutcome.Failure -> {
+                val errorState = SessionState.AuthenticatedProfileLoadError(
+                    uid = authUser.uid,
+                    email = resolvedEmail,
+                    error = documentResult.error
+                )
+                _sessionState.value = errorState
+                return errorState
+            }
+        }
+
+        return when (rawDocResult) {
+            is RemoteDocumentResult.NotFound -> {
+                val suggestedDraft = pendingRegistrationState
+                    ?.takeIf { it.uid == authUser.uid }
+                    ?.draft
+                val incompleteState = SessionState.AuthenticatedProfileIncomplete(
+                    uid = authUser.uid,
+                    email = resolvedEmail,
+                    isEmailVerified = authUser.isEmailVerified,
+                    reason = ProfileIncompleteReason.DOCUMENT_MISSING,
+                    pendingDraft = suggestedDraft
+                )
+                _sessionState.value = incompleteState
+                incompleteState
+            }
+
+            is RemoteDocumentResult.Found -> {
+                when (val inspected = UserMapper.inspectFirestoreMap(rawDocResult.data, authUser.uid)) {
+                    is ProfileMappingResult.Incomplete -> {
+                        val suggestedDraft = pendingRegistrationState
+                            ?.takeIf { it.uid == authUser.uid }
+                            ?.draft
+                        val incompleteState = SessionState.AuthenticatedProfileIncomplete(
+                            uid = authUser.uid,
+                            email = resolvedEmail,
+                            isEmailVerified = authUser.isEmailVerified,
+                            reason = inspected.reason,
+                            pendingDraft = suggestedDraft
+                        )
+                        _sessionState.value = incompleteState
+                        incompleteState
+                    }
+
+                    is ProfileMappingResult.Malformed -> {
+                        val malformedError = AuthError.MalformedProfile(
+                            uid = authUser.uid,
+                            reason = inspected.reason
+                        )
+                        val errorState = SessionState.AuthenticatedProfileLoadError(
+                            uid = authUser.uid,
+                            email = resolvedEmail,
+                            error = malformedError
+                        )
+                        _sessionState.value = errorState
+                        errorState
+                    }
+
+                    is ProfileMappingResult.Valid -> {
+                        val domainUser = inspected.user
+                        var effectiveAuth = authUser
+
+                        // Enforce server-side custom claim verification for ADMIN profiles
+                        if (domainUser.role == UserRole.ADMIN && !effectiveAuth.hasAdminClaim) {
+                            val refreshed = try {
+                                remoteDataSource.refreshIdToken()
+                            } catch (_: Throwable) {
+                                null
+                            }
+                            if (refreshed != null) {
+                                effectiveAuth = refreshed
+                            }
+                            if (!effectiveAuth.hasAdminClaim) {
+                                val claimError = AuthError.UnauthorizedAdminClaim()
+                                val errorState = SessionState.AuthenticatedProfileLoadError(
+                                    uid = effectiveAuth.uid,
+                                    email = resolvedEmail,
+                                    error = claimError
+                                )
+                                _sessionState.value = errorState
+                                return errorState
+                            }
+                        }
+
+                        if (pendingRegistrationState?.uid == effectiveAuth.uid) {
+                            pendingRegistrationState = null
+                        }
+                        if (pendingLegacySignUp?.uid == effectiveAuth.uid) {
+                            pendingLegacySignUp = null
+                        }
+
+                        applyResolvedUserToSessionState(
+                            user = domainUser,
+                            authUser = effectiveAuth,
+                            isFromCache = rawDocResult.isFromCache
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun applyResolvedUserToSessionState(
+        user: User,
+        authUser: RemoteAuthUser,
+        isFromCache: Boolean
+    ): SessionState {
+        val nextState = when (user.accountStatus) {
+            AccountStatus.ACTIVE -> SessionState.Authenticated(
+                user = user,
+                isEmailVerified = authUser.isEmailVerified,
+                hasAdminClaim = authUser.hasAdminClaim,
+                isFromCache = isFromCache
+            )
+            AccountStatus.RESTRICTED,
+            AccountStatus.SUSPENDED,
+            AccountStatus.BANNED -> SessionState.AuthenticatedRestricted(
+                user = user,
+                isEmailVerified = authUser.isEmailVerified,
+                accountStatus = user.accountStatus,
+                statusReason = user.statusReason,
+                suspendedUntilEpochMs = user.suspendedUntilEpochMs
+            )
+        }
+        _sessionState.value = nextState
+        return nextState
+    }
+
+    private sealed interface DocumentFetchOutcome {
+        data class Success(val result: RemoteDocumentResult) : DocumentFetchOutcome
+        data class Failure(val error: AuthError) : DocumentFetchOutcome
+    }
+
+    private suspend fun fetchUserDocumentWithBoundedRetry(
+        uid: String,
+        emailContext: String
+    ): DocumentFetchOutcome {
+        var lastError: AuthError? = null
+
+        for (attempt in 1..2) {
+            try {
+                val doc = remoteDataSource.fetchUserDocumentServerFirst(uid)
+                return DocumentFetchOutcome.Success(doc)
+            } catch (e: Throwable) {
+                val mapped = FirebaseErrorMapper.toAuthError(
+                    throwable = e,
+                    emailContext = emailContext,
+                    uidContext = uid
+                )
+                lastError = mapped
+                // Only retry on transient network failures
+                if (mapped !is AuthError.NetworkFailure) {
+                    return DocumentFetchOutcome.Failure(mapped)
+                }
+            }
+        }
+
+        // If server is unreachable after bounded retry, check local Firestore cache before failing
+        val cached = try {
+            remoteDataSource.fetchUserDocumentFromCache(uid)
+        } catch (_: Throwable) {
+            RemoteDocumentResult.NotFound(isFromCache = true)
+        }
+
+        if (cached is RemoteDocumentResult.Found) {
+            return DocumentFetchOutcome.Success(cached)
+        }
+
+        return DocumentFetchOutcome.Failure(
+            lastError ?: AuthError.NetworkFailure()
+        )
+    }
+
+    // =========================================================================
+    // 10. Legacy Compatibility Bridge Implementations (for Stage 4+ ViewModels)
+    // =========================================================================
+
+    @Deprecated("Use registerResident / registerCollector / registerUser in new code")
     override suspend fun signUp(
         email: String,
         password: String,
         name: String,
         phone: String
     ): Result<AppUser> {
+        val nameResult = AuthValidator.validateFullName(name)
+        if (nameResult is ValidationResult.Invalid) {
+            return Result.failure(IllegalArgumentException(nameResult.message))
+        }
+        val emailResult = AuthValidator.validateEmail(email)
+        if (emailResult is ValidationResult.Invalid) {
+            return Result.failure(IllegalArgumentException(emailResult.message))
+        }
+        val phoneResult = AuthValidator.validateAndNormalizePhone(phone)
+        if (phoneResult is ValidationResult.Invalid) {
+            return Result.failure(IllegalArgumentException(phoneResult.message))
+        }
+        val passwordResult = AuthValidator.validatePassword(password)
+        if (passwordResult is ValidationResult.Invalid) {
+            return Result.failure(IllegalArgumentException(passwordResult.message))
+        }
+
+        val normalizedName = (nameResult as ValidationResult.Valid).value
+        val normalizedEmail = (emailResult as ValidationResult.Valid).value
+        val normalizedPhone = (phoneResult as ValidationResult.Valid).value
+
         return try {
-            val result = auth.createUserWithEmailAndPassword(email, password).await()
-            val uid = result.user?.uid ?: throw Exception("User creation failed")
-
-            // Standard registration default role (Admin cannot be self-assigned from client)
-            val role = "unassigned"
-            val status = "UNVERIFIED"
-
-            val appUser = AppUser(
-                uid = uid,
-                name = name,
-                email = email,
-                phone = phone,
-                role = role,
-                status = status
+            val createdAuthUser = remoteDataSource.createAuthUser(normalizedEmail, password)
+            try {
+                remoteDataSource.updateAuthDisplayName(normalizedName)
+            } catch (_: Throwable) {
+                // Non-fatal
+            }
+            // Cache pending signup in memory until setRole() is called; NEVER write role="unassigned" to Firestore
+            pendingLegacySignUp = PendingLegacySignUp(
+                uid = createdAuthUser.uid,
+                fullName = normalizedName,
+                email = normalizedEmail,
+                phoneNumber = normalizedPhone
             )
-
-            firestore.collection("users").document(uid).set(appUser).await()
-            Result.success(appUser)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    override suspend fun setRole(uid: String, role: String): Result<AppUser> {
-        return try {
-            if (role != "resident" && role != "collector") {
-                throw IllegalArgumentException("Invalid client role: $role. Admin role cannot be self-assigned.")
-            }
-            val document = firestore.collection("users").document(uid).get().await()
-            val user = document.toObject(AppUser::class.java) ?: throw Exception("User not found")
-            val updatedUser = user.copy(role = role, status = "ACTIVE")
-            firestore.collection("users").document(uid).set(updatedUser).await()
-            Result.success(updatedUser)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    override suspend fun signIn(email: String, password: String): Result<AppUser> {
-        return try {
-            val result = auth.signInWithEmailAndPassword(email, password).await()
-            val uid = result.user?.uid ?: throw Exception("Sign in failed")
-            val roleResult = getUserRole(uid)
-            
-            if (roleResult.isFailure) {
-                // Auto-create fallback document if missing
-                val appUser = AppUser(
-                    uid = uid,
-                    name = "User",
-                    email = email,
-                    phone = "Not provided",
-                    role = "resident",
-                    status = "ACTIVE"
+            Result.success(
+                AppUser(
+                    uid = createdAuthUser.uid,
+                    id = createdAuthUser.uid,
+                    name = normalizedName,
+                    fullName = normalizedName,
+                    email = normalizedEmail,
+                    phone = normalizedPhone,
+                    phoneNumber = normalizedPhone,
+                    role = "unassigned"
                 )
-                firestore.collection("users").document(uid).set(appUser).await()
-                Result.success(appUser)
-            } else {
-                roleResult
-            }
-        } catch (e: Exception) {
-            Result.failure(e)
+            )
+        } catch (e: Throwable) {
+            val mapped = FirebaseErrorMapper.toAuthError(e, emailContext = normalizedEmail)
+            Result.failure(IllegalStateException(mapped.message, e))
         }
     }
 
+    @Deprecated("Use registerUser or completeMissingProfile in new code")
+    override suspend fun setRole(uid: String, role: String): Result<AppUser> {
+        val parsedRole = UserRole.fromClientSelection(role)
+            ?: return Result.failure(IllegalArgumentException("Invalid or unauthorized role selection: $role"))
+
+        val authUser = remoteDataSource.getCurrentAuthUser()
+            ?: return Result.failure(IllegalStateException("No authenticated user session found."))
+
+        if (authUser.uid != uid) {
+            return Result.failure(IllegalStateException("Authenticated UID does not match requested UID."))
+        }
+
+        val pendingLegacy = pendingLegacySignUp?.takeIf { it.uid == uid }
+        val draft = if (pendingLegacy != null) {
+            RegistrationDraft(
+                fullName = pendingLegacy.fullName,
+                email = pendingLegacy.email,
+                phoneNumber = pendingLegacy.phoneNumber,
+                role = parsedRole
+            )
+        } else {
+            val fallbackName = authUser.displayName?.takeIf { it.isNotBlank() }
+                ?: return Result.failure(IllegalStateException("Missing full name for profile initialization."))
+            val fallbackEmail = authUser.email?.trim()?.lowercase()
+                ?: return Result.failure(IllegalStateException("Missing email for profile initialization."))
+            val fallbackPhone = authUser.phoneNumber?.takeIf { it.isNotBlank() }
+                ?: return Result.failure(IllegalStateException("Missing phone number for profile initialization."))
+            RegistrationDraft(
+                fullName = fallbackName,
+                email = fallbackEmail,
+                phoneNumber = fallbackPhone,
+                role = parsedRole
+            )
+        }
+
+        return when (val outcome = initializeProfileForAuthenticatedUser(authUser, draft)) {
+            is ProfileInitializationOutcome.Success -> Result.success(
+                AppUser.fromDomainUser(outcome.user)
+            )
+            is ProfileInitializationOutcome.Failure -> Result.failure(
+                IllegalStateException(outcome.error.message)
+            )
+        }
+    }
+
+    @Deprecated("Use login(email, password) returning LoginOutcome in new code")
+    override suspend fun signIn(email: String, password: String): Result<AppUser> {
+        return when (val outcome = login(email, password)) {
+            is LoginOutcome.Authenticated -> Result.success(AppUser.fromDomainUser(outcome.user))
+            is LoginOutcome.AccountLocked -> Result.success(AppUser.fromDomainUser(outcome.user))
+            is LoginOutcome.ProfileIncomplete -> Result.failure(
+                IllegalStateException("Profile setup is incomplete (${outcome.reason}). Please complete your profile.")
+            )
+            is LoginOutcome.ProfileLoadFailed -> Result.failure(
+                IllegalStateException(outcome.error.message)
+            )
+            is LoginOutcome.Failure -> Result.failure(
+                IllegalStateException(outcome.error.message)
+            )
+        }
+    }
+
+    @Deprecated("Use restoreSession() or login() returning canonical User in new code")
     override suspend fun getUserRole(uid: String): Result<AppUser> {
-        return try {
-            val document = firestore.collection("users").document(uid).get().await()
-            val appUser = document.toObject(AppUser::class.java)
-                ?: throw Exception("User document not found")
-                
-            // Hard Ban Check
-            if (appUser.status == "BANNED" || appUser.deletedAt != null) {
-                auth.signOut()
-                throw Exception("Account has been permanently banned or deleted.")
-            }
-            
-            // Suspension Check
-            if (appUser.status == "SUSPENDED" && appUser.bannedUntil != null) {
-                val currentTime = System.currentTimeMillis()
-                if (currentTime < appUser.bannedUntil) {
-                    auth.signOut()
-                    val date = java.util.Date(appUser.bannedUntil)
-                    throw Exception("Account suspended until $date")
-                } else {
-                    // Suspension expired, auto-restore
-                    val restoredUser = appUser.copy(status = "RESTRICTED", bannedUntil = null)
-                    firestore.collection("users").document(uid).set(restoredUser).await()
-                    return Result.success(restoredUser)
+        val trimmedUid = uid.trim()
+        if (trimmedUid.isEmpty()) {
+            return Result.failure(IllegalArgumentException("User ID must not be blank."))
+        }
+
+        val fetchOutcome = fetchUserDocumentWithBoundedRetry(
+            uid = trimmedUid,
+            emailContext = ""
+        )
+        val docResult = when (fetchOutcome) {
+            is DocumentFetchOutcome.Success -> fetchOutcome.result
+            is DocumentFetchOutcome.Failure -> return Result.failure(
+                IllegalStateException(fetchOutcome.error.message)
+            )
+        }
+
+        return when (docResult) {
+            is RemoteDocumentResult.NotFound -> Result.failure(
+                IllegalStateException("User profile not found for UID $trimmedUid")
+            )
+            is RemoteDocumentResult.Found -> {
+                when (val inspected = UserMapper.inspectFirestoreMap(docResult.data, trimmedUid)) {
+                    is ProfileMappingResult.Valid -> Result.success(
+                        AppUser.fromDomainUser(inspected.user)
+                    )
+                    is ProfileMappingResult.Incomplete -> Result.failure(
+                        IllegalStateException("User profile is incomplete (${inspected.reason}).")
+                    )
+                    is ProfileMappingResult.Malformed -> Result.failure(
+                        IllegalStateException("User profile is malformed: ${inspected.reason}")
+                    )
                 }
             }
-            
-            // Sponsor Downgrade Check
-            if (appUser.role == "collector" && appUser.contractUntil != null && appUser.status == "ACTIVE") {
-                val currentTime = System.currentTimeMillis()
-                if (currentTime > appUser.contractUntil) {
-                    val downgradedUser = appUser.copy(status = "RESTRICTED")
-                    firestore.collection("users").document(uid).set(downgradedUser).await()
-                    return Result.success(downgradedUser)
-                }
-            }
-            
-            Result.success(appUser)
-        } catch (e: Exception) {
-            Result.failure(e)
         }
     }
 
-    override suspend fun signOut() {
-        auth.signOut()
+    @Deprecated("Use logout() in new code")
+    override fun signOut() {
+        remoteDataSource.signOut()
+        pendingRegistrationState = null
+        pendingLegacySignUp = null
+        _sessionState.value = SessionState.Unauthenticated
     }
 
     override fun isUserSignedIn(): Boolean {
-        return auth.currentUser != null
+        return remoteDataSource.getCurrentAuthUser() != null
     }
 
     override fun getCurrentUserId(): String? {
-        return auth.currentUser?.uid
+        return remoteDataSource.getCurrentAuthUser()?.uid
     }
 
+    @Deprecated("Use sendPasswordReset(email) in new code")
     override suspend fun sendPasswordResetEmail(email: String): Result<Unit> {
-        return try {
-            auth.sendPasswordResetEmail(email).await()
-            Result.success(Unit)
-        } catch (e: Exception) {
-            Result.failure(e)
+        return when (val outcome = sendPasswordReset(email)) {
+            is PasswordResetOutcome.ResetEmailDispatched -> Result.success(Unit)
+            is PasswordResetOutcome.Failure -> Result.failure(
+                IllegalStateException(outcome.error.message)
+            )
         }
     }
 
     override suspend fun deleteAccount(): Result<Unit> {
         return try {
-            val user = auth.currentUser ?: throw Exception("User not logged in")
-            val uid = user.uid
-            
-            // GDPR Export stub (just an audit log for now)
-            firestore.collection("audit_logs").add(
-                mapOf(
-                    "action" to "ACCOUNT_DELETED",
-                    "uid" to uid,
-                    "timestamp" to System.currentTimeMillis()
-                )
-            ).await()
-
-            // Delete Firestore document
-            firestore.collection("users").document(uid).delete().await()
-            
-            // Delete Firebase Auth user
-            user.delete().await()
+            // Note: firestore.rules denies client-side hard deletion of /users/{uid} audit records;
+            // deleteAccount only deletes the Firebase Auth credential and clears local state.
+            remoteDataSource.deleteCurrentAuthUser()
+            pendingRegistrationState = null
+            pendingLegacySignUp = null
+            _sessionState.value = SessionState.Unauthenticated
             Result.success(Unit)
-        } catch (e: Exception) {
-            Result.failure(e)
+        } catch (e: Throwable) {
+            val mapped = FirebaseErrorMapper.toAuthError(e)
+            Result.failure(IllegalStateException(mapped.message, e))
         }
     }
 }
