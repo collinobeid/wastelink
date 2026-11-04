@@ -348,8 +348,16 @@ class AuthStage4ComposeAndEmulatorTest {
         saveDeviceScreenshot("stage4_onboarding_screen.png")
         composeRule.onNodeWithTag(AuthTestTags.ONBOARD_ROLE_BADGE).assertIsDisplayed()
 
-        // Complete Stage 4 Resident onboarding -> reaches Resident Home
-        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_BTN_CONTINUE).performScrollTo().performClick()
+        // Select valid zone: Kinondoni Municipality
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_RES_ZONE_DROPDOWN)
+            .performScrollTo()
+            .performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Kinondoni Municipality").performClick()
+        composeRule.waitForIdle()
+
+        // Complete Resident onboarding -> reaches Resident Home
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_RES_BTN_FINISH).performScrollTo().performClick()
         composeRule.waitUntil(timeoutMillis = 10_000L) {
             composeRule.onAllNodesWithTag(TAG_RESIDENT_ENTRY).fetchSemanticsNodes().isNotEmpty()
         }
@@ -407,9 +415,78 @@ class AuthStage4ComposeAndEmulatorTest {
         composeRule.waitUntil(timeoutMillis = 15_000L) {
             composeRule.onAllNodesWithTag(AuthTestTags.ONBOARDING_SCREEN).fetchSemanticsNodes().isNotEmpty()
         }
-        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_BTN_CONTINUE).performScrollTo().performClick()
+        // Fill Collector KYC details
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_COL_VEHICLE_DROPDOWN)
+            .performScrollTo()
+            .performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Compactor Truck").performClick()
+        composeRule.waitForIdle()
 
-        composeRule.waitUntil(timeoutMillis = 10_000L) {
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_COL_INPUT_PLATE)
+            .performScrollTo()
+            .performTextInput("T 123 ABC")
+
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_COL_INPUT_LICENSE)
+            .performScrollTo()
+            .performTextInput("DL-12345678")
+
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_COL_ZONE_DROPDOWN)
+            .performScrollTo()
+            .performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Kinondoni Municipality").performClick()
+        composeRule.waitForIdle()
+
+        // Review step
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_COL_BTN_REVIEW)
+            .performScrollTo()
+            .performClick()
+        composeRule.waitForIdle()
+
+        // Submit KYC -> enters PENDING verification status
+        composeRule.onNodeWithTag(AuthTestTags.ONBOARD_COL_BTN_SUBMIT)
+            .performScrollTo()
+            .performClick()
+
+        composeRule.waitUntil(timeoutMillis = 15_000L) {
+            composeRule.onAllNodesWithTag(AuthTestTags.COL_STATUS_SCREEN).fetchSemanticsNodes().isNotEmpty()
+        }
+
+        // Simulate admin approval in Firestore via admin bypass for both /users and /collector_submissions
+        val collectorUid = firebaseAuth.currentUser?.uid ?: error("Expected collector UID")
+        seedFirestoreDocWithAdminBypass(
+            "users",
+            collectorUid,
+            mapOf(
+                "collectorVerificationStatus" to "APPROVED",
+                "onboardingStatus" to "COMPLETED",
+                "updatedAtEpochMs" to System.currentTimeMillis()
+            )
+        )
+        seedFirestoreDocWithAdminBypass(
+            "collector_submissions",
+            collectorUid,
+            mapOf(
+                "status" to "APPROVED"
+            )
+        )
+
+        // If refresh button is visible, tap it; otherwise proceed to open dashboard
+        val refreshBtn = composeRule.onAllNodesWithTag(AuthTestTags.COL_STATUS_BTN_REFRESH)
+        if (refreshBtn.fetchSemanticsNodes().isNotEmpty()) {
+            refreshBtn[0].performClick()
+        }
+
+        // Wait for transition to Collector Dashboard or click dashboard button if displayed
+        composeRule.waitUntil(timeoutMillis = 15_000L) {
+            val atDashboard = composeRule.onAllNodesWithTag(TAG_COLLECTOR_ENTRY).fetchSemanticsNodes().isNotEmpty()
+            if (!atDashboard) {
+                val dashboardBtn = composeRule.onAllNodesWithTag(AuthTestTags.COL_STATUS_BTN_DASHBOARD)
+                if (dashboardBtn.fetchSemanticsNodes().isNotEmpty()) {
+                    dashboardBtn[0].performClick()
+                }
+            }
             composeRule.onAllNodesWithTag(TAG_COLLECTOR_ENTRY).fetchSemanticsNodes().isNotEmpty()
         }
     }
@@ -552,8 +629,9 @@ class AuthStage4ComposeAndEmulatorTest {
             viewModel.navigationEvents.collect { event ->
                 when (event) {
                     is AuthNavigationEvent.NavigateToLogin -> {
-                        if (!event.prefillEmail.isNullOrBlank()) {
-                            viewModel.onLoginEmailChanged(event.prefillEmail)
+                        val prefill = event.prefillEmail
+                        if (!prefill.isNullOrBlank()) {
+                            viewModel.onLoginEmailChanged(prefill)
                         }
                         navController.navigate(Destinations.LOGIN) {
                             popUpTo(0) { inclusive = true }
@@ -686,8 +764,39 @@ class AuthStage4ComposeAndEmulatorTest {
             composable(Destinations.ONBOARDING) {
                 OnboardingScreen(
                     uiState = uiState,
+                    onResidentZoneChanged = viewModel::onResidentZoneChanged,
+                    onResidentAddressChanged = viewModel::onResidentAddressChanged,
+                    onCompleteResidentOnboarding = { viewModel.completeResidentOnboarding() },
+                    onCollectorVehicleTypeChanged = viewModel::onCollectorVehicleTypeChanged,
+                    onCollectorPlateNumberChanged = viewModel::onCollectorPlateNumberChanged,
+                    onCollectorLicenseNumberChanged = viewModel::onCollectorLicenseNumberChanged,
+                    onCollectorServiceZoneChanged = viewModel::onCollectorServiceZoneChanged,
+                    onCollectorReviewToggled = viewModel::onCollectorReviewToggled,
+                    onSubmitCollectorOnboarding = viewModel::submitCollectorOnboarding,
+                    onResubmitCollectorOnboarding = viewModel::resubmitCollectorOnboarding,
                     onCompleteOnboarding = {
                         viewModel.completeStage4Onboarding()
+                    },
+                    onLogoutClick = viewModel::logout
+                )
+            }
+
+            composable(Destinations.COLLECTOR_VERIFICATION_STATUS) {
+                CollectorVerificationStatusScreen(
+                    uiState = uiState,
+                    onRefreshStatus = viewModel::refreshCollectorVerificationStatus,
+                    onEditAndResubmit = viewModel::startCollectorEditAndResubmit,
+                    onNavigateToDashboard = {
+                        navController.navigate(Destinations.COLLECTOR_DASHBOARD) {
+                            popUpTo(0) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    },
+                    onNavigateToOnboarding = {
+                        navController.navigate(Destinations.ONBOARDING) {
+                            popUpTo(0) { inclusive = true }
+                            launchSingleTop = true
+                        }
                     },
                     onLogoutClick = viewModel::logout
                 )
@@ -789,8 +898,8 @@ class AuthStage4ComposeAndEmulatorTest {
         )
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "DELETE"
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         val code = conn.responseCode
         conn.disconnect()
@@ -803,8 +912,8 @@ class AuthStage4ComposeAndEmulatorTest {
         )
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "DELETE"
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         val code = conn.responseCode
         conn.disconnect()
@@ -817,8 +926,8 @@ class AuthStage4ComposeAndEmulatorTest {
         )
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         val body = conn.inputStream.bufferedReader().use { it.readText() }
         conn.disconnect()
@@ -833,5 +942,41 @@ class AuthStage4ComposeAndEmulatorTest {
             }
         }
         return null
+    }
+
+    private fun seedFirestoreDocWithAdminBypass(collectionPath: String, documentId: String, fields: Map<String, Any?>) {
+        val queryParams = if (fields.isNotEmpty()) {
+            "?" + fields.keys.joinToString("&") { "updateMask.fieldPaths=$it" }
+        } else ""
+        val url = URL(
+            "http://$emulatorHost:${FirebaseEmulatorConfig.DEFAULT_FIRESTORE_PORT}/v1/projects/$projectId/databases/(default)/documents/$collectionPath/$documentId$queryParams"
+        )
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "PATCH"
+            setRequestProperty("Authorization", "Bearer owner")
+            setRequestProperty("Content-Type", "application/json")
+            doOutput = true
+            connectTimeout = 15000
+            readTimeout = 15000
+        }
+        val jsonFields = JSONObject()
+        for ((key, value) in fields) {
+            val fieldVal = JSONObject()
+            when (value) {
+                null -> fieldVal.put("nullValue", JSONObject.NULL)
+                is String -> fieldVal.put("stringValue", value)
+                is Boolean -> fieldVal.put("booleanValue", value)
+                is Long -> fieldVal.put("integerValue", value.toString())
+                is Int -> fieldVal.put("integerValue", value.toString())
+                is Double -> fieldVal.put("doubleValue", value)
+                else -> fieldVal.put("stringValue", value.toString())
+            }
+            jsonFields.put(key, fieldVal)
+        }
+        val payload = JSONObject().put("fields", jsonFields).toString()
+        conn.outputStream.use { it.write(payload.toByteArray()) }
+        val code = conn.responseCode
+        conn.disconnect()
+        assertTrue("Admin bypass write to $collectionPath/$documentId failed with HTTP $code", code in 200..299)
     }
 }

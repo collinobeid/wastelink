@@ -998,8 +998,8 @@ class AuthStage6NavigationTest {
         val url = URL("http://$emulatorHost:${FirebaseEmulatorConfig.DEFAULT_AUTH_PORT}/emulator/v1/projects/$projectId/accounts")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "DELETE"
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         val code = conn.responseCode
         conn.disconnect()
@@ -1012,8 +1012,8 @@ class AuthStage6NavigationTest {
         )
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "DELETE"
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         val code = conn.responseCode
         conn.disconnect()
@@ -1029,8 +1029,8 @@ class AuthStage6NavigationTest {
             setRequestProperty("Authorization", "Bearer owner")
             setRequestProperty("Content-Type", "application/json")
             doOutput = true
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         val jsonFields = JSONObject()
         for ((key, value) in fields) {
@@ -1062,8 +1062,8 @@ class AuthStage6NavigationTest {
             setRequestProperty("Authorization", "Bearer owner")
             setRequestProperty("Content-Type", "application/json")
             doOutput = true
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         val payload = JSONObject().apply {
             put("localId", uid)
@@ -1081,8 +1081,8 @@ class AuthStage6NavigationTest {
         )
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         val body = conn.inputStream.bufferedReader().use { it.readText() }
         conn.disconnect()

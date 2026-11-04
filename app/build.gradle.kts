@@ -22,7 +22,19 @@ android {
     }
 
     buildTypes {
+        debug {
+            buildConfigField("String", "FIREBASE_ENV", "\"EMULATOR\"")
+            buildConfigField("String", "FIREBASE_PROJECT_ID", "\"wastelink-emulator\"")
+        }
+        create("staging") {
+            initWith(getByName("debug"))
+            buildConfigField("String", "FIREBASE_ENV", "\"STAGING\"")
+            buildConfigField("String", "FIREBASE_PROJECT_ID", "\"wastelink-4791b\"")
+            matchingFallbacks += listOf("debug")
+        }
         release {
+            buildConfigField("String", "FIREBASE_ENV", "\"PRODUCTION\"")
+            buildConfigField("String", "FIREBASE_PROJECT_ID", "\"wastelink-prod\"")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -36,6 +48,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
@@ -51,6 +64,15 @@ hilt {
 }
 
 dependencies {
+    // Modular project dependencies
+    implementation(project(":core:common"))
+    implementation(project(":core:domain"))
+    implementation(project(":core:data"))
+    implementation(project(":core:firebase"))
+    implementation(project(":core:design-system"))
+    implementation(project(":core:navigation"))
+    implementation(project(":feature:auth"))
+
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -77,21 +99,6 @@ dependencies {
     ksp(libs.hilt.compiler)
     annotationProcessor("org.jetbrains.kotlinx:kotlinx-metadata-jvm:0.9.0")
     implementation(libs.hilt.navigation.compose)
-    implementation(libs.hilt.work)
-    ksp(libs.hilt.compiler.android)
-    
-    // DataStore
-    implementation(libs.datastore.preferences)
-    
-    // Maps & Location
-    implementation(libs.play.services.location)
-    implementation(libs.maplibre.compose)
-    
-    // Room & WorkManager
-    implementation(libs.room.runtime)
-    implementation(libs.room.ktx)
-    ksp(libs.room.compiler)
-    implementation(libs.work.runtime.ktx)
     
     // Auth & Biometric
     implementation(libs.androidx.biometric)

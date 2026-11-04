@@ -5,12 +5,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.*
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -30,34 +25,14 @@ import com.waste.link.domain.model.AccountStatus
 import com.waste.link.domain.model.CollectorVerificationStatus
 import com.waste.link.domain.model.OnboardingStatus
 import com.waste.link.domain.model.UserRole
-import com.waste.link.ui.admin.AdminShellScreen
-import com.waste.link.ui.auth.AccountStatusLockScreen
-import com.waste.link.ui.auth.AuthNavigationEvent
-import com.waste.link.ui.auth.AuthPrimaryGreen
-import com.waste.link.ui.auth.AuthViewModel
-import com.waste.link.ui.auth.CollectorVerificationStatusScreen
-import com.waste.link.ui.auth.CompleteProfileScreen
-import com.waste.link.ui.auth.LoginScreen
-import com.waste.link.ui.auth.OnboardingScreen
-import com.waste.link.ui.auth.RegisterScreen
-import com.waste.link.ui.auth.VerifyEmailScreen
+import com.waste.link.ui.auth.*
+import com.waste.link.ui.navigation.Destinations
+import com.waste.link.ui.placeholders.AdminShellPlaceholder
+import com.waste.link.ui.placeholders.CollectorDashboardPlaceholder
+import com.waste.link.ui.placeholders.ResidentHomePlaceholder
 import com.waste.link.ui.theme.DarkBackground
 import com.waste.link.ui.theme.DarkMutedForeground
-
-object Destinations {
-    const val CHECK_AUTH = "check_auth"
-    const val LOGIN = "login"
-    const val REGISTER = "register"
-    const val VERIFY_EMAIL = "verify_email"
-    const val COMPLETE_PROFILE = "complete_profile"
-    const val ONBOARDING = "onboarding"
-    const val COLLECTOR_VERIFICATION_STATUS = "collector_verification_status"
-    const val ACCOUNT_STATUS_LOCK = "account_status_lock"
-    const val RESIDENT_HOME = "resident_home"
-    const val COLLECTOR_DASHBOARD = "collector_dashboard"
-    const val ADMIN_SHELL = "admin_shell"
-    const val SETTINGS = "settings"
-}
+import com.waste.link.ui.theme.EmeraldGreen
 
 @Composable
 fun WasteLinkNavGraph(
@@ -75,8 +50,9 @@ fun WasteLinkNavGraph(
         authViewModel.navigationEvents.collect { event ->
             when (event) {
                 is AuthNavigationEvent.NavigateToLogin -> {
-                    if (!event.prefillEmail.isNullOrBlank()) {
-                        authViewModel.onLoginEmailChanged(event.prefillEmail)
+                    val prefill = event.prefillEmail
+                    if (!prefill.isNullOrBlank()) {
+                        authViewModel.onLoginEmailChanged(prefill)
                     }
                     if (event.clearBackStack) {
                         navController.navigate(Destinations.LOGIN) {
@@ -173,7 +149,7 @@ fun WasteLinkNavGraph(
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     CircularProgressIndicator(
-                        color = AuthPrimaryGreen,
+                        color = EmeraldGreen,
                         modifier = Modifier.size(36.dp)
                     )
                     Spacer(modifier = Modifier.height(14.dp))
@@ -408,26 +384,11 @@ fun WasteLinkNavGraph(
                     }
                 }
             } else {
-                MainScreen(
-                    rootNavController = navController,
-                    onNewRequest = { /* Handled in Resident module */ },
-                    onNavigateToAdmin = {
-                        if (uiState.hasAdminClaim && uiState.currentUser?.role == UserRole.ADMIN) {
-                            navController.navigate(Destinations.ADMIN_SHELL)
-                        }
-                    }
+                ResidentHomePlaceholder(
+                    user = user,
+                    onLogout = authViewModel::logout
                 )
             }
-        }
-
-        composable(Destinations.SETTINGS) {
-            com.waste.link.ui.settings.SettingsScreen(
-                onNavigateBack = { navController.popBackStack() }
-            )
-        }
-
-        composable("resident_tracking") {
-            com.waste.link.ui.resident.ResidentTrackingScreen()
         }
 
         composable(Destinations.COLLECTOR_DASHBOARD) {
@@ -463,17 +424,11 @@ fun WasteLinkNavGraph(
                     }
                 }
             } else {
-                com.waste.link.ui.collector.CollectorShellScreen(
-                    rootNavController = navController,
-                    onAcceptMission = { navController.navigate("collector_mission") }
+                CollectorDashboardPlaceholder(
+                    user = user,
+                    onLogout = authViewModel::logout
                 )
             }
-        }
-
-        composable("collector_mission") {
-            com.waste.link.ui.collector.CollectorMissionScreen(
-                onFinishJob = { navController.popBackStack() }
-            )
         }
 
         composable(Destinations.ADMIN_SHELL) {
@@ -490,10 +445,9 @@ fun WasteLinkNavGraph(
                     }
                 }
             } else {
-                AdminShellScreen(
-                    onLogout = {
-                        authViewModel.logout()
-                    }
+                AdminShellPlaceholder(
+                    user = uiState.currentUser,
+                    onLogout = authViewModel::logout
                 )
             }
         }

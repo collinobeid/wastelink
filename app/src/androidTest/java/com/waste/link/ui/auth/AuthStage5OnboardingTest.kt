@@ -829,8 +829,8 @@ class AuthStage5OnboardingTest {
         )
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "DELETE"
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         val code = conn.responseCode
         conn.disconnect()
@@ -843,8 +843,8 @@ class AuthStage5OnboardingTest {
         )
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "DELETE"
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         val code = conn.responseCode
         conn.disconnect()
@@ -857,8 +857,8 @@ class AuthStage5OnboardingTest {
         )
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         val body = conn.inputStream.bufferedReader().use { it.readText() }
         conn.disconnect()
@@ -893,8 +893,8 @@ class AuthStage5OnboardingTest {
             setRequestProperty("Authorization", "Bearer owner")
             setRequestProperty("Content-Type", "application/json")
             doOutput = true
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         val jsonFields = JSONObject()
         for ((key, value) in fields) {
