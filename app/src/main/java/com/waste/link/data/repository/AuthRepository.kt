@@ -214,37 +214,44 @@ interface AuthRepository {
     ): ProfileUpdateOutcome
 
     // =========================================================================
-    // 8a. Collector Onboarding & Vetting Operations (Stage 5)
+    // 8a. Collector Onboarding & Vetting Compatibility Delegation (Stage 5.1 Decoupling)
+    // NOTE: Responsibilities have migrated to CollectorVerificationRepository.
+    // These methods provide temporary backward compatibility and delegate directly.
     // =========================================================================
 
     /**
      * Executes atomic WriteBatch for initial Collector KYC onboarding.
-     * Requires server-verified session, role == COLLECTOR, and status == NOT_SUBMITTED.
+     * Temporary delegation to [CollectorVerificationRepository.submitInitialVerification].
      */
+    @Deprecated("Migrate caller to CollectorVerificationRepository.submitInitialVerification directly.")
     suspend fun submitCollectorOnboarding(
         input: CollectorSubmissionInput
     ): CollectorSubmissionOutcome
 
     /**
      * Executes atomic WriteBatch for Collector KYC resubmission after rejection.
-     * Requires server-verified session, role == COLLECTOR, and status == REJECTED.
+     * Temporary delegation to [CollectorVerificationRepository.resubmitVerification].
      */
+    @Deprecated("Migrate caller to CollectorVerificationRepository.resubmitVerification directly.")
     suspend fun resubmitCollectorOnboarding(
         input: CollectorSubmissionInput
     ): CollectorSubmissionOutcome
 
     /**
      * Fetches current [CollectorSubmission] for [uid] from `/collector_submissions/{uid}`.
+     * Temporary delegation to [CollectorVerificationRepository.getSubmission].
      */
+    @Deprecated("Migrate caller to CollectorVerificationRepository.getSubmission directly.")
     suspend fun getCollectorSubmission(
         uid: String
     ): Result<CollectorSubmission?>
 
     /**
      * Test-only administrative helper to approve a collector's submission atomically.
-     * Requires custom claim admin == true on caller context.
+     * Temporary delegation to [CollectorVerificationRepository.adminApproveCollectorSubmission].
      */
     @VisibleForTesting
+    @Deprecated("Migrate caller to CollectorVerificationRepository.adminApproveCollectorSubmission directly.")
     suspend fun adminApproveCollectorSubmission(
         collectorUid: String,
         adminUid: String
@@ -252,9 +259,10 @@ interface AuthRepository {
 
     /**
      * Test-only administrative helper to reject a collector's submission atomically.
-     * Requires custom claim admin == true on caller context.
+     * Temporary delegation to [CollectorVerificationRepository.adminRejectCollectorSubmission].
      */
     @VisibleForTesting
+    @Deprecated("Migrate caller to CollectorVerificationRepository.adminRejectCollectorSubmission directly.")
     suspend fun adminRejectCollectorSubmission(
         collectorUid: String,
         adminUid: String,

@@ -27,6 +27,9 @@ import com.waste.link.domain.validation.AuthValidator
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -419,6 +422,118 @@ class CollectorVerificationRepositoryImplTest {
         assertNotNull(submission)
         assertEquals(CollectorVerificationStatus.REJECTED, submission!!.status)
         assertEquals("Vehicle plate photo is unreadable", submission.rejectionReason)
+    }
+
+    // =========================================================================
+    // 5. Concurrency & Re-entrancy Protection
+    // =========================================================================
+
+    @Test
+    fun `concurrent initial submissions serialize and prevent duplicate or conflicting submissions`() = runBlocking {
+        val uid = "collector_test_uid"
+        setupAuthenticatedCollector(uid = uid, isEmailVerified = true)
+
+        val input1 = CollectorSubmissionInput(
+            vehicleType = "Pickup Truck",
+            vehiclePlateNumber = "T 111 AAA",
+            licenseNumber = "DL-11111111",
+            serviceZoneId = "zone_kinondoni"
+        )
+        val input2 = CollectorSubmissionInput(
+            vehicleType = "Compactor Truck",
+            vehiclePlateNumber = "T 222 BBB",
+            licenseNumber = "DL-22222222",
+            serviceZoneId = "zone_ilala"
+        )
+
+        val results = coroutineScope {
+            val d1 = async { repository.submitInitialVerification(input1) }
+            val d2 = async { repository.submitInitialVerification(input2) }
+            awaitAll(d1, d2)
+        }
+
+        val successCount = results.count { it is CollectorSubmissionOutcome.Success }
+        val failureCount = results.count { it is CollectorSubmissionOutcome.Failure }
+
+        assertEquals("Exactly one concurrent submission must succeed", 1, successCount)
+        assertEquals("The competing concurrent submission must fail", 1, failureCount)
+
+        val failure = results.filterIsInstance<CollectorSubmissionOutcome.Failure>().first()
+        assertTrue(failure.error is AuthError.PermissionDenied)
+
+        // History must have exactly 1 record, never duplicated or overwritten
+        val history = repository.getSubmissionHistory(uid).getOrNull()
+        assertNotNull(history)
+        assertEquals(1, history!!.size)
+        assertEquals(1, history[0].submissionAttempt)
+    }
+
+    @Test
+    fun `concurrent resubmissions serialize and prevent duplicate history attempt reuse`() = runBlocking {
+        val uid = "collector_test_uid"
+        setupAuthenticatedCollector(uid = uid, isEmailVerified = true)
+
+        // 1. Initial submission
+        val input1 = CollectorSubmissionInput(
+            vehicleType = "Pickup Truck",
+            vehiclePlateNumber = "T 111 AAA",
+            licenseNumber = "DL-11111111",
+            serviceZoneId = "zone_kinondoni"
+        )
+        repository.submitInitialVerification(input1)
+
+        // 2. Admin rejects
+        fakeRemote.currentUser = RemoteAuthUser(
+            uid = "admin_uid_1",
+            email = "admin@wastelink.co.tz",
+            displayName = "Admin",
+            phoneNumber = null,
+            isEmailVerified = true,
+            hasAdminClaim = true
+        )
+        repository.adminRejectCollectorSubmission(uid, "admin_uid_1", "Invalid license copy")
+
+        // 3. Collector logs back in as REJECTED
+        setupAuthenticatedCollector(
+            uid = uid,
+            isEmailVerified = true,
+            verificationStatus = CollectorVerificationStatus.REJECTED,
+            onboardingStatus = OnboardingStatus.COMPLETED
+        )
+
+        // 4. Two concurrent resubmissions with different inputs
+        val resubmit1 = CollectorSubmissionInput(
+            vehicleType = "Pickup Truck",
+            vehiclePlateNumber = "T 111 AAA",
+            licenseNumber = "DL-33333333",
+            serviceZoneId = "zone_kinondoni"
+        )
+        val resubmit2 = CollectorSubmissionInput(
+            vehicleType = "Compactor Truck",
+            vehiclePlateNumber = "T 444 DDD",
+            licenseNumber = "DL-44444444",
+            serviceZoneId = "zone_temeke"
+        )
+
+        currentEpochMs += 60_000L
+        val results = coroutineScope {
+            val d1 = async { repository.resubmitVerification(resubmit1) }
+            val d2 = async { repository.resubmitVerification(resubmit2) }
+            awaitAll(d1, d2)
+        }
+
+        val successCount = results.count { it is CollectorSubmissionOutcome.Success }
+        val failureCount = results.count { it is CollectorSubmissionOutcome.Failure }
+
+        assertEquals("Exactly one resubmission must succeed", 1, successCount)
+        assertEquals("The competing resubmission must fail", 1, failureCount)
+
+        // History must have exactly 3 entries (initial, rejected, resubmitted), with attempt 2 used once
+        val history = repository.getSubmissionHistory(uid).getOrNull()
+        assertNotNull(history)
+        assertEquals(3, history!!.size)
+        assertEquals("RESUBMITTED", history[2].eventType)
+        assertEquals(2, history[2].submissionAttempt)
     }
 }
 
