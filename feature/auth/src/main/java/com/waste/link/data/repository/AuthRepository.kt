@@ -1,6 +1,7 @@
 package com.waste.link.data.repository
 
 import androidx.annotation.VisibleForTesting
+import com.waste.link.data.auth.SessionStateProvider
 import com.waste.link.data.models.AppUser
 import com.waste.link.domain.model.CollectorSubmission
 import com.waste.link.domain.model.CollectorSubmissionInput
@@ -34,14 +35,14 @@ import kotlinx.coroutines.flow.StateFlow
  * - Enumeration-safe password reset.
  * - Clean logout clearing in-memory draft and session state without deleting Firestore documents.
  */
-interface AuthRepository {
+interface AuthRepository : SessionStateProvider {
 
     // =========================================================================
     // 1. Canonical Stage 3 State & Inspection
     // =========================================================================
 
     /** Reactive stream of the current authoritative [SessionState]. */
-    val sessionState: StateFlow<SessionState>
+    override val sessionState: StateFlow<SessionState>
 
     /**
      * Returns the currently resolved canonical [User] ONLY when the session has been verified

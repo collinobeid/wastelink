@@ -35,11 +35,11 @@ interface LocalWasteRequestDao {
     suspend fun getRequestsBySyncStatus(clientUid: String, syncStatus: LocalSyncStatus): List<LocalWasteRequestRecord>
 
     @Query("""
-        UPDATE local_waste_requests 
-        SET syncStatus = :syncStatus, 
-            lastSyncAttemptEpochMs = :lastSyncAttemptEpochMs, 
-            syncErrorMessage = :errorMessage, 
-            retryCount = :retryCount 
+        UPDATE local_waste_requests
+        SET syncStatus = :syncStatus,
+            lastSyncAttemptEpochMs = :lastSyncAttemptEpochMs,
+            syncErrorMessage = :errorMessage,
+            retryCount = :retryCount
         WHERE id = :id AND clientUid = :clientUid
     """)
     suspend fun updateSyncStatus(
@@ -50,6 +50,33 @@ interface LocalWasteRequestDao {
         errorMessage: String?,
         retryCount: Int
     ): Int
+
+    @Query("""
+        UPDATE local_waste_requests
+        SET syncStatus = :syncStatus,
+            requestRef = :requestRef,
+            lastSyncAttemptEpochMs = :lastSyncAttemptEpochMs,
+            syncErrorMessage = NULL,
+            retryCount = :retryCount
+        WHERE id = :id AND clientUid = :clientUid
+    """)
+    suspend fun updateSyncSuccess(
+        id: String,
+        clientUid: String,
+        syncStatus: LocalSyncStatus,
+        requestRef: String,
+        lastSyncAttemptEpochMs: Long,
+        retryCount: Int
+    ): Int
+
+    @Query("""
+        UPDATE local_waste_requests
+        SET syncStatus = 'QUEUED_OFFLINE'
+        WHERE clientUid = :clientUid
+          AND syncStatus = 'UPLOADING'
+          AND lastSyncAttemptEpochMs < :staleThresholdEpochMs
+    """)
+    suspend fun recoverStaleUploadingRequests(clientUid: String, staleThresholdEpochMs: Long): Int
 
     @Update
     suspend fun updateRequest(record: LocalWasteRequestRecord): Int

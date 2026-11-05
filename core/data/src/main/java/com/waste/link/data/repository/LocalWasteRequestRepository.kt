@@ -107,6 +107,29 @@ interface LocalWasteRequestRepository {
     ): Boolean
 
     /**
+     * Updates record on successful synchronization with server-allocated [requestRef].
+     */
+    suspend fun updateSyncSuccess(
+        id: String,
+        clientUid: String,
+        requestRef: String,
+        attemptEpochMs: Long
+    ): Boolean
+
+    /**
+     * Recovers stale uploading requests by resetting their status to QUEUED_OFFLINE.
+     */
+    suspend fun recoverStaleUploadingRequests(
+        clientUid: String,
+        staleThresholdEpochMs: Long
+    ): Int
+
+    /**
+     * Retrieves all raw persistence records in [QUEUED_OFFLINE] state for the given [clientUid].
+     */
+    suspend fun getQueuedRecords(clientUid: String): List<LocalWasteRequestRecord>
+
+    /**
      * Deletes a local request owned by [clientUid].
      * Returns true if deleted, false otherwise.
      */

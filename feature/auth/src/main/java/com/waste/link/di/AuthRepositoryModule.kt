@@ -26,6 +26,12 @@ abstract class AuthRepositoryModule {
 
     @Binds
     @Singleton
+    abstract fun bindSessionStateProvider(
+        authRepositoryImpl: AuthRepositoryImpl
+    ): com.waste.link.data.auth.SessionStateProvider
+
+    @Binds
+    @Singleton
     abstract fun bindCollectorVerificationRepository(
         collectorVerificationRepositoryImpl: CollectorVerificationRepositoryImpl
     ): CollectorVerificationRepository

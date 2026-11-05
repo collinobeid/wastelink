@@ -97,6 +97,9 @@ dependencies {
     // Hilt
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
+    implementation(libs.hilt.work)
+    ksp(libs.hilt.compiler.android)
+    implementation(libs.work.runtime.ktx)
     annotationProcessor("org.jetbrains.kotlinx:kotlinx-metadata-jvm:0.9.0")
     implementation(libs.hilt.navigation.compose)
     

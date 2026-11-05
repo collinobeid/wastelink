@@ -137,6 +137,46 @@ class LocalWasteRequestRepositoryImpl @Inject constructor(
         return rowsUpdated > 0
     }
 
+    override suspend fun updateSyncSuccess(
+        id: String,
+        clientUid: String,
+        requestRef: String,
+        attemptEpochMs: Long
+    ): Boolean {
+        validateUid(clientUid)
+        require(id.isNotBlank()) { "Request ID must not be blank" }
+        require(requestRef.isNotBlank()) { "requestRef must not be blank" }
+
+        val rowsUpdated = requestDao.updateSyncSuccess(
+            id = id.trim(),
+            clientUid = clientUid.trim(),
+            syncStatus = LocalSyncStatus.SYNCED,
+            requestRef = requestRef.trim(),
+            lastSyncAttemptEpochMs = attemptEpochMs,
+            retryCount = 0
+        )
+        return rowsUpdated > 0
+    }
+
+    override suspend fun recoverStaleUploadingRequests(
+        clientUid: String,
+        staleThresholdEpochMs: Long
+    ): Int {
+        validateUid(clientUid)
+        return requestDao.recoverStaleUploadingRequests(
+            clientUid = clientUid.trim(),
+            staleThresholdEpochMs = staleThresholdEpochMs
+        )
+    }
+
+    override suspend fun getQueuedRecords(clientUid: String): List<LocalWasteRequestRecord> {
+        validateUid(clientUid)
+        return requestDao.getRequestsBySyncStatus(
+            clientUid = clientUid.trim(),
+            syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+        )
+    }
+
     override suspend fun deleteLocalRequest(id: String, clientUid: String): Boolean {
         validateUid(clientUid)
         require(id.isNotBlank()) { "Request ID must not be blank" }

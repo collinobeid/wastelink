@@ -8,6 +8,8 @@ import com.waste.link.data.local.dao.LocalWasteRequestDao
 import com.waste.link.data.local.dao.ResidentDraftDao
 import com.waste.link.data.repository.LocalWasteRequestRepository
 import com.waste.link.data.repository.LocalWasteRequestRepositoryImpl
+import com.waste.link.data.repository.WasteRequestRepositoryImpl
+import com.waste.link.domain.repository.WasteRequestRepository
 import dagger.Binds
 import dagger.Module
 import dagger.Provides
@@ -25,6 +27,12 @@ abstract class DatabaseBindingModule {
     abstract fun bindLocalWasteRequestRepository(
         impl: LocalWasteRequestRepositoryImpl
     ): LocalWasteRequestRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindWasteRequestRepository(
+        impl: WasteRequestRepositoryImpl
+    ): WasteRequestRepository
 }
 
 @Module

@@ -134,10 +134,10 @@ Target test directory: `core/data/src/test/java/com/waste/link/data/repository/`
 
 | Test ID | Test Scenario | Expected Outcome | Verification Command | Status |
 | :---: | :--- | :--- | :--- | :---: |
-| **IT-REP-01** | Create request online: writes to Firestore using deterministic `clientGeneratedId` and saves to Room. | Returns `Result.success(documentId)`; Room record status set to `SYNCED`. | `./gradlew :core:data:testDebugUnitTest` | PENDING |
-| **IT-REP-02** | Create request offline: network unavailable. | Saves to Room table `cached_waste_requests` as `QUEUED_OFFLINE`; enqueues `OfflineSyncWorker`. | `./gradlew :core:data:testDebugUnitTest` | PENDING |
-| **IT-REP-03** | WorkManager runs upon `NetworkType.CONNECTED`. | Syncs pending records to Firestore via idempotent `set(doc)`; updates local status to `SYNCED`. | `./gradlew :core:data:testDebugUnitTest` | PENDING |
-| **IT-REP-04** | Multi-User Logout Isolation: User A queues an offline request, then logs out. User B logs in. | `OfflineSyncWorker` detects `currentAuthUid != request.clientUid`; rejects sync under User B. | `./gradlew :core:data:testDebugUnitTest` | PENDING |
+| **IT-REP-01** | Create request online: writes to Firestore using deterministic `clientGeneratedId` and saves to Room. | Returns `Result.success(documentId)`; Room record status set to `SYNCED`. | `./gradlew :core:data:testDebugUnitTest` | **PASSED (Phase 1C)** |
+| **IT-REP-02** | Create request offline: network unavailable. | Saves to Room table `cached_waste_requests` as `QUEUED_OFFLINE`; enqueues `OfflineSyncWorker`. | `./gradlew :core:data:testDebugUnitTest` | **PASSED (Phase 1C)** |
+| **IT-REP-03** | WorkManager runs upon `NetworkType.CONNECTED`. | Syncs pending records to Firestore via idempotent `set(doc)`; updates local status to `SYNCED`. | `./gradlew :core:data:testDebugUnitTest` | **PASSED (Phase 1C)** |
+| **IT-REP-04** | Multi-User Logout Isolation: User A queues an offline request, then logs out. User B logs in. | `OfflineSyncWorker` detects `currentAuthUid != request.clientUid`; rejects sync under User B. | `./gradlew :core:data:testDebugUnitTest` | **PASSED (Phase 1C)** |
 | **IT-REP-05** | Stream user requests via `getUserRequests(uid)`. | Emits list ordered by `createdAt DESC`; updates dynamically on Firestore snapshots. | `./gradlew :core:data:testDebugUnitTest` | PENDING |
 | **IT-REP-06** | Stream single request via `watchRequest(id)`. | Emits live updates when collector updates status (`EN_ROUTE`, `ARRIVED`). | `./gradlew :core:data:testDebugUnitTest` | PENDING |
 | **IT-REP-07** | Fetch categories from `/waste_categories`. | Returns Firestore documents mapped to `DynamicWasteCategory`; caches locally for offline use. | `./gradlew :core:data:testDebugUnitTest` | PENDING |
@@ -167,6 +167,28 @@ Target test directory: `core/data/src/test/java/com/waste/link/data/`
 | **P1B-16** | Migration | Existing data survives the introduced migration (v1 -> v2) | `WasteLinkMigrationTest` | **PASSED** |
 | **P1B-17** | Empty UID | Blank or missing UID fails safely | `LocalWasteRequestRepositoryTest` | **PASSED** |
 | **P1B-18** | Mapping | Supported domain fields round-trip without silent loss | `WasteRequestLocalMapperTest` | **PASSED** |
+
+### 5.2 Phase 1C Remote Synchronization & Repository Integration Acceptance Matrix
+
+Target test directories: `:core:firebase`, `:core:data`
+
+| ID | Required Behavior | Test Strategy | Verification Target | Status |
+| :---: | :--- | :--- | :--- | :---: |
+| **AC-01** | Authenticated resident syncs eligible request | Execute sync with server-verified session; verify Room transitions to `SYNCED`. | `WasteRequestSyncOrchestratorTest` | **PASSED** |
+| **AC-02** | Unauthenticated user cannot sync requests | Attempt sync with `SessionState.Unauthenticated`; verify sync halts with `AuthUnavailable`. | `WasteRequestSyncOrchestratorTest` | **PASSED** |
+| **AC-03** | User A's requests cannot be uploaded under User B | Attempt to sync User A request with User B session; verify rejection with zero remote writes. | `WasteRequestSyncOrchestratorTest` | **PASSED** |
+| **AC-04** | Repeated retries do not duplicate remote requests | Simulate retry on same request; verify idempotent reconciliation via `AlreadyExists`. | `FirestoreWasteRequestRemoteDataSourceTest` | **PASSED** |
+| **AC-05** | Server rejection does not produce false success | Simulate Firestore `PERMISSION_DENIED`; verify Room transitions to `SYNC_FAILED`, not `SYNCED`. | `WasteRequestSyncOrchestratorTest` | **PASSED** |
+| **AC-06** | Network failure preserves request locally | Simulate network disconnect during sync; verify request remains in Room with `SYNC_FAILED` and retry scheduled. | `WasteRequestSyncOrchestratorTest` | **PASSED** |
+| **AC-07** | Interrupted upload recovers safely after restart | Mark record as `UPLOADING` with stale timestamp; run recovery; verify reset to `QUEUED_OFFLINE`. | `WasteRequestSyncOrchestratorTest` | **PASSED** |
+| **AC-08** | Concurrent sync attempts do not duplicate | Launch 5 concurrent coroutines synchronizing same request; verify exactly one remote write executed. | `WasteRequestMultiUserAndWorkerTest` | **PASSED** |
+| **AC-09** | Account switching cannot leak queued requests | User A queues requests; user logs out; User B logs in; verify User B sync touches 0 User A records. | `WasteRequestMultiUserAndWorkerTest` | **PASSED** |
+| **AC-10** | Legacy unmapped records remain excluded | Load migrated record with `legacy_unmapped_zone`; run sync; verify record is skipped and quarantined. | `WasteRequestSyncOrchestratorTest` | **PASSED** |
+| **AC-11** | Invalid categories & service zones rejected | Submit request with unmapped zone; verify rejection without corrupting local DB. | `FirestoreWasteRequestRemoteDataSourceTest` | **PASSED** |
+| **AC-12** | Server-generated references and timestamps persisted | On 200 OK from server, verify canonical `requestRef` and `createdAt` are saved to Room. | `WasteRequestSyncOrchestratorTest` | **PASSED** |
+| **AC-13** | Retry limits and backoff behave as specified | Force repeated network failures; verify backoff timing and termination after 3 attempts. | `WasteRequestSyncOrchestratorTest` | **PASSED** |
+| **AC-14** | Phase 1A and 1B regression tests continue passing | Run `./gradlew :core:domain:testDebugUnitTest :core:data:testDebugUnitTest`. | Gradle Test Runner | **PASSED** |
+| **AC-15** | Application builds successfully | Run `./gradlew :app:assembleDebug`. | Gradle Build | **PASSED** |
 
 ---
 

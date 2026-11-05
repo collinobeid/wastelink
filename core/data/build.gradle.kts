@@ -48,6 +48,10 @@ dependencies {
     implementation(libs.room.ktx)
     ksp(libs.room.compiler)
 
+    implementation(libs.work.runtime.ktx)
+    implementation(libs.hilt.work)
+    ksp(libs.hilt.compiler.android)
+
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
 
