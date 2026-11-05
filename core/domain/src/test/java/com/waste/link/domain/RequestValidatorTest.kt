@@ -65,22 +65,53 @@ class RequestValidatorTest {
     // Outside all zones (Dodoma): (-6.1630, 35.7516)
     private val outsideCoords = GeoCoordinates(latitude = -6.1630, longitude = 35.7516)
 
-    private fun createMockWebP(totalBytes: Int): String {
-        require(totalBytes >= 12)
+    // Genuine 1x1 Lossy WebP (68 bytes, libwebp generated)
+    private val genuine1x1LossyWebpBase64 =
+        "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoBAAEAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA="
+
+    // Genuine 1x1 Lossless WebP (36 bytes, libwebp generated)
+    private val genuine1x1LosslessWebpBase64 =
+        "UklGRhwAAABXRUJQVlA4TA8AAAAvAAAAAAdQwIj+ByKi/wEA"
+
+    /**
+     * Constructs a structurally valid VP8 WebP with exact byte size [totalBytes].
+     */
+    private fun createValidStructuralWebP(totalBytes: Int): String {
+        require(totalBytes >= 26) { "Valid VP8 WebP requires at least 26 bytes" }
         val arr = ByteArray(totalBytes)
+        // RIFF header: 'R', 'I', 'F', 'F'
         arr[0] = 'R'.code.toByte()
         arr[1] = 'I'.code.toByte()
         arr[2] = 'F'.code.toByte()
         arr[3] = 'F'.code.toByte()
-        val size = totalBytes - 8
-        arr[4] = (size and 0xFF).toByte()
-        arr[5] = ((size shr 8) and 0xFF).toByte()
-        arr[6] = ((size shr 16) and 0xFF).toByte()
-        arr[7] = ((size shr 24) and 0xFF).toByte()
+        val riffSize = totalBytes - 8
+        arr[4] = (riffSize and 0xFF).toByte()
+        arr[5] = ((riffSize shr 8) and 0xFF).toByte()
+        arr[6] = ((riffSize shr 16) and 0xFF).toByte()
+        arr[7] = ((riffSize shr 24) and 0xFF).toByte()
+        // WEBP FourCC
         arr[8] = 'W'.code.toByte()
         arr[9] = 'E'.code.toByte()
         arr[10] = 'B'.code.toByte()
         arr[11] = 'P'.code.toByte()
+        // VP8 Chunk FourCC
+        arr[12] = 'V'.code.toByte()
+        arr[13] = 'P'.code.toByte()
+        arr[14] = '8'.code.toByte()
+        arr[15] = ' '.code.toByte()
+        val chunkSize = totalBytes - 20
+        arr[16] = (chunkSize and 0xFF).toByte()
+        arr[17] = ((chunkSize shr 8) and 0xFF).toByte()
+        arr[18] = ((chunkSize shr 16) and 0xFF).toByte()
+        arr[19] = ((chunkSize shr 24) and 0xFF).toByte()
+        // VP8 frame tag
+        arr[20] = 0xD0.toByte()
+        arr[21] = 0x01.toByte()
+        arr[22] = 0x00.toByte()
+        // VP8 keyframe start code: 0x9D, 0x01, 0x2A
+        arr[23] = 0x9D.toByte()
+        arr[24] = 0x01.toByte()
+        arr[25] = 0x2A.toByte()
         return Base64.getEncoder().encodeToString(arr)
     }
 
@@ -101,60 +132,62 @@ class RequestValidatorTest {
 
     // Step 2: Location and Service Zone Tests
     @Test
-    fun step2Location_correctZoneAndCoordinates_succeeds() {
+    fun step2Location_validCoordinatesInsideSelectedZone_succeeds() {
         val errors = RequestValidator.validateLocation(
             coordinates = kinondoniCoords,
             selectedZoneId = "zone_kinondoni_01",
-            pickupAddress = "Plot 42, Ali Hassan Rd",
+            pickupAddress = "Plot 42, Ali Hassan Mwinyi Rd",
             availableZones = availableZones
         )
         assertTrue(errors.isEmpty())
     }
 
     @Test
-    fun step2Location_correctZoneButOutsideBoundary_returnsError() {
+    fun step2Location_coordinatesInsideZoneAButZoneBSelected_failsValidation() {
+        val errors = RequestValidator.validateLocation(
+            coordinates = kinondoniCoords, // inside Kinondoni
+            selectedZoneId = "zone_ilala_02", // but Ilala is selected!
+            pickupAddress = "Plot 42, Ali Hassan Mwinyi Rd",
+            availableZones = availableZones
+        )
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("fall outside selected service zone 'Ilala Municipal'"))
+    }
+
+    @Test
+    fun step2Location_coordinatesOutsideAllZones_returnsError() {
         val errors = RequestValidator.validateLocation(
             coordinates = outsideCoords,
             selectedZoneId = "zone_kinondoni_01",
-            pickupAddress = "Plot 42, Ali Hassan Rd",
+            pickupAddress = "Plot 42, Dodoma Central",
             availableZones = availableZones
         )
-        assertTrue(errors.any { it.contains("fall outside selected service zone") })
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("fall outside selected service zone"))
     }
 
     @Test
-    fun step2Location_coordinatesInsideZoneAWhileZoneBSelected_returnsError() {
-        // kinondoniCoords are inside Kinondoni, but Ilala zone is selected
+    fun step2Location_unknownServiceZone_returnsError() {
         val errors = RequestValidator.validateLocation(
             coordinates = kinondoniCoords,
-            selectedZoneId = "zone_ilala_02",
+            selectedZoneId = "zone_unknown_99",
             pickupAddress = "Plot 42, Ali Hassan Rd",
             availableZones = availableZones
         )
-        assertTrue(errors.any { it.contains("fall outside selected service zone") })
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("does not exist in the municipal catalog"))
     }
 
     @Test
-    fun step2Location_unknownZoneId_returnsError() {
+    fun step2Location_inactiveServiceZone_returnsError() {
         val errors = RequestValidator.validateLocation(
-            coordinates = kinondoniCoords,
-            selectedZoneId = "non_existent_zone_999",
-            pickupAddress = "Plot 42, Ali Hassan Rd",
-            availableZones = availableZones
-        )
-        assertTrue(errors.any { it.contains("does not exist in the municipal catalog") })
-    }
-
-    @Test
-    fun step2Location_inactiveZone_returnsError() {
-        val temekeCoords = GeoCoordinates(latitude = -6.9200, longitude = 39.2500)
-        val errors = RequestValidator.validateLocation(
-            coordinates = temekeCoords,
+            coordinates = GeoCoordinates(latitude = -6.9200, longitude = 39.2500),
             selectedZoneId = "zone_temeke_inactive",
-            pickupAddress = "Plot 42, Ali Hassan Rd",
+            pickupAddress = "Plot 10, Temeke Industrial Area",
             availableZones = availableZones
         )
-        assertTrue(errors.any { it.contains("is currently inactive") })
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("is currently inactive"))
     }
 
     @Test
@@ -163,7 +196,7 @@ class RequestValidatorTest {
             coordinates = kinondoniCoords,
             selectedZoneId = "zone_kinondoni_01",
             pickupAddress = "Plot 42, Ali Hassan Rd",
-            availableZones = emptyList() // No zones loaded
+            availableZones = emptyList()
         )
         assertTrue(errors.any { it.contains("does not exist in the municipal catalog") })
     }
@@ -198,42 +231,121 @@ class RequestValidatorTest {
         assertTrue(ok.isEmpty())
     }
 
-    // Gate Photo Validation Tests
+    // Gate Photo Validation: Genuine WebP Tests
     @Test
-    fun gatePhoto_validWebpBelowLimit_succeeds() {
-        val webpUnder50Kb = createMockWebP(1024) // 1 KB
-        val errors = RequestValidator.validateGatePhoto(webpUnder50Kb)
+    fun gatePhoto_genuine1x1LossyWebp_succeeds() {
+        val errors = RequestValidator.validateGatePhoto(genuine1x1LossyWebpBase64)
         assertTrue(errors.isEmpty())
     }
 
     @Test
-    fun gatePhoto_validWebpExactlyAt50KbLimit_succeeds() {
-        val webpExact50Kb = createMockWebP(50 * 1024) // 51,200 bytes
-        val errors = RequestValidator.validateGatePhoto(webpExact50Kb)
+    fun gatePhoto_genuine1x1LosslessWebp_succeeds() {
+        val errors = RequestValidator.validateGatePhoto(genuine1x1LosslessWebpBase64)
+        assertTrue(errors.isEmpty())
+    }
+
+    // Gate Photo Validation: Strict 50 KB Boundary Tests
+    @Test
+    fun gatePhoto_strict50KbBoundary_immediatelyBelowLimit_succeeds() {
+        // 50 * 1024 - 1 = 51,199 bytes (< 50 KB limit)
+        val webpUnderLimit = createValidStructuralWebP(50 * 1024 - 1)
+        val errors = RequestValidator.validateGatePhoto(webpUnderLimit)
         assertTrue(errors.isEmpty())
     }
 
     @Test
-    fun gatePhoto_validWebpAbove50KbLimit_returnsError() {
-        val webpOversized = createMockWebP(50 * 1024 + 1) // 51,201 bytes
-        val errors = RequestValidator.validateGatePhoto(webpOversized)
+    fun gatePhoto_strict50KbBoundary_exactlyAt50KbLimit_isRejected() {
+        // Exactly 50 * 1024 = 51,200 bytes (NOT smaller than 50 KB)
+        val webpExactLimit = createValidStructuralWebP(50 * 1024)
+        val errors = RequestValidator.validateGatePhoto(webpExactLimit)
         assertEquals(1, errors.size)
-        assertTrue(errors[0].contains("exceeds maximum allowed size of 50 KB"))
+        assertTrue(errors[0].contains("must be strictly smaller than 50 KB"))
     }
 
     @Test
-    fun gatePhoto_invalidOrUnsupportedFormat_returnsError() {
-        // JPEG magic header: FF D8 FF E0
-        val fakeJpeg = ByteArray(500) { 0.toByte() }
+    fun gatePhoto_strict50KbBoundary_immediatelyAbove50KbLimit_isRejected() {
+        // 50 * 1024 + 1 = 51,201 bytes (> 50 KB limit)
+        val webpOverLimit = createValidStructuralWebP(50 * 1024 + 1)
+        val errors = RequestValidator.validateGatePhoto(webpOverLimit)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("must be strictly smaller than 50 KB"))
+    }
+
+    // Gate Photo Validation: Structural Corruption & Truncation Tests
+    @Test
+    fun gatePhoto_corruptedVp8StartCode_returnsError() {
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LossyWebpBase64)
+        // Corrupt VP8 keyframe start code at byte 23
+        rawBytes[23] = 0x00.toByte()
+        val corruptedBase64 = Base64.getEncoder().encodeToString(rawBytes)
+
+        val errors = RequestValidator.validateGatePhoto(corruptedBase64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("corrupted VP8 stream"))
+    }
+
+    @Test
+    fun gatePhoto_corruptedVp8lSignature_returnsError() {
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LosslessWebpBase64)
+        // Corrupt VP8L signature at byte 20 (was 0x2F)
+        rawBytes[20] = 0x00.toByte()
+        val corruptedBase64 = Base64.getEncoder().encodeToString(rawBytes)
+
+        val errors = RequestValidator.validateGatePhoto(corruptedBase64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("corrupted VP8L stream"))
+    }
+
+    @Test
+    fun gatePhoto_truncatedWebpPayload_returnsError() {
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LossyWebpBase64)
+        // Truncate to 30 bytes when declared RIFF size is 60 (total 68 bytes)
+        val truncatedBytes = rawBytes.copyOf(30)
+        val truncatedBase64 = Base64.getEncoder().encodeToString(truncatedBytes)
+
+        val errors = RequestValidator.validateGatePhoto(truncatedBase64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("truncated"))
+    }
+
+    @Test
+    fun gatePhoto_invalidOrUnsupportedFormats_returnsError() {
+        // Fake JPEG (magic header FF D8 FF E0)
+        val fakeJpeg = ByteArray(100) { 0.toByte() }
         fakeJpeg[0] = 0xFF.toByte()
         fakeJpeg[1] = 0xD8.toByte()
         fakeJpeg[2] = 0xFF.toByte()
         fakeJpeg[3] = 0xE0.toByte()
         val jpegBase64 = Base64.getEncoder().encodeToString(fakeJpeg)
+        val errJpeg = RequestValidator.validateGatePhoto(jpegBase64)
+        assertEquals(1, errJpeg.size)
+        assertTrue(errJpeg[0].contains("must be in compressed WebP format"))
 
-        val errors = RequestValidator.validateGatePhoto(jpegBase64)
-        assertEquals(1, errors.size)
-        assertTrue(errors[0].contains("must be in compressed WebP format"))
+        // Fake PNG (magic header 89 50 4E 47)
+        val fakePng = ByteArray(100) { 0.toByte() }
+        fakePng[0] = 0x89.toByte()
+        fakePng[1] = 0x50.toByte()
+        fakePng[2] = 0x4E.toByte()
+        fakePng[3] = 0x47.toByte()
+        val pngBase64 = Base64.getEncoder().encodeToString(fakePng)
+        val errPng = RequestValidator.validateGatePhoto(pngBase64)
+        assertEquals(1, errPng.size)
+        assertTrue(errPng[0].contains("must be in compressed WebP format"))
+
+        // RIFF container with WAVE instead of WEBP
+        val fakeWave = ByteArray(100) { 0.toByte() }
+        fakeWave[0] = 'R'.code.toByte()
+        fakeWave[1] = 'I'.code.toByte()
+        fakeWave[2] = 'F'.code.toByte()
+        fakeWave[3] = 'F'.code.toByte()
+        fakeWave[8] = 'W'.code.toByte()
+        fakeWave[9] = 'A'.code.toByte()
+        fakeWave[10] = 'V'.code.toByte()
+        fakeWave[11] = 'E'.code.toByte()
+        val waveBase64 = Base64.getEncoder().encodeToString(fakeWave)
+        val errWave = RequestValidator.validateGatePhoto(waveBase64)
+        assertEquals(1, errWave.size)
+        assertTrue(errWave[0].contains("must be in compressed WebP format"))
     }
 
     @Test
@@ -261,7 +373,7 @@ class RequestValidatorTest {
             volumeTier = VolumeTier.STANDARD_BIN,
             availableZones = availableZones,
             notes = "Ring bell",
-            gatePhotoBase64 = createMockWebP(2048)
+            gatePhotoBase64 = genuine1x1LossyWebpBase64
         )
 
         assertThrows(RequestValidationException::class.java) {

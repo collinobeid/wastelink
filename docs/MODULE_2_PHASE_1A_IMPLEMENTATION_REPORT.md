@@ -62,19 +62,19 @@ com.waste.link.domain.AuthValidatorTest > 15 tests passed
 com.waste.link.domain.GeoCoordinatesTest > 5 tests passed
 com.waste.link.domain.WasteCategoryTest > 7 tests passed
 com.waste.link.domain.VolumeTierTest > 4 tests passed
-com.waste.link.domain.ServiceZoneTest > 7 tests passed
+com.waste.link.domain.ServiceZoneTest > 11 tests passed
 com.waste.link.domain.RequestRefSpecificationTest > 5 tests passed
 com.waste.link.domain.WasteRequestDomainTest > 9 tests passed
 com.waste.link.domain.RequestStateTransitionValidatorTest > 26 tests passed
-com.waste.link.domain.RequestValidatorTest > 16 tests passed
+com.waste.link.domain.RequestValidatorTest > 21 tests passed
 
-BUILD SUCCESSFUL in 9s
-Tests run: 94, Failures: 0, Ignored: 0, Success rate: 100%
+BUILD SUCCESSFUL in 30s
+Tests run: 103, Failures: 0, Ignored: 0, Success rate: 100%
 ```
 
 - **Module 1 Domain Tests:** 15 tests (`AuthValidatorTest`)
-- **Module 2 Domain Tests:** 79 tests (`GeoCoordinatesTest` (5), `WasteCategoryTest` (7), `VolumeTierTest` (4), `ServiceZoneTest` (7), `RequestRefSpecificationTest` (5), `WasteRequestDomainTest` (9), `RequestStateTransitionValidatorTest` (26), `RequestValidatorTest` (16))
-- **Total Domain Tests:** 94 tests, all passing.
+- **Module 2 Domain Tests:** 88 tests (`GeoCoordinatesTest` (5), `WasteCategoryTest` (7), `VolumeTierTest` (4), `ServiceZoneTest` (11), `RequestRefSpecificationTest` (5), `WasteRequestDomainTest` (9), `RequestStateTransitionValidatorTest` (26), `RequestValidatorTest` (21))
+- **Total Domain Tests:** 103 tests, all passing.
 
 ### 3.2 Traceability to Layer 1 Checklist (UT-DOM-01 through UT-DOM-18)
 
@@ -102,7 +102,12 @@ Tests run: 94, Failures: 0, Ignored: 0, Success rate: 100%
 ### 3.3 Project-Wide Regression Test
 
 Command: `.\gradlew.bat testDebugUnitTest`  
-Result: **BUILD SUCCESSFUL in 14s** across 165 actionable Gradle tasks. Total 212 unit tests executed across all modules with 0 failures, 0 errors.
+Result: **BUILD SUCCESSFUL in 29s** across 165 actionable Gradle tasks. Total **221 unit tests** executed across all Gradle modules with 0 failures, 0 errors, 0 skipped:
+- `:core:domain`: 103 tests
+- `:feature:auth`: 98 tests
+- `:core:data`: 13 tests
+- `:core:firebase`: 6 tests
+- `:app`: 1 test
 
 ---
 

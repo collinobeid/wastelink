@@ -43,6 +43,24 @@ class ServiceZoneTest {
         isActive = false
     )
 
+    // Triangular polygon zone inside bounding box [-6.80, -6.70] x [39.20, 39.30]
+    // Vertices form a triangle: (-6.70, 39.20), (-6.70, 39.30), (-6.80, 39.20)
+    private val polygonVertices = listOf(
+        GeoCoordinates(latitude = -6.70, longitude = 39.20),
+        GeoCoordinates(latitude = -6.70, longitude = 39.30),
+        GeoCoordinates(latitude = -6.80, longitude = 39.20)
+    )
+    private val activePolygonZone = ServiceZone(
+        zoneId = "zone_polygon_01",
+        name = "Precision Triangular Ward",
+        minLat = -6.80,
+        maxLat = -6.70,
+        minLng = 39.20,
+        maxLng = 39.30,
+        polygonVertices = polygonVertices,
+        isActive = true
+    )
+
     private val kinondoniCoords = GeoCoordinates(latitude = -6.7924, longitude = 39.2083)
     private val outsideCoords = GeoCoordinates(latitude = -6.1630, longitude = 35.7516)
 
@@ -75,6 +93,50 @@ class ServiceZoneTest {
     }
 
     @Test
+    fun boundaryEdgePoints_areContainedInBoundingBox() {
+        // Inclusive bounds check: minLat, maxLat, minLng, maxLng edges must be contained
+        val minEdge = GeoCoordinates(latitude = -6.8200, longitude = 39.1800)
+        val maxEdge = GeoCoordinates(latitude = -6.7500, longitude = 39.2600)
+        assertTrue(activeZoneKinondoni.contains(minEdge))
+        assertTrue(activeZoneKinondoni.contains(maxEdge))
+    }
+
+    @Test
+    fun polygonZone_pointInsidePolygon_returnsTrue() {
+        // Point inside the triangle: (-6.72, 39.22)
+        val insidePoint = GeoCoordinates(latitude = -6.72, longitude = 39.22)
+        assertTrue(activePolygonZone.contains(insidePoint))
+        assertTrue(activePolygonZone.containsGeographically(insidePoint))
+    }
+
+    @Test
+    fun polygonZone_pointInsideBoundingBoxButOutsidePolygon_returnsFalse() {
+        // Point in upper-right half of bounding box: (-6.72, 39.29)
+        // Inside [-6.80, -6.70] x [39.20, 39.30], but outside the triangle!
+        val outsidePoint = GeoCoordinates(latitude = -6.72, longitude = 39.29)
+        assertFalse(activePolygonZone.contains(outsidePoint))
+        assertFalse(activePolygonZone.containsGeographically(outsidePoint))
+    }
+
+    @Test
+    fun polygonVertices_lessThanThree_throwsIllegalArgumentException() {
+        assertThrows(IllegalArgumentException::class.java) {
+            ServiceZone(
+                zoneId = "zone_invalid_poly",
+                name = "Invalid Poly",
+                minLat = -6.80,
+                maxLat = -6.70,
+                minLng = 39.20,
+                maxLng = 39.30,
+                polygonVertices = listOf(
+                    GeoCoordinates(latitude = -6.70, longitude = 39.20),
+                    GeoCoordinates(latitude = -6.70, longitude = 39.30)
+                ) // only 2 vertices
+            )
+        }
+    }
+
+    @Test
     fun findActiveZone_succeedsForCoveredCoordinates() {
         val zone = findActiveZoneForCoordinates(kinondoniCoords, listOf(activeZoneKinondoni, activeZoneIlala))
         assertEquals("zone_kinondoni_01", zone.zoneId)
@@ -99,10 +161,10 @@ class ServiceZoneTest {
             ServiceZone(
                 zoneId = "invalid_lat",
                 name = "Invalid Lat",
-                minLat = -6.5000,
-                maxLat = -6.8000, // min > max
-                minLng = 39.0,
-                maxLng = 40.0
+                minLat = -6.7000,
+                maxLat = -6.8000, // minLat > maxLat
+                minLng = 39.2000,
+                maxLng = 39.3000
             )
         }
     }
