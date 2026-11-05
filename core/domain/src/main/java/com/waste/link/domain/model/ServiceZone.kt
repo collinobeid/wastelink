@@ -16,7 +16,7 @@ package com.waste.link.domain.model
  * - When [polygonVertices] is empty, containment evaluates strictly against this bounding box approximation.
  *   This MUST NOT be claimed as exact municipal ward/polygon boundary validation in reports or documentation.
  * - When [polygonVertices] is supplied (at least 3 WGS 84 vertices forming a sequential boundary):
- *     1. Invariant: Every polygon vertex must fall strictly within the declared bounding box [minLat..maxLat] and [minLng..maxLng].
+ *     1. Invariant: Every polygon vertex must fall within or on the bounding-box limits ([minLat..maxLat] and [minLng..maxLng]).
  *     2. Boundary-Inclusive Policy: Containment is strictly boundary-inclusive. Points lying directly on a polygon
  *        vertex or along a polygon boundary edge are considered INSIDE for service-zone eligibility.
  *     3. Interior Containment: Points within the polygon interior are verified using the pure Kotlin Ray-Casting

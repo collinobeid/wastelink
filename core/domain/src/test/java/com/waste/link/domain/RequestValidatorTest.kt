@@ -210,6 +210,42 @@ class RequestValidatorTest {
         return Base64.getEncoder().encodeToString(arr)
     }
 
+    private fun createVp8xTruncatedSubsequentChunkPayload(): String {
+        // RIFF (12) + VP8X (18) + VP8 header (8) + partial payload (6 bytes) = 44 bytes
+        // But VP8 header declares 48 bytes!
+        val totalBytes = 44
+        val arr = ByteArray(totalBytes)
+        // RIFF
+        arr[0] = 'R'.code.toByte()
+        arr[1] = 'I'.code.toByte()
+        arr[2] = 'F'.code.toByte()
+        arr[3] = 'F'.code.toByte()
+        val riffSize = totalBytes - 8
+        arr[4] = (riffSize and 0xFF).toByte()
+        arr[5] = ((riffSize shr 8) and 0xFF).toByte()
+        arr[6] = ((riffSize shr 16) and 0xFF).toByte()
+        arr[7] = ((riffSize shr 24) and 0xFF).toByte()
+        // WEBP
+        arr[8] = 'W'.code.toByte()
+        arr[9] = 'E'.code.toByte()
+        arr[10] = 'B'.code.toByte()
+        arr[11] = 'P'.code.toByte()
+        // VP8X
+        arr[12] = 'V'.code.toByte()
+        arr[13] = 'P'.code.toByte()
+        arr[14] = '8'.code.toByte()
+        arr[15] = 'X'.code.toByte()
+        arr[16] = 10.toByte()
+        // VP8 chunk at offset 30
+        arr[30] = 'V'.code.toByte()
+        arr[31] = 'P'.code.toByte()
+        arr[32] = '8'.code.toByte()
+        arr[33] = ' '.code.toByte()
+        // Declared chunk size = 48 bytes (exceeds payload which is only 44 - 38 = 6 bytes)
+        arr[34] = 48.toByte()
+        return Base64.getEncoder().encodeToString(arr)
+    }
+
     private fun createValidVp8xWithImageData(): String {
         // RIFF (12) + VP8X (18) + VP8 (56: 8 header + 48 payload) = 86 bytes
         val totalBytes = 86
@@ -391,8 +427,8 @@ class RequestValidatorTest {
     // Gate Photo Validation: Strict 50 KB Boundary Tests
     @Test
     fun gatePhoto_strict50KbBoundary_immediatelyBelowLimit_succeeds() {
-        // 50 * 1024 - 1 = 51,199 bytes (< 50 KB limit)
-        val webpUnderLimit = createValidStructuralWebP(50 * 1024 - 1)
+        // 50 * 1024 - 2 = 51,198 bytes (< 50 KB limit, even RIFF length)
+        val webpUnderLimit = createValidStructuralWebP(50 * 1024 - 2)
         val errors = RequestValidator.validateGatePhoto(webpUnderLimit)
         assertTrue(errors.isEmpty())
     }
@@ -408,8 +444,8 @@ class RequestValidatorTest {
 
     @Test
     fun gatePhoto_strict50KbBoundary_immediatelyAbove50KbLimit_isRejected() {
-        // 50 * 1024 + 1 = 51,201 bytes (> 50 KB limit)
-        val webpOverLimit = createValidStructuralWebP(50 * 1024 + 1)
+        // 50 * 1024 + 2 = 51,202 bytes (> 50 KB limit, even RIFF length)
+        val webpOverLimit = createValidStructuralWebP(50 * 1024 + 2)
         val errors = RequestValidator.validateGatePhoto(webpOverLimit)
         assertEquals(1, errors.size)
         assertTrue(errors[0].contains("must be strictly smaller than 50 KB"))
@@ -470,11 +506,19 @@ class RequestValidatorTest {
     }
 
     @Test
-    fun gatePhoto_vp8xTruncatedSubsequentChunk_returnsError() {
+    fun gatePhoto_vp8xIncompleteTrailingChunkHeader_returnsError() {
         val truncatedSub = createVp8xTruncatedSubsequentChunk()
         val errors = RequestValidator.validateGatePhoto(truncatedSub)
         assertEquals(1, errors.size)
-        assertTrue(errors[0].contains("truncated subsequent chunk"))
+        assertTrue(errors[0].contains("incomplete trailing chunk header"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xTruncatedSubsequentChunkPayload_returnsError() {
+        val truncatedPayload = createVp8xTruncatedSubsequentChunkPayload()
+        val errors = RequestValidator.validateGatePhoto(truncatedPayload)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("truncated subsequent chunk 'VP8 '"))
     }
 
     // RIFF Declared Length Discrepancy Tests
@@ -490,7 +534,7 @@ class RequestValidatorTest {
 
         val errors = RequestValidator.validateGatePhoto(b64)
         assertEquals(1, errors.size)
-        assertTrue(errors[0].contains("extraneous data"))
+        assertTrue(errors[0].contains("trailing bytes"))
     }
 
     @Test
@@ -506,6 +550,96 @@ class RequestValidatorTest {
         val errors = RequestValidator.validateGatePhoto(b64)
         assertEquals(1, errors.size)
         assertTrue(errors[0].contains("truncated"))
+    }
+
+    // Strict RIFF Envelope Tests
+    @Test
+    fun gatePhoto_oddRiffDeclaredLength_returnsError() {
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LosslessWebpBase64)
+        // Alter declared RIFF size at bytes 4..7 to an odd number (27 instead of 28)
+        rawBytes[4] = 27.toByte()
+        val b64 = Base64.getEncoder().encodeToString(rawBytes)
+
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("invalid odd RIFF declared length"))
+    }
+
+    @Test
+    fun gatePhoto_riffDeclaredLengthWithExtraTrailingByte_returnsError() {
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LosslessWebpBase64)
+        // Append 1 extra trailing byte (total 37 bytes when declared RIFF size 28 requires exactly 36 bytes)
+        val withTrailing = rawBytes.copyOf(rawBytes.size + 1)
+        withTrailing[rawBytes.size] = 0x00.toByte()
+        val b64 = Base64.getEncoder().encodeToString(withTrailing)
+
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("trailing bytes"))
+    }
+
+    // Simple VP8 & VP8L Container Completion Tests
+    @Test
+    fun gatePhoto_simpleVp8WithTrailingGarbage_returnsError() {
+        // Simple VP8 (68 bytes: 12 RIFF + 8 VP8 header + 48 payload).
+        // Expand file by 10 trailing garbage bytes to 78 bytes and update declared RIFF size to 70 (even).
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LossyWebpBase64)
+        val withGarbage = ByteArray(78)
+        System.arraycopy(rawBytes, 0, withGarbage, 0, rawBytes.size)
+        withGarbage[4] = 70.toByte()
+        val b64 = Base64.getEncoder().encodeToString(withGarbage)
+
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("trailing data or unparsed chunks after simple VP8 chunk"))
+    }
+
+    @Test
+    fun gatePhoto_simpleVp8lWithTrailingGarbage_returnsError() {
+        // Simple VP8L (36 bytes: 12 RIFF + 8 VP8L header + 15 payload + 1 pad).
+        // Expand file by 10 trailing garbage bytes to 46 bytes and update declared RIFF size to 38 (even).
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LosslessWebpBase64)
+        val withGarbage = ByteArray(46)
+        System.arraycopy(rawBytes, 0, withGarbage, 0, rawBytes.size)
+        withGarbage[4] = 38.toByte()
+        val b64 = Base64.getEncoder().encodeToString(withGarbage)
+
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("trailing data or unparsed chunks after simple VP8L chunk"))
+    }
+
+    // Chunk Boundary & Zero-Padding Tests
+    @Test
+    fun gatePhoto_oddSizedChunkMissingPadding_returnsError() {
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LosslessWebpBase64)
+        // genuine1x1LosslessWebp is 36 bytes (12 RIFF + 8 VP8L header + 15 payload + 1 zero-padding byte).
+        // Drop the 1-byte padding byte at the end (resulting in 35 bytes with 15 bytes odd payload and missing pad).
+        val truncatedPad = rawBytes.copyOf(35)
+        val b64 = Base64.getEncoder().encodeToString(truncatedPad)
+
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("truncated") || errors[0].contains("missing required zero-padding byte"))
+    }
+
+    @Test
+    fun gatePhoto_oddSizedChunkWithNonZeroPadding_returnsError() {
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LosslessWebpBase64)
+        // Byte 35 is the padding byte for the 15-byte odd VP8L chunk. Corrupt it to non-zero (0xFF).
+        rawBytes[35] = 0xFF.toByte()
+        val b64 = Base64.getEncoder().encodeToString(rawBytes)
+
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("with non-zero padding byte"))
+    }
+
+    @Test
+    fun gatePhoto_validOddSizedChunkWithZeroPadding_succeeds() {
+        // genuine1x1LosslessWebpBase64 has a 15-byte odd VP8L payload followed by a valid 0x00 padding byte
+        val errors = RequestValidator.validateGatePhoto(genuine1x1LosslessWebpBase64)
+        assertTrue(errors.isEmpty())
     }
 
     @Test

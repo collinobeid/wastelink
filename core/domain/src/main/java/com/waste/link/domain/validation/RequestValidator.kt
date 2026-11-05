@@ -160,14 +160,19 @@ object RequestValidator {
      * Returns error description if invalid, or null if structurally valid.
      *
      * STRUCTURAL VALIDATION GUARANTEES:
-     * - Validates RIFF container envelope (bytes 0..3: 'RIFF').
-     * - Validates RIFF declared length against actual payload: rejects truncated payloads and extraneous trailing data.
-     * - Validates WebP identifier (bytes 8..11: 'WEBP').
-     * - Validates chunk boundaries, headers, and 2-byte alignment padding.
-     * - For simple lossy ('VP8 '): verifies keyframe start code (0x9D 0x01 0x2A) and single-image container span.
-     * - For simple lossless ('VP8L'): verifies 0x2F signature and single-image container span.
-     * - For extended containers ('VP8X'): rejects header-only payloads, validates subsequent chunk headers and bounds,
-     *   and strictly requires presence of valid image data ('VP8 ' or 'VP8L').
+     * - Strict RIFF Envelope:
+     *     - Rejects odd RIFF declared size (must be even per RIFF 2-byte alignment).
+     *     - Requires actual byte length to equal declaredRiffSize + 8 exactly (no outer padding, no trailing bytes).
+     *     - Validates RIFF identifier (bytes 0..3: 'RIFF') and WebP identifier (bytes 8..11: 'WEBP').
+     * - Chunk Boundaries & Mandatory Zero-Padding:
+     *     - Validates complete 8-byte chunk headers for every chunk.
+     *     - Requires chunk payload to fit within declared RIFF boundaries.
+     *     - For odd-sized chunks, strictly requires the presence of a 1-byte padding byte and verifies it equals 0x00.
+     * - Container Completion:
+     *     - Simple lossy ('VP8 ') and lossless ('VP8L') containers must completely consume the declared container.
+     *       Extraneous trailing bytes or unparsed subsequent chunks are rejected.
+     *     - Extended containers ('VP8X') reject header-only payloads and incomplete trailing chunks, traverse all chunks,
+     *       and mandate presence of valid image data ('VP8 ' or 'VP8L').
      */
     private fun validateWebpStructure(bytes: ByteArray): String? {
         if (bytes.size < 20) {
@@ -183,15 +188,19 @@ object RequestValidator {
 
         // 2. Declared RIFF file size: bytes 4..7 (little-endian unsigned 32-bit)
         val declaredRiffSize = readLittleEndian32(bytes, 4)
-        val expectedMinSize = declaredRiffSize + 8L
-        val riffPad = declaredRiffSize % 2L
 
-        // Total file must strictly match declaredRiffSize + 8 (+ optional 1-byte RIFF pad if declaredRiffSize is odd)
-        if (bytes.size.toLong() < expectedMinSize) {
-            return "Gate reference photo is truncated (RIFF declared length $declaredRiffSize requires at least $expectedMinSize bytes, got ${bytes.size} bytes)."
+        // Strict RIFF Envelope Rule 1: Declared RIFF size must be even (2-byte alignment)
+        if (declaredRiffSize % 2L != 0L) {
+            return "Gate reference photo has invalid odd RIFF declared length ($declaredRiffSize bytes; must be even)."
         }
-        if (bytes.size.toLong() > expectedMinSize + riffPad) {
-            return "Gate reference photo contains extraneous data (RIFF declared length $declaredRiffSize specifies $expectedMinSize bytes, got ${bytes.size} bytes)."
+
+        // Strict RIFF Envelope Rule 2: Actual byte-array length must equal declaredRiffSize + 8 exactly
+        val expectedTotalSize = declaredRiffSize + 8L
+        if (bytes.size.toLong() < expectedTotalSize) {
+            return "Gate reference photo is truncated (RIFF declared length $declaredRiffSize requires $expectedTotalSize bytes, got ${bytes.size} bytes)."
+        }
+        if (bytes.size.toLong() > expectedTotalSize) {
+            return "Gate reference photo contains trailing bytes (RIFF declared length $declaredRiffSize specifies $expectedTotalSize bytes, got ${bytes.size} bytes)."
         }
 
         // 3. WEBP FourCC: bytes 8..11 == 'W', 'E', 'B', 'P'
@@ -204,13 +213,32 @@ object RequestValidator {
         // 4. First Chunk FourCC: bytes 12..15
         val firstFourCC = readFourCC(bytes, 12)
         val firstChunkSize = readLittleEndian32(bytes, 16)
+        val firstPad = if (firstChunkSize % 2L != 0L) 1 else 0
 
-        if (12 + 8 + firstChunkSize > bytes.size) {
+        // Check first chunk bounds including padding
+        if (20L + firstChunkSize + firstPad > bytes.size) {
             return "Gate reference photo is truncated (chunk '$firstFourCC' declared $firstChunkSize bytes exceeding payload)."
+        }
+
+        // If first chunk size is odd, validate the mandatory zero-padding byte
+        if (firstChunkSize % 2L != 0L) {
+            val padOffset = (20L + firstChunkSize).toInt()
+            if (padOffset >= bytes.size) {
+                return "Gate reference photo contains odd-sized chunk '$firstFourCC' ($firstChunkSize bytes) missing required zero-padding byte."
+            }
+            val padByte = bytes[padOffset]
+            if (padByte != 0.toByte()) {
+                return "Gate reference photo contains odd-sized chunk '$firstFourCC' with non-zero padding byte ($padByte; expected 0x00)."
+            }
         }
 
         return when (firstFourCC) {
             "VP8 " -> {
+                // Simple VP8: must consume the entire container correctly
+                val totalConsumed = 20L + firstChunkSize + firstPad
+                if (totalConsumed != bytes.size.toLong()) {
+                    return "Gate reference photo contains trailing data or unparsed chunks after simple VP8 chunk (expected $totalConsumed bytes, got ${bytes.size} bytes)."
+                }
                 if (firstChunkSize < 10L) {
                     "Gate reference photo contains corrupted VP8 header (chunk size $firstChunkSize < 10)."
                 } else {
@@ -224,6 +252,11 @@ object RequestValidator {
                 }
             }
             "VP8L" -> {
+                // Simple VP8L: must consume the entire container correctly
+                val totalConsumed = 20L + firstChunkSize + firstPad
+                if (totalConsumed != bytes.size.toLong()) {
+                    return "Gate reference photo contains trailing data or unparsed chunks after simple VP8L chunk (expected $totalConsumed bytes, got ${bytes.size} bytes)."
+                }
                 if (firstChunkSize < 5L) {
                     "Gate reference photo contains corrupted VP8L header (chunk size $firstChunkSize < 5)."
                 } else {
@@ -238,8 +271,7 @@ object RequestValidator {
                 if (firstChunkSize < 10L) {
                     return "Gate reference photo contains corrupted VP8X header (chunk size $firstChunkSize < 10)."
                 }
-                val firstPad = (firstChunkSize % 2L).toInt()
-                val nextChunkOffset = 20 + firstChunkSize.toInt() + firstPad
+                val nextChunkOffset = (20L + firstChunkSize + firstPad).toInt()
                 if (nextChunkOffset >= bytes.size) {
                     return "Gate reference photo contains header-only VP8X without image data."
                 }
@@ -248,15 +280,29 @@ object RequestValidator {
                 var foundImageChunk = false
 
                 while (subOffset < bytes.size) {
+                    // Complete 8-byte chunk header check
                     if (subOffset + 8 > bytes.size) {
-                        return "Gate reference photo contains truncated subsequent chunk header at offset $subOffset."
+                        return "Gate reference photo contains incomplete trailing chunk header at offset $subOffset (expected 8 bytes, got ${bytes.size - subOffset} bytes)."
                     }
                     val subFourCC = readFourCC(bytes, subOffset)
                     val subChunkSize = readLittleEndian32(bytes, subOffset + 4)
                     val subPayloadOffset = subOffset + 8
+                    val subPad = if (subChunkSize % 2L != 0L) 1 else 0
 
-                    if (subPayloadOffset + subChunkSize > bytes.size) {
+                    if (subPayloadOffset + subChunkSize + subPad > bytes.size) {
                         return "Gate reference photo contains truncated subsequent chunk '$subFourCC' (declared $subChunkSize bytes exceeding payload)."
+                    }
+
+                    // Odd-sized subsequent chunk zero-padding byte check
+                    if (subChunkSize % 2L != 0L) {
+                        val padOffset = (subPayloadOffset + subChunkSize).toInt()
+                        if (padOffset >= bytes.size) {
+                            return "Gate reference photo contains odd-sized chunk '$subFourCC' ($subChunkSize bytes) missing required zero-padding byte."
+                        }
+                        val padByte = bytes[padOffset]
+                        if (padByte != 0.toByte()) {
+                            return "Gate reference photo contains odd-sized chunk '$subFourCC' with non-zero padding byte ($padByte; expected 0x00)."
+                        }
                     }
 
                     when (subFourCC) {
@@ -290,8 +336,7 @@ object RequestValidator {
                         }
                     }
 
-                    val pad = (subChunkSize % 2L).toInt()
-                    subOffset = subPayloadOffset + subChunkSize.toInt() + pad
+                    subOffset = (subPayloadOffset + subChunkSize + subPad).toInt()
                 }
 
                 if (!foundImageChunk) {
