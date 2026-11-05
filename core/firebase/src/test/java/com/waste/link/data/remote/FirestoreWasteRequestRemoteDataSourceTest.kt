@@ -26,12 +26,14 @@ class FirestoreWasteRequestRemoteDataSourceTest {
     private fun sampleRequest(
         id: String = "test-uuid-1",
         clientUid: String = "resident_1",
-        serviceZoneId: String = "zone_kinondoni"
+        serviceZoneId: String = "zone_kinondoni",
+        requestRef: String? = "WL-2611-7X9F2B"
     ): WasteRequest {
         val coords = GeoCoordinates(-6.7924, 39.2083)
         return WasteRequest(
             id = id,
             clientGeneratedId = id,
+            requestRef = requestRef,
             clientUid = clientUid,
             coordinates = coords,
             serviceZoneId = serviceZoneId,
@@ -40,6 +42,20 @@ class FirestoreWasteRequestRemoteDataSourceTest {
             volumeTier = VolumeTier.STANDARD_BIN
         )
     }
+
+    @Test
+    fun createRequest_nullRequestRef_returnsRejectedReferenceAllocationRequired() = runBlocking {
+        val outcome = dataSource.createRequest(
+            authenticatedUid = "resident_1",
+            request = sampleRequest(requestRef = null)
+        )
+
+        assertTrue(outcome is RemoteRequestOutcome.Rejected)
+        val rejected = outcome as RemoteRequestOutcome.Rejected
+        assertEquals("REFERENCE_ALLOCATION_REQUIRED", rejected.errorCode)
+        org.junit.Assert.assertFalse(rejected.requiresUserIntervention)
+    }
+
 
     @Test
     fun createRequest_blankAuthUid_returnsRejectedUnauthenticated() = runBlocking {

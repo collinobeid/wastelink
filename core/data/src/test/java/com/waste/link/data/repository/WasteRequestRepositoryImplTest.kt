@@ -41,6 +41,7 @@ class WasteRequestRepositoryImplTest {
     private lateinit var localRepository: LocalWasteRequestRepository
     private lateinit var fakeRemoteDataSource: FakeRemoteDataSource
     private lateinit var fakeSessionProvider: FakeSessionProvider
+    private lateinit var fakeSyncScheduler: FakeWasteRequestSyncScheduler
     private lateinit var orchestrator: WasteRequestSyncOrchestrator
     private lateinit var repository: WasteRequestRepositoryImpl
 
@@ -68,15 +69,18 @@ class WasteRequestRepositoryImplTest {
         fakeSessionProvider = FakeSessionProvider(
             SessionState.Authenticated(user = authUser, isEmailVerified = true)
         )
+        fakeSyncScheduler = FakeWasteRequestSyncScheduler()
         orchestrator = WasteRequestSyncOrchestrator(
             localRepository = localRepository,
             remoteDataSource = fakeRemoteDataSource,
-            sessionStateProvider = fakeSessionProvider
+            sessionStateProvider = fakeSessionProvider,
+            syncScheduler = fakeSyncScheduler
         )
         repository = WasteRequestRepositoryImpl(
             localRepository = localRepository,
             syncOrchestrator = orchestrator,
-            sessionStateProvider = fakeSessionProvider
+            sessionStateProvider = fakeSessionProvider,
+            syncScheduler = fakeSyncScheduler
         )
     }
 
@@ -169,11 +173,32 @@ class WasteRequestRepositoryImplTest {
         assertNotNull(record)
         assertEquals(LocalSyncStatus.SYNC_FAILED, record!!.syncStatus)
         assertEquals(1, record.retryCount)
+
+        // Finding 5: Background sync must be actually scheduled!
+        assertTrue(fakeSyncScheduler.scheduledImmediate.contains("resident_1"))
     }
 
     // =========================================================================
     // Test Doubles
     // =========================================================================
+    class FakeWasteRequestSyncScheduler : com.waste.link.data.sync.WasteRequestSyncScheduler {
+        val scheduledImmediate = mutableListOf<String>()
+        val scheduledDelayed = mutableListOf<Triple<String, Long, Int>>()
+        val cancelled = mutableListOf<String>()
+
+        override fun scheduleImmediateSync(authenticatedUid: String) {
+            scheduledImmediate.add(authenticatedUid)
+        }
+
+        override fun scheduleDelayedSync(authenticatedUid: String, delayMs: Long, retryAttempt: Int) {
+            scheduledDelayed.add(Triple(authenticatedUid, delayMs, retryAttempt))
+        }
+
+        override fun cancelSync(authenticatedUid: String) {
+            cancelled.add(authenticatedUid)
+        }
+    }
+
     class FakeSessionProvider(
         initialState: SessionState
     ) : SessionStateProvider {
@@ -200,7 +225,8 @@ class WasteRequestRepositoryImplTest {
 
         override suspend fun getRequestById(
             authenticatedUid: String,
-            requestId: String
+            requestId: String,
+            serviceZoneId: String?
         ): RemoteRequestOutcome {
             return nextOutcome ?: RemoteRequestOutcome.Rejected("NOT_FOUND", "Not found")
         }

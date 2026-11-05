@@ -42,6 +42,7 @@ class WasteRequestMultiUserAndWorkerTest {
     private lateinit var localRepository: LocalWasteRequestRepository
     private lateinit var fakeRemoteDataSource: FakeRemoteDataSource
     private lateinit var fakeSessionProvider: FakeSessionProvider
+    private lateinit var fakeSyncScheduler: FakeWasteRequestSyncScheduler
     private lateinit var orchestrator: WasteRequestSyncOrchestrator
 
     private val userA = User(
@@ -77,10 +78,12 @@ class WasteRequestMultiUserAndWorkerTest {
         fakeSessionProvider = FakeSessionProvider(
             SessionState.Authenticated(user = userA, isEmailVerified = true)
         )
+        fakeSyncScheduler = FakeWasteRequestSyncScheduler()
         orchestrator = WasteRequestSyncOrchestrator(
             localRepository = localRepository,
             remoteDataSource = fakeRemoteDataSource,
-            sessionStateProvider = fakeSessionProvider
+            sessionStateProvider = fakeSessionProvider,
+            syncScheduler = fakeSyncScheduler
         )
     }
 
@@ -195,6 +198,24 @@ class WasteRequestMultiUserAndWorkerTest {
         override val sessionState: StateFlow<SessionState> = mutableSessionState.asStateFlow()
     }
 
+    class FakeWasteRequestSyncScheduler : WasteRequestSyncScheduler {
+        val scheduledImmediate = mutableListOf<String>()
+        val scheduledDelayed = mutableListOf<Triple<String, Long, Int>>()
+        val cancelled = mutableListOf<String>()
+
+        override fun scheduleImmediateSync(authenticatedUid: String) {
+            scheduledImmediate.add(authenticatedUid)
+        }
+
+        override fun scheduleDelayedSync(authenticatedUid: String, delayMs: Long, retryAttempt: Int) {
+            scheduledDelayed.add(Triple(authenticatedUid, delayMs, retryAttempt))
+        }
+
+        override fun cancelSync(authenticatedUid: String) {
+            cancelled.add(authenticatedUid)
+        }
+    }
+
     class FakeRemoteDataSource : WasteRequestRemoteDataSource {
         val submissions = mutableListOf<WasteRequest>()
 
@@ -213,7 +234,8 @@ class WasteRequestMultiUserAndWorkerTest {
 
         override suspend fun getRequestById(
             authenticatedUid: String,
-            requestId: String
+            requestId: String,
+            serviceZoneId: String?
         ): RemoteRequestOutcome {
             return RemoteRequestOutcome.Rejected("NOT_FOUND", "Not found")
         }

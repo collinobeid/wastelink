@@ -8,6 +8,7 @@
     "test": "node --test --test-concurrency=1 auth_rules.test.mjs auth_repository_integration.test.mjs",
     "test:rules": "node --test auth_rules.test.mjs",
     "test:auth": "node --test auth_repository_integration.test.mjs",
+    "test:requests": "node --test waste_requests_integration.test.mjs",
     "test:emulator": "firebase emulators:exec --only auth,firestore --project demo-wastelink \"npm test\""
   },
   "devDependencies": {

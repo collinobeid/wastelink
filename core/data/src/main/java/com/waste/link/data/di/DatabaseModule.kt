@@ -33,6 +33,12 @@ abstract class DatabaseBindingModule {
     abstract fun bindWasteRequestRepository(
         impl: WasteRequestRepositoryImpl
     ): WasteRequestRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindWasteRequestSyncScheduler(
+        impl: com.waste.link.data.sync.WorkManagerWasteRequestSyncScheduler
+    ): com.waste.link.data.sync.WasteRequestSyncScheduler
 }
 
 @Module

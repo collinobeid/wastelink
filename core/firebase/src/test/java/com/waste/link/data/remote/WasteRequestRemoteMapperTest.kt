@@ -103,7 +103,7 @@ class WasteRequestRemoteMapperTest {
     }
 
     @Test
-    fun toDomain_mapsDtoToDomain_preservingFallbackServiceZoneId() {
+    fun toDomain_mapsDtoToDomain_withValidServiceZoneId() {
         val dto = WasteRequestDto(
             id = "req-uuid-999",
             requestRef = "WL-2611-7X9F2B",
@@ -120,7 +120,7 @@ class WasteRequestRemoteMapperTest {
             updatedAt = Timestamp(1793869205L, 0)
         )
 
-        val domain = WasteRequestRemoteMapper.toDomain(dto, fallbackServiceZoneId = "zone_kinondoni")
+        val domain = WasteRequestRemoteMapper.toDomain(dto, serviceZoneId = "zone_kinondoni")
 
         assertEquals("req-uuid-999", domain.id)
         assertEquals("req-uuid-999", domain.clientGeneratedId)
@@ -132,5 +132,80 @@ class WasteRequestRemoteMapperTest {
         assertEquals(RequestLifecycleStatus.PENDING_DISPATCH, domain.status)
         assertEquals(1793869200000L, domain.createdAtEpochMs)
         assertEquals(1793869205000L, domain.updatedAtEpochMs)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun toDomain_unknownVolumeTier_throwsIllegalArgumentException() {
+        val dto = WasteRequestDto(
+            id = "req-uuid-bad-tier",
+            clientUid = "resident_uid_1",
+            lat = -6.7924,
+            lng = 39.2083,
+            pickupAddress = "Masaki",
+            category = "cat_general",
+            volumeTier = "MEGA_MONSTER_BIN", // Unknown volume tier!
+            status = "PENDING_DISPATCH"
+        )
+        WasteRequestRemoteMapper.toDomain(dto, serviceZoneId = "zone_kinondoni")
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun toDomain_unknownStatus_throwsIllegalArgumentException() {
+        val dto = WasteRequestDto(
+            id = "req-uuid-bad-status",
+            clientUid = "resident_uid_1",
+            lat = -6.7924,
+            lng = 39.2083,
+            pickupAddress = "Masaki",
+            category = "cat_general",
+            volumeTier = "STANDARD_BIN",
+            status = "MAGIC_TELEPORTED" // Unknown status!
+        )
+        WasteRequestRemoteMapper.toDomain(dto, serviceZoneId = "zone_kinondoni")
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun toDomain_blankServiceZoneId_throwsIllegalArgumentException() {
+        val dto = WasteRequestDto(
+            id = "req-uuid-blank-zone",
+            clientUid = "resident_uid_1",
+            lat = -6.7924,
+            lng = 39.2083,
+            pickupAddress = "Masaki",
+            category = "cat_general",
+            volumeTier = "STANDARD_BIN",
+            status = "PENDING_DISPATCH"
+        )
+        WasteRequestRemoteMapper.toDomain(dto, serviceZoneId = "")
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun toDomain_fabricatedRemoteZone_throwsIllegalArgumentException() {
+        val dto = WasteRequestDto(
+            id = "req-uuid-fake-zone",
+            clientUid = "resident_uid_1",
+            lat = -6.7924,
+            lng = 39.2083,
+            pickupAddress = "Masaki",
+            category = "cat_general",
+            volumeTier = "STANDARD_BIN",
+            status = "PENDING_DISPATCH"
+        )
+        WasteRequestRemoteMapper.toDomain(dto, serviceZoneId = "remote_zone")
+    }
+
+    @Test
+    fun toDomainOrNull_malformedDto_returnsNull() {
+        val badTierDto = WasteRequestDto(
+            id = "req-bad",
+            clientUid = "resident_uid_1",
+            lat = -6.7924,
+            lng = 39.2083,
+            pickupAddress = "Masaki",
+            category = "cat_general",
+            volumeTier = "INVALID_TIER",
+            status = "PENDING_DISPATCH"
+        )
+        assertNull(WasteRequestRemoteMapper.toDomainOrNull(badTierDto, serviceZoneId = "zone_kinondoni"))
     }
 }

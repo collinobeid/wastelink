@@ -1,6 +1,7 @@
 package com.waste.link.data.remote
 
 import androidx.annotation.VisibleForTesting
+import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
 import com.waste.link.data.remote.dto.WasteRequestDto
@@ -9,7 +10,6 @@ import com.waste.link.domain.model.RequestRefSpecification
 import com.waste.link.domain.model.WasteRequest
 import kotlinx.coroutines.tasks.await
 import java.io.IOException
-import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicReference
@@ -23,8 +23,10 @@ import javax.inject.Singleton
  * 1. Target collection is strictly `/waste_requests/{id}`.
  * 2. Caller's [authenticatedUid] must match [request.clientUid] exactly.
  * 3. Never uploads requests with serviceZoneId == "legacy_unmapped_zone".
- * 4. Idempotently reconciles prior submissions via [RemoteRequestOutcome.AlreadyExists].
- * 5. Deterministic canonical reference formatted via [RequestRefSpecification].
+ * 4. Atomic transaction ensures idempotency: reconciles matching payloads, rejects conflicting payloads.
+ * 5. Requires server-authoritative [request.requestRef]; client does not manufacture canonical references.
+ * 6. Authoritatively validates category and service zone against Firestore configuration.
+ * 7. Writes with [FieldValue.serverTimestamp()] and persists only confirmed server timestamps.
  */
 @Singleton
 class FirestoreWasteRequestRemoteDataSource internal constructor(
@@ -39,6 +41,8 @@ class FirestoreWasteRequestRemoteDataSource internal constructor(
 
     companion object {
         const val WASTE_REQUESTS_COLLECTION = "waste_requests"
+        const val WASTE_CATEGORIES_COLLECTION = "waste_categories"
+        const val SERVICE_ZONES_COLLECTION = "service_zones"
         const val LEGACY_UNMAPPED_ZONE_ID = "legacy_unmapped_zone"
     }
 
@@ -82,58 +86,160 @@ class FirestoreWasteRequestRemoteDataSource internal constructor(
             )
         }
 
+        // Invariant 3: Server-authoritative reference check (Finding 1)
+        val requestRef = request.requestRef
+        if (requestRef.isNullOrBlank()) {
+            return RemoteRequestOutcome.Rejected(
+                errorCode = "REFERENCE_ALLOCATION_REQUIRED",
+                message = "Server-authoritative reference is required for remote submission. Canonical sequential reference allocation requires a trusted Cloud Function endpoint.",
+                requiresUserIntervention = false
+            )
+        }
+        if (!RequestRefSpecification.isValid(requestRef)) {
+            return RemoteRequestOutcome.Rejected(
+                errorCode = "INVALID_REQUEST_REF",
+                message = "Request reference '$requestRef' is invalid according to RequestRefSpecification.",
+                requiresUserIntervention = true
+            )
+        }
+
         val docRef = firestore.collection(WASTE_REQUESTS_COLLECTION).document(request.id)
+        val categoryRef = firestore.collection(WASTE_CATEGORIES_COLLECTION).document(request.categoryId)
+        val zoneRef = firestore.collection(SERVICE_ZONES_COLLECTION).document(request.serviceZoneId)
 
-        // Invariant 3: Idempotency pre-check
-        try {
-            val snapshot = docRef.get().await()
-            if (snapshot.exists()) {
-                val dto = snapshot.toObject(WasteRequestDto::class.java)
-                    ?: return RemoteRequestOutcome.Rejected(
-                        errorCode = "MALFORMED_REMOTE_DOC",
-                        message = "Existing remote document could not be parsed."
-                    )
-                val existingRequest = WasteRequestRemoteMapper.toDomain(dto, request.serviceZoneId)
-                val serverCreatedAt = dto.createdAt?.toDate()?.time ?: System.currentTimeMillis()
-                val serverUpdatedAt = dto.updatedAt?.toDate()?.time ?: System.currentTimeMillis()
-                return RemoteRequestOutcome.AlreadyExists(
-                    existingRequest = existingRequest,
-                    requestRef = dto.requestRef,
-                    serverCreatedAtEpochMs = serverCreatedAt,
-                    serverUpdatedAtEpochMs = serverUpdatedAt
-                )
-            }
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            return mapException(e)
-        }
-
-        // Invariant 4: Canonical reference allocation
-        val allocatedRef = if (request.requestRef != null && RequestRefSpecification.isValid(request.requestRef)) {
-            request.requestRef!!
-        } else {
-            val entropy = (UUID.randomUUID().mostSignificantBits and 0x3FFFFFFF).toInt()
-            RequestRefSpecification.formatNonCanonicalPreview(entropy, System.currentTimeMillis())
-        }
-
-        // Invariant 5: Safe payload mapping matching firestore.rules whitelist
-        val dto = WasteRequestRemoteMapper.toDto(request, allocatedRef = allocatedRef)
-        val creationMap = dto.toFirestoreCreationMap()
-
+        // Invariant 4 & 5: Atomic transaction creation, duplicate reconciliation, conflict rejection, and category/zone validation
         return try {
-            docRef.set(creationMap).await()
-            val now = System.currentTimeMillis()
-            val confirmedRequest = request.copy(
-                requestRef = allocatedRef,
-                createdAtEpochMs = request.createdAtEpochMs ?: now,
-                updatedAtEpochMs = now
-            )
-            RemoteRequestOutcome.Success(
-                confirmedRequest = confirmedRequest,
-                requestRef = allocatedRef,
-                serverCreatedAtEpochMs = confirmedRequest.createdAtEpochMs ?: now,
-                serverUpdatedAtEpochMs = now
-            )
+            val outcome = firestore.runTransaction { transaction ->
+                val snapshot = transaction.get(docRef)
+                if (snapshot.exists()) {
+                    val dto = snapshot.toObject(WasteRequestDto::class.java)
+                        ?: return@runTransaction RemoteRequestOutcome.Rejected(
+                            errorCode = "MALFORMED_REMOTE_DOC",
+                            message = "Existing remote document could not be parsed.",
+                            requiresUserIntervention = true
+                        )
+
+                    // Verify ownership
+                    if (dto.clientUid != authenticatedUid) {
+                        return@runTransaction RemoteRequestOutcome.Rejected(
+                            errorCode = "PERMISSION_DENIED",
+                            message = "Access denied: existing document clientUid does not match authenticated user.",
+                            requiresUserIntervention = true
+                        )
+                    }
+
+                    // Verify immutable identity and payload consistency
+                    val matchesCategory = dto.category == request.categoryId
+                    val matchesVolumeTier = dto.volumeTier.equals(request.volumeTier.name, ignoreCase = true) ||
+                        dto.volumeTier.equals(request.volumeTier.id, ignoreCase = true)
+                    val matchesAddress = dto.pickupAddress == request.pickupAddress
+                    val matchesCoords = kotlin.math.abs(dto.lat - request.coordinates.latitude) < 0.00001 &&
+                        kotlin.math.abs(dto.lng - request.coordinates.longitude) < 0.00001
+
+                    if (!matchesCategory || !matchesVolumeTier || !matchesAddress || !matchesCoords) {
+                        return@runTransaction RemoteRequestOutcome.Rejected(
+                            errorCode = "CONFLICTING_EXISTING_DOCUMENT",
+                            message = "Remote document '${request.id}' already exists with conflicting payload.",
+                            requiresUserIntervention = true
+                        )
+                    }
+
+                    // Reconcile matching existing request safely
+                    val existingDomain = WasteRequestRemoteMapper.toDomain(dto, request.serviceZoneId)
+                    val serverCreatedAt = dto.createdAt?.toDate()?.time ?: 0L
+                    val serverUpdatedAt = dto.updatedAt?.toDate()?.time ?: serverCreatedAt
+
+                    return@runTransaction RemoteRequestOutcome.AlreadyExists(
+                        existingRequest = existingDomain,
+                        requestRef = dto.requestRef,
+                        serverCreatedAtEpochMs = serverCreatedAt,
+                        serverUpdatedAtEpochMs = serverUpdatedAt
+                    )
+                }
+
+                // If document does not exist, authoritatively validate category and service zone
+                val categorySnap = transaction.get(categoryRef)
+                if (!categorySnap.exists()) {
+                    return@runTransaction RemoteRequestOutcome.Rejected(
+                        errorCode = "UNKNOWN_CATEGORY",
+                        message = "Waste category '${request.categoryId}' does not exist in authoritative configuration.",
+                        requiresUserIntervention = true
+                    )
+                }
+                if (categorySnap.getBoolean("isActive") != true) {
+                    return@runTransaction RemoteRequestOutcome.Rejected(
+                        errorCode = "INACTIVE_CATEGORY",
+                        message = "Waste category '${request.categoryId}' is currently inactive.",
+                        requiresUserIntervention = true
+                    )
+                }
+
+                val zoneSnap = transaction.get(zoneRef)
+                if (!zoneSnap.exists()) {
+                    return@runTransaction RemoteRequestOutcome.Rejected(
+                        errorCode = "UNKNOWN_SERVICE_ZONE",
+                        message = "Service zone '${request.serviceZoneId}' does not exist in authoritative configuration.",
+                        requiresUserIntervention = true
+                    )
+                }
+                if (zoneSnap.getBoolean("isActive") != true) {
+                    return@runTransaction RemoteRequestOutcome.Rejected(
+                        errorCode = "INACTIVE_SERVICE_ZONE",
+                        message = "Service zone '${request.serviceZoneId}' is currently inactive.",
+                        requiresUserIntervention = true
+                    )
+                }
+
+                val minLat = zoneSnap.getDouble("minLat")
+                val maxLat = zoneSnap.getDouble("maxLat")
+                val minLng = zoneSnap.getDouble("minLng")
+                val maxLng = zoneSnap.getDouble("maxLng")
+                if (minLat != null && maxLat != null && minLng != null && maxLng != null) {
+                    if (request.coordinates.latitude !in minLat..maxLat || request.coordinates.longitude !in minLng..maxLng) {
+                        return@runTransaction RemoteRequestOutcome.Rejected(
+                            errorCode = "OUTSIDE_SERVICE_ZONE",
+                            message = "Request coordinates (${request.coordinates.latitude}, ${request.coordinates.longitude}) fall outside service zone '${request.serviceZoneId}' boundary.",
+                            requiresUserIntervention = true
+                        )
+                    }
+                }
+
+                // Atomic creation with server timestamps
+                val dto = WasteRequestRemoteMapper.toDto(request, allocatedRef = requestRef)
+                val creationMap = dto.toFirestoreCreationMap(
+                    createdAtValue = FieldValue.serverTimestamp(),
+                    updatedAtValue = FieldValue.serverTimestamp()
+                )
+                transaction.set(docRef, creationMap)
+
+                RemoteRequestOutcome.Success(
+                    confirmedRequest = request.copy(requestRef = requestRef),
+                    requestRef = requestRef,
+                    serverCreatedAtEpochMs = 0L,
+                    serverUpdatedAtEpochMs = 0L
+                )
+            }.await()
+
+            if (outcome is RemoteRequestOutcome.Success) {
+                // Retrieve the committed document to get the server-resolved timestamps
+                val committedSnapshot = docRef.get().await()
+                val committedDto = committedSnapshot.toObject(WasteRequestDto::class.java)
+                val resolvedCreatedAt = committedDto?.createdAt?.toDate()?.time ?: 0L
+                val resolvedUpdatedAt = committedDto?.updatedAt?.toDate()?.time ?: resolvedCreatedAt
+                val fullyConfirmed = request.copy(
+                    requestRef = outcome.requestRef,
+                    createdAtEpochMs = resolvedCreatedAt,
+                    updatedAtEpochMs = resolvedUpdatedAt
+                )
+                RemoteRequestOutcome.Success(
+                    confirmedRequest = fullyConfirmed,
+                    requestRef = outcome.requestRef,
+                    serverCreatedAtEpochMs = resolvedCreatedAt,
+                    serverUpdatedAtEpochMs = resolvedUpdatedAt
+                )
+            } else {
+                outcome
+            }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             mapException(e)
@@ -142,7 +248,8 @@ class FirestoreWasteRequestRemoteDataSource internal constructor(
 
     override suspend fun getRequestById(
         authenticatedUid: String,
-        requestId: String
+        requestId: String,
+        serviceZoneId: String?
     ): RemoteRequestOutcome {
         simulatedNextFailure.getAndSet(null)?.let { simulated ->
             return mapException(simulated)
@@ -181,9 +288,17 @@ class FirestoreWasteRequestRemoteDataSource internal constructor(
                 )
             }
 
-            val domainRequest = WasteRequestRemoteMapper.toDomain(dto, fallbackServiceZoneId = "remote_zone")
-            val serverCreatedAt = dto.createdAt?.toDate()?.time ?: System.currentTimeMillis()
-            val serverUpdatedAt = dto.updatedAt?.toDate()?.time ?: System.currentTimeMillis()
+            if (serviceZoneId.isNullOrBlank() || serviceZoneId == "remote_zone") {
+                return RemoteRequestOutcome.Rejected(
+                    errorCode = "SERVICE_ZONE_REQUIRED",
+                    message = "Cannot map remote document without valid serviceZoneId. Service zones are not fabricated.",
+                    requiresUserIntervention = true
+                )
+            }
+
+            val domainRequest = WasteRequestRemoteMapper.toDomain(dto, serviceZoneId = serviceZoneId)
+            val serverCreatedAt = dto.createdAt?.toDate()?.time ?: 0L
+            val serverUpdatedAt = dto.updatedAt?.toDate()?.time ?: serverCreatedAt
 
             RemoteRequestOutcome.AlreadyExists(
                 existingRequest = domainRequest,

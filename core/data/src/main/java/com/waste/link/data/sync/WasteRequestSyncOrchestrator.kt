@@ -32,7 +32,8 @@ import javax.inject.Singleton
 class WasteRequestSyncOrchestrator @Inject constructor(
     private val localRepository: LocalWasteRequestRepository,
     private val remoteDataSource: WasteRequestRemoteDataSource,
-    private val sessionStateProvider: SessionStateProvider
+    private val sessionStateProvider: SessionStateProvider,
+    private val syncScheduler: WasteRequestSyncScheduler
 ) {
 
     companion object {
@@ -120,7 +121,29 @@ class WasteRequestSyncOrchestrator @Inject constructor(
             _events.emit(SyncEvent.UploadStarted(requestId, authenticatedUid, clock()))
 
             // Step 8: Remote submission
-            return when (val outcome = remoteDataSource.createRequest(authenticatedUid, domainRequest)) {
+            val outcome = remoteDataSource.createRequest(authenticatedUid, domainRequest)
+
+            // Step 8b: Revalidate session post-submission before committing result (Finding 4)
+            val postCallSession = sessionStateProvider.sessionState.value
+            val isSessionStillValid = postCallSession is SessionState.Authenticated &&
+                postCallSession.isServerVerified &&
+                postCallSession.user.id == authenticatedUid
+
+            if (!isSessionStillValid) {
+                // Active session changed or logged out during remote upload.
+                // Reset original user's record from UPLOADING to QUEUED_OFFLINE to prevent corruption or stranded upload.
+                localRepository.updateSyncStatus(
+                    id = requestId,
+                    clientUid = authenticatedUid,
+                    newStatus = LocalSyncStatus.QUEUED_OFFLINE,
+                    errorMessage = "Upload aborted due to session change during in-flight synchronization."
+                )
+                val reason = "Session changed or invalidated during upload of request '$requestId'."
+                _events.emit(SyncEvent.AuthUnavailable(reason, clock()))
+                return SyncResult.AuthUnavailable(reason)
+            }
+
+            return when (outcome) {
                 is RemoteRequestOutcome.Success -> {
                     localRepository.updateSyncSuccess(
                         id = requestId,
@@ -185,6 +208,8 @@ class WasteRequestSyncOrchestrator @Inject constructor(
                                 timestampEpochMs = clock()
                             )
                         )
+                        // Finding 5: Actually schedule delayed background retry via WorkManager
+                        syncScheduler.scheduleDelayedSync(authenticatedUid, delayMs, nextRetry)
                         _events.emit(SyncEvent.RetryScheduled(requestId, nextRetry, delayMs, clock()))
                         SyncResult.QueuedOffline(requestId, "Transient network failure; retry $nextRetry scheduled.")
                     } else {

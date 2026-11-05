@@ -27,7 +27,8 @@ import javax.inject.Singleton
 class WasteRequestRepositoryImpl @Inject constructor(
     private val localRepository: LocalWasteRequestRepository,
     private val syncOrchestrator: WasteRequestSyncOrchestrator,
-    private val sessionStateProvider: SessionStateProvider
+    private val sessionStateProvider: SessionStateProvider,
+    private val syncScheduler: com.waste.link.data.sync.WasteRequestSyncScheduler
 ) : WasteRequestRepository {
 
     override suspend fun createWasteRequest(request: WasteRequest): CreateWasteRequestOutcome {
@@ -68,6 +69,8 @@ class WasteRequestRepositoryImpl @Inject constructor(
             }
 
             is SyncResult.QueuedOffline -> {
+                // Connect offline failure to actual WorkManager background sync
+                syncScheduler.scheduleImmediateSync(authenticatedUid)
                 CreateWasteRequestOutcome.Failure(
                     error = IllegalStateException(syncResult.reason),
                     message = syncResult.reason
@@ -89,6 +92,8 @@ class WasteRequestRepositoryImpl @Inject constructor(
             }
 
             is SyncResult.Failure -> {
+                // Connect transient failure to actual WorkManager background sync
+                syncScheduler.scheduleImmediateSync(authenticatedUid)
                 CreateWasteRequestOutcome.Failure(
                     error = syncResult.error,
                     message = syncResult.error.message ?: "Failed to synchronize waste request"

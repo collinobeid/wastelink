@@ -49,9 +49,12 @@ object WasteRequestRemoteMapper {
 
     fun toDomain(
         dto: WasteRequestDto,
-        fallbackServiceZoneId: String
+        serviceZoneId: String
     ): WasteRequest {
         val requestId = dto.id.ifBlank { error("WasteRequestDto.id must not be blank") }
+        require(serviceZoneId.isNotBlank() && serviceZoneId != "remote_zone") {
+            "Explicit valid serviceZoneId is required, received '$serviceZoneId'"
+        }
         val coords = GeoCoordinates(dto.lat, dto.lng)
         val derivedGeohash = if (dto.geohash.length in 5..12 && coords.toGeohash(dto.geohash.length) == dto.geohash) {
             dto.geohash
@@ -61,11 +64,11 @@ object WasteRequestRemoteMapper {
 
         val volumeTierEnum = VolumeTier.fromIdOrNull(dto.volumeTier)
             ?: VolumeTier.entries.firstOrNull { it.name.equals(dto.volumeTier, ignoreCase = true) }
-            ?: VolumeTier.STANDARD_BIN
+            ?: throw IllegalArgumentException("Malformed remote document: unknown volume tier '${dto.volumeTier}'.")
 
         val statusEnum = RequestLifecycleStatus.entries.firstOrNull {
             it.name.equals(dto.status, ignoreCase = true)
-        } ?: RequestLifecycleStatus.PENDING_DISPATCH
+        } ?: throw IllegalArgumentException("Malformed remote document: unknown lifecycle status '${dto.status}'.")
 
         return WasteRequest(
             id = requestId,
@@ -74,7 +77,7 @@ object WasteRequestRemoteMapper {
             clientUid = dto.clientUid,
             coordinates = coords,
             geohash = derivedGeohash,
-            serviceZoneId = fallbackServiceZoneId,
+            serviceZoneId = serviceZoneId,
             pickupAddress = dto.pickupAddress,
             categoryId = dto.category,
             volumeTier = volumeTierEnum,
@@ -100,6 +103,15 @@ object WasteRequestRemoteMapper {
             completedAtEpochMs = dto.completedAt?.let { toEpochMs(it) },
             failedAtEpochMs = dto.failedAt?.let { toEpochMs(it) }
         )
+    }
+
+    fun toDomainOrNull(
+        dto: WasteRequestDto,
+        serviceZoneId: String
+    ): WasteRequest? = try {
+        toDomain(dto, serviceZoneId)
+    } catch (_: Exception) {
+        null
     }
 
     private fun toTimestamp(epochMs: Long): Timestamp {

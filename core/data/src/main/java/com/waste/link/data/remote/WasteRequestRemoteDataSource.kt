@@ -34,6 +34,7 @@ interface WasteRequestRemoteDataSource {
      */
     suspend fun getRequestById(
         authenticatedUid: String,
-        requestId: String
+        requestId: String,
+        serviceZoneId: String? = null
     ): RemoteRequestOutcome
 }

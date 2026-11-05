@@ -44,6 +44,7 @@ class WasteRequestSyncOrchestratorTest {
     private lateinit var localRepository: LocalWasteRequestRepository
     private lateinit var fakeRemoteDataSource: FakeWasteRequestRemoteDataSource
     private lateinit var fakeSessionProvider: FakeSessionStateProvider
+    private lateinit var fakeSyncScheduler: FakeWasteRequestSyncScheduler
     private lateinit var orchestrator: WasteRequestSyncOrchestrator
 
     private val authResidentUser = User(
@@ -70,10 +71,12 @@ class WasteRequestSyncOrchestratorTest {
         fakeSessionProvider = FakeSessionStateProvider(
             SessionState.Authenticated(user = authResidentUser, isEmailVerified = true)
         )
+        fakeSyncScheduler = FakeWasteRequestSyncScheduler()
         orchestrator = WasteRequestSyncOrchestrator(
             localRepository = localRepository,
             remoteDataSource = fakeRemoteDataSource,
-            sessionStateProvider = fakeSessionProvider
+            sessionStateProvider = fakeSessionProvider,
+            syncScheduler = fakeSyncScheduler
         )
     }
 
@@ -309,11 +312,88 @@ class WasteRequestSyncOrchestratorTest {
         assertEquals(LocalSyncStatus.SYNC_FAILED, record!!.syncStatus)
         assertEquals(4, record.retryCount)
         assertTrue(record.syncErrorMessage!!.contains("Max retries exceeded"))
+        // Finding 5: Max retries exceeded must NOT schedule another retry!
+        assertTrue(fakeSyncScheduler.scheduledDelayed.isEmpty())
+    }
+
+    @Test
+    fun finding4_sessionChangeDuringUpload_abortsCommit_resetsRecordToQueuedOffline() = runBlocking {
+        val userB = User(
+            id = "resident_uid_2",
+            fullName = "Amina Resident",
+            email = "amina@wastelink.tz",
+            phoneNumber = "+255712345679",
+            role = UserRole.RESIDENT,
+            accountStatus = AccountStatus.ACTIVE
+        )
+
+        val request = sampleRequest()
+        localRepository.saveLocalRequest("resident_uid_1", request, LocalSyncStatus.QUEUED_OFFLINE)
+
+        // Simulate session switching to User B while the remote upload is suspended in-flight
+        fakeRemoteDataSource.onBeforeCreate = {
+            fakeSessionProvider.mutableSessionState.value = SessionState.Authenticated(
+                user = userB,
+                isEmailVerified = true
+            )
+        }
+
+        val result = orchestrator.synchronizeSingleRequest("resident_uid_1", request.id)
+
+        // Result must be AuthUnavailable
+        assertTrue(result is SyncResult.AuthUnavailable)
+
+        // Original user's record must NOT be marked SYNCED; must be safely reset to QUEUED_OFFLINE
+        val userARecord = localRepository.getLocalRecord(request.id, "resident_uid_1")
+        assertNotNull(userARecord)
+        assertEquals(LocalSyncStatus.QUEUED_OFFLINE, userARecord!!.syncStatus)
+        assertTrue(userARecord.syncErrorMessage!!.contains("session change"))
+
+        // User B must have no records created
+        val userBRecords = localRepository.getQueuedRecords("resident_uid_2")
+        assertTrue(userBRecords.isEmpty())
+    }
+
+    @Test
+    fun finding5_transientFailure_schedulesWorkManagerDelayedRetry() = runBlocking {
+        val request = sampleRequest()
+        localRepository.saveLocalRequest("resident_uid_1", request, LocalSyncStatus.QUEUED_OFFLINE)
+
+        fakeRemoteDataSource.nextOutcome = RemoteRequestOutcome.TransientFailure(
+            cause = IOException("Transient Socket Timeout")
+        )
+
+        val result = orchestrator.synchronizeSingleRequest("resident_uid_1", request.id)
+
+        assertTrue(result is SyncResult.QueuedOffline)
+        assertEquals(1, fakeSyncScheduler.scheduledDelayed.size)
+        val (scheduledUid, delayMs, retryAttempt) = fakeSyncScheduler.scheduledDelayed.first()
+        assertEquals("resident_uid_1", scheduledUid)
+        assertEquals(orchestrator.computeBackoffDelay(1), delayMs)
+        assertEquals(1, retryAttempt)
     }
 
     // =========================================================================
     // Helper Test Doubles
     // =========================================================================
+    class FakeWasteRequestSyncScheduler : WasteRequestSyncScheduler {
+        val scheduledImmediate = mutableListOf<String>()
+        val scheduledDelayed = mutableListOf<Triple<String, Long, Int>>()
+        val cancelled = mutableListOf<String>()
+
+        override fun scheduleImmediateSync(authenticatedUid: String) {
+            scheduledImmediate.add(authenticatedUid)
+        }
+
+        override fun scheduleDelayedSync(authenticatedUid: String, delayMs: Long, retryAttempt: Int) {
+            scheduledDelayed.add(Triple(authenticatedUid, delayMs, retryAttempt))
+        }
+
+        override fun cancelSync(authenticatedUid: String) {
+            cancelled.add(authenticatedUid)
+        }
+    }
+
     class FakeSessionStateProvider(
         initialState: SessionState
     ) : SessionStateProvider {
@@ -324,15 +404,17 @@ class WasteRequestSyncOrchestratorTest {
     class FakeWasteRequestRemoteDataSource : WasteRequestRemoteDataSource {
         val submissions = mutableListOf<WasteRequest>()
         var nextOutcome: RemoteRequestOutcome? = null
+        var onBeforeCreate: (() -> Unit)? = null
 
         override suspend fun createRequest(
             authenticatedUid: String,
             request: WasteRequest
         ): RemoteRequestOutcome {
+            onBeforeCreate?.invoke()
             submissions.add(request)
             return nextOutcome ?: RemoteRequestOutcome.Success(
-                confirmedRequest = request.copy(requestRef = "WL-2611-TESTREF"),
-                requestRef = "WL-2611-TESTREF",
+                confirmedRequest = request.copy(requestRef = "WL-2611-TEST01"),
+                requestRef = "WL-2611-TEST01",
                 serverCreatedAtEpochMs = System.currentTimeMillis(),
                 serverUpdatedAtEpochMs = System.currentTimeMillis()
             )
@@ -340,7 +422,8 @@ class WasteRequestSyncOrchestratorTest {
 
         override suspend fun getRequestById(
             authenticatedUid: String,
-            requestId: String
+            requestId: String,
+            serviceZoneId: String?
         ): RemoteRequestOutcome {
             return nextOutcome ?: RemoteRequestOutcome.Rejected("NOT_FOUND", "Not found")
         }
