@@ -21,7 +21,7 @@ Phase 1A of Module 2 (*Resident Operations & Request Flow*) has been executed in
 3. **Actor-Aware State Machine**: Complete transition validator enforcing all 16 operational transitions (TR-01 through TR-16), actor roles (`RESIDENT`, `COLLECTOR`, `ADMIN`), ownership checks, Proof of Collection (PoC) photographic evidence, failure evidence, and the 48-hour dispute expiration window.
 4. **Collision-Safe Crockford Base32 References**: Format `WL-YYMM-XXXXXX` validated against regex `^WL-[0-9]{4}-[0-9A-Z]{6}$`. Unallocated server references are explicitly represented as `null` on `WasteRequest` until returned by the backend.
 5. **Exact Geohash Verification**: Verified mathematical geohash encoding producing exact 7-character string `"kygck5q"` for Dar es Salaam test coordinates `(-6.7924, 39.2083)`.
-6. **100% Test Pass Rate**: 75 unit tests passing in `:core:domain:testDebugUnitTest`. Zero project-wide regressions across 165 Gradle tasks.
+6. **100% Test Pass Rate**: 78 unit tests passing in `:core:domain:testDebugUnitTest`. Zero project-wide regressions across 165 Gradle tasks.
 
 ---
 
@@ -39,6 +39,7 @@ Phase 1A of Module 2 (*Resident Operations & Request Flow*) has been executed in
 | [`RequestLifecycleStatus.kt`](file:///c:/Users/JogerBee/Desktop/WasteLink/core/domain/src/main/java/com/waste/link/domain/model/RequestLifecycleStatus.kt) | 13 canonical operational states (`PENDING_DISPATCH`, `FLAGGED_FOR_REVIEW`, `ASSIGNED_TO_FLEET`, `EN_ROUTE`, `ARRIVED_AT_LOCATION`, `COLLECTION_VERIFIED`, `IN_TRANSIT_TO_DUMP`, `COMPLETED`, `CANCELLED`, `FAILED`, `DISPUTED`, `RESOLVED`, `DISMISSED`). Properties: `isTerminal`, `isCancellableByResident`, `isDisputable`, `isActiveFleetExecution`. Includes `fromLegacyStatus()` reconciliation. |
 | [`RequestRefGenerator.kt`](file:///c:/Users/JogerBee/Desktop/WasteLink/core/domain/src/main/java/com/waste/link/domain/model/RequestRefGenerator.kt) | Crockford Base32 deterministic reference generator (`WL-YYMM-XXXXXX`) using alphabet `0123456789ABCDEFGHJKMNPQRSTVWXYZ` (excludes I, L, O, U). Validated against regex `^WL-[0-9]{4}-[0-9A-Z]{6}$`. |
 | [`WasteRequest.kt`](file:///c:/Users/JogerBee/Desktop/WasteLink/core/domain/src/main/java/com/waste/link/domain/model/WasteRequest.kt) | Pure business-domain entity. Invariants: `id == clientGeneratedId`, non-blank `pickupAddress`, currency strictly `"TZS"`, positive `priceTzs`, nullable `requestRef` (explicitly representing unallocated server reference). Zero framework annotations and zero synchronization metadata (`syncStatus`). |
+| [`WasteRequestRepository.kt`](file:///c:/Users/JogerBee/Desktop/WasteLink/core/domain/src/main/java/com/waste/link/domain/repository/WasteRequestRepository.kt) | Pure domain repository interfaces defining the authenticated trusted operation `createWasteRequest(request): WasteRequestCreationOutcome`, rather than assuming a direct unmediated Firestore client write. Also defines `WasteCategoryRepository` and `ServiceZoneRepository` domain contracts. |
 
 ### 2.2 Domain Validation (`com.waste.link.domain.validation`)
 
@@ -65,9 +66,10 @@ com.waste.link.domain.RequestRefGeneratorTest > 5 tests passed
 com.waste.link.domain.WasteRequestDomainTest > 7 tests passed
 com.waste.link.domain.RequestStateTransitionValidatorTest > 17 tests passed
 com.waste.link.domain.RequestValidatorTest > 5 tests passed
+com.waste.link.domain.WasteRequestRepositoryContractTest > 3 tests passed
 
-BUILD SUCCESSFUL in 8s
-Tests run: 75, Failures: 0, Ignored: 0, Success rate: 100%
+BUILD SUCCESSFUL in 5s
+Tests run: 78, Failures: 0, Ignored: 0, Success rate: 100%
 ```
 
 ### 3.2 Traceability to Layer 1 Checklist (UT-DOM-01 through UT-DOM-18)
