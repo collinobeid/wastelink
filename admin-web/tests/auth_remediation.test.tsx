@@ -2,6 +2,7 @@ import { render, screen, waitFor, act } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import React from 'react';
 import { AuthProvider, useAuth } from '../src/context/AuthContext';
+import { auth } from '../src/config/firebase';
 import * as FirebaseAuth from 'firebase/auth';
 import * as Firestore from 'firebase/firestore';
 
@@ -41,12 +42,28 @@ const AuthConsumer: React.FC = () => {
 
 describe('Admin Authentication Remediation Suite', () => {
   let authCallback: (user: any) => Promise<void>;
+  let autoSyncCurrentUser = true;
 
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(Firestore.getDoc).mockReset();
+    autoSyncCurrentUser = true;
+    Object.defineProperty(auth, 'currentUser', {
+      value: null,
+      configurable: true,
+      writable: true,
+    });
     vi.mocked(FirebaseAuth.onIdTokenChanged).mockImplementation((_auth, cb: any) => {
-      authCallback = cb;
+      authCallback = async (user: any) => {
+        if (autoSyncCurrentUser) {
+          Object.defineProperty(auth, 'currentUser', {
+            value: user ?? null,
+            configurable: true,
+            writable: true,
+          });
+        }
+        await cb(user);
+      };
       return () => {};
     });
   });
@@ -606,6 +623,149 @@ describe('Admin Authentication Remediation Suite', () => {
       expect(screen.getByTestId('is-admin')).toHaveTextContent('ADMIN');
       expect(screen.getByTestId('current-user')).toHaveTextContent('user_b_active_admin_2');
       expect(screen.getByTestId('profile')).toHaveTextContent('userb2@wastelink.go.tz');
+      expect(screen.getByTestId('error')).toHaveTextContent('NO_ERROR');
+    });
+  });
+
+  // Strict Firebase Auth Identity Validation Suite
+  describe('Strict Firebase Auth Identity Validation', () => {
+    it('denies admin access when a non-null user is evaluated but auth.currentUser is null', async () => {
+      autoSyncCurrentUser = false;
+      // Explicitly configure mocked Firebase Auth currentUser as null
+      Object.defineProperty(auth, 'currentUser', {
+        value: null,
+        configurable: true,
+        writable: true,
+      });
+
+      const mockUser = {
+        uid: 'user_with_null_auth_current_user',
+        email: 'nullauth@wastelink.go.tz',
+        getIdTokenResult: vi.fn().mockResolvedValue({ claims: { admin: true } }),
+      };
+
+      vi.mocked(Firestore.getDoc).mockResolvedValue({
+        exists: () => true,
+        data: () => ({
+          role: 'admin',
+          accountStatus: 'ACTIVE',
+          email: 'nullauth@wastelink.go.tz',
+          fullName: 'Valid Admin Profile',
+        }),
+      } as any);
+
+      render(
+        <AuthProvider>
+          <AuthConsumer />
+        </AuthProvider>
+      );
+
+      await act(async () => {
+        await authCallback(mockUser);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('loading')).toHaveTextContent('READY');
+      });
+
+      // Crucial: Must fail closed because auth.currentUser is null
+      expect(screen.getByTestId('is-admin')).toHaveTextContent('NOT_ADMIN');
+      expect(screen.getByTestId('current-user')).toHaveTextContent('NO_USER');
+      expect(screen.getByTestId('profile')).toHaveTextContent('NO_PROFILE');
+    });
+
+    it('denies admin access to User A when auth.currentUser currently identifies User B', async () => {
+      autoSyncCurrentUser = false;
+      // Explicitly configure mocked Firebase Auth currentUser as User B
+      const userB = {
+        uid: 'user_b_active_session',
+        email: 'userb@wastelink.go.tz',
+      };
+      Object.defineProperty(auth, 'currentUser', {
+        value: userB,
+        configurable: true,
+        writable: true,
+      });
+
+      const userA = {
+        uid: 'user_a_evaluating',
+        email: 'usera@wastelink.go.tz',
+        getIdTokenResult: vi.fn().mockResolvedValue({ claims: { admin: true } }),
+      };
+
+      vi.mocked(Firestore.getDoc).mockResolvedValue({
+        exists: () => true,
+        data: () => ({
+          role: 'admin',
+          accountStatus: 'ACTIVE',
+          email: 'usera@wastelink.go.tz',
+          fullName: 'User A Admin Profile',
+        }),
+      } as any);
+
+      render(
+        <AuthProvider>
+          <AuthConsumer />
+        </AuthProvider>
+      );
+
+      await act(async () => {
+        await authCallback(userA);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('loading')).toHaveTextContent('READY');
+      });
+
+      // User A cannot obtain admin access when Firebase Auth identifies User B
+      expect(screen.getByTestId('is-admin')).toHaveTextContent('NOT_ADMIN');
+      expect(screen.getByTestId('current-user')).toHaveTextContent('NO_USER');
+      expect(screen.getByTestId('profile')).toHaveTextContent('NO_PROFILE');
+    });
+
+    it('permits admin access when auth.currentUser strictly matches the evaluated user with valid claims and active profile', async () => {
+      autoSyncCurrentUser = false;
+      const validAdmin = {
+        uid: 'matching_auth_admin',
+        email: 'matching@wastelink.go.tz',
+        getIdTokenResult: vi.fn().mockResolvedValue({ claims: { admin: true } }),
+      };
+
+      // Explicitly configure mocked Firebase Auth currentUser as validAdmin
+      Object.defineProperty(auth, 'currentUser', {
+        value: validAdmin,
+        configurable: true,
+        writable: true,
+      });
+
+      vi.mocked(Firestore.getDoc).mockResolvedValueOnce({
+        exists: () => true,
+        data: () => ({
+          role: 'admin',
+          accountStatus: 'ACTIVE',
+          email: 'matching@wastelink.go.tz',
+          fullName: 'Matching Verified Director',
+        }),
+      } as any);
+
+      render(
+        <AuthProvider>
+          <AuthConsumer />
+        </AuthProvider>
+      );
+
+      await act(async () => {
+        await authCallback(validAdmin);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('loading')).toHaveTextContent('READY');
+      });
+
+      // Exact agreement between Firebase Auth instance and evaluated user grants authoritative admin access
+      expect(screen.getByTestId('is-admin')).toHaveTextContent('ADMIN');
+      expect(screen.getByTestId('current-user')).toHaveTextContent('matching_auth_admin');
+      expect(screen.getByTestId('profile')).toHaveTextContent('matching@wastelink.go.tz');
       expect(screen.getByTestId('error')).toHaveTextContent('NO_ERROR');
     });
   });

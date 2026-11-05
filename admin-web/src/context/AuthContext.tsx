@@ -40,8 +40,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (currentSeq !== evalSeqRef.current) return false;
       // 2. Active session identity check: Must match the current active session UID
       if (activeSessionUidRef.current !== (user ? user.uid : null)) return false;
-      // 3. Auth client check: If Firebase Auth reports a currentUser, it must match this user's UID
-      if (auth.currentUser && user && auth.currentUser.uid !== user.uid) return false;
+      // 3. Auth client check: Firebase Auth instance must strictly agree with the evaluated identity
+      if (user && auth.currentUser?.uid !== user.uid) return false;
+      if (!user && auth.currentUser !== null) return false;
       return true;
     };
 
