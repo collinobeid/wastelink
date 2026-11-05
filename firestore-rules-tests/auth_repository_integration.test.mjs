@@ -30,7 +30,7 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const PROJECT_ID = process.env.GCLOUD_PROJECT || "wastelink-4791b";
+const PROJECT_ID = process.env.GCLOUD_PROJECT || "wastelink-27595";
 const AUTH_EMULATOR_HOST = "127.0.0.1";
 const AUTH_EMULATOR_PORT = 9099;
 const FIRESTORE_EMULATOR_HOST = "127.0.0.1";

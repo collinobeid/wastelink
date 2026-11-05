@@ -1,5 +1,6 @@
 {
   "projects": {
-    "default": "wastelink-4791b"
+    "staging": "wastelink-27595",
+    "prod": "wastelink-prod-2026"
   }
 }

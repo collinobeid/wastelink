@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "161365383144",
+    "project_id": "wastelink-27595",
+    "storage_bucket": "wastelink-27595.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:161365383144:android:3448bf6fac95de1cc4f65d",
+        "android_client_info": {
+          "package_name": "com.waste.link"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "161365383144-tpi6aj0rh05thpvv2bkbjsmcjf272n1u.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.waste.link",
+            "certificate_hash": "b2de5d59e5a7431b18618031c667c2e2e6be8c73"
+          }
+        },
+        {
+          "client_id": "161365383144-tm0qldalep605brf02nks1d9v3q3qutr.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAduex24MctqNLjnyZcaunHU0Axu_yucA8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "161365383144-tm0qldalep605brf02nks1d9v3q3qutr.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

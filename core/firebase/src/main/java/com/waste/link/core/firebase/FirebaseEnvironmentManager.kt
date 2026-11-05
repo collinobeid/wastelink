@@ -30,6 +30,26 @@ object FirebaseEnvironmentManager {
     }
 
     /**
+     * Validates that the active Firebase configuration matches the expected build project.
+     */
+    fun validateProjectConfiguration(expectedProjectId: String, actualProjectId: String?) {
+        if (expectedProjectId.isNotEmpty() && actualProjectId != null) {
+            check(expectedProjectId.equals(actualProjectId, ignoreCase = true)) {
+                "Firebase project mismatch: Expected '$expectedProjectId' but runtime configuration loaded '$actualProjectId'"
+            }
+        }
+    }
+
+    /**
+     * Resets environment manager state for unit testing.
+     */
+    fun resetForTesting() {
+        currentEnvironment.set(FirebaseEnvironment.LOCAL_EMULATOR)
+        isProductionActive.set(false)
+        FirebaseEmulatorConfig.resetForTesting()
+    }
+
+    /**
      * Configures Firebase services according to the active environment.
      *
      * - LOCAL_EMULATOR: Connects to local emulators at [emulatorHost] (Auth 9099, Firestore 8080).
@@ -53,9 +73,15 @@ object FirebaseEnvironmentManager {
                 )
             }
             FirebaseEnvironment.REMOTE_STAGING -> {
-                Log.i(TAG, "Configuring Firebase for REMOTE_STAGING (remote endpoints active)")
+                check(!FirebaseEmulatorConfig.isEmulatorConnected()) {
+                    "Security violation: Cannot route to REMOTE_STAGING while local emulator is connected."
+                }
+                Log.i(TAG, "Configuring Firebase for REMOTE_STAGING (remote endpoints active: wastelink-27595)")
             }
             FirebaseEnvironment.PRODUCTION -> {
+                check(!FirebaseEmulatorConfig.isEmulatorConnected()) {
+                    "Security violation: Cannot route to PRODUCTION while local emulator is connected."
+                }
                 check(isProductionActivated()) {
                     "Production Firebase environment is not activated yet. WasteLink is operating in staging mode."
                 }

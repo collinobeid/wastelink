@@ -24,17 +24,17 @@ android {
     buildTypes {
         debug {
             buildConfigField("String", "FIREBASE_ENV", "\"EMULATOR\"")
-            buildConfigField("String", "FIREBASE_PROJECT_ID", "\"wastelink-emulator\"")
+            buildConfigField("String", "FIREBASE_PROJECT_ID", "\"wastelink-27595\"")
         }
         create("staging") {
             initWith(getByName("debug"))
             buildConfigField("String", "FIREBASE_ENV", "\"STAGING\"")
-            buildConfigField("String", "FIREBASE_PROJECT_ID", "\"wastelink-4791b\"")
+            buildConfigField("String", "FIREBASE_PROJECT_ID", "\"wastelink-27595\"")
             matchingFallbacks += listOf("debug")
         }
         release {
             buildConfigField("String", "FIREBASE_ENV", "\"PRODUCTION\"")
-            buildConfigField("String", "FIREBASE_PROJECT_ID", "\"wastelink-prod\"")
+            buildConfigField("String", "FIREBASE_PROJECT_ID", "\"wastelink-prod-2026\"")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

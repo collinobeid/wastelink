@@ -36,6 +36,14 @@ object FirebaseEmulatorConfig {
     fun currentHost(): String? = connectedHost.get()
 
     /**
+     * Resets emulator connection state for isolated unit testing.
+     */
+    fun resetForTesting() {
+        isConnected.set(false)
+        connectedHost.set(null)
+    }
+
+    /**
      * Connects [firebaseAuth] and [firestore] to the local Firebase Emulator Suite if not already connected.
      */
     @Synchronized
