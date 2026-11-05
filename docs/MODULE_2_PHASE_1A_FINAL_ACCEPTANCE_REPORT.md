@@ -1,11 +1,11 @@
 # WASTELINK — MODULE 2 PHASE 1A FINAL ACCEPTANCE REPORT
-## Strict VP8X 10-Byte Header, Reserved Bits, Sequential Extended-Container Parser & Municipal Boundary Clarification
+## Strict VP8L Bitstream Header Parsing (RFC 9649), VP8X Alpha Agreement, Flexible Metadata Ordering, and Supported-Format Policy Clarification
 
-**Document Version:** 1.2.0<br>
+**Document Version:** 1.3.0<br>
 **Date:** November 5, 2026<br>
 **Status:** PHASE 1A COMPLETE & FULLY ACCEPTED — FINAL VERIFICATION READY FOR INDEPENDENT REVIEW<br>
 **Branch:** `rebuild/modular-workspace`<br>
-**Starting Commit:** `cac9f57`<br>
+**Starting Commit:** `8f29bf9`<br>
 **Reference Specification:** [`docs/MODULE_2_RESIDENT_REQUEST_ARCHITECTURE.md`](MODULE_2_RESIDENT_REQUEST_ARCHITECTURE.md) (v2.1.0-ENTERPRISE)<br>
 **Acceptance Test Matrix:** [`docs/MODULE_2_RESIDENT_REQUEST_ACCEPTANCE_CHECKLIST.md`](MODULE_2_RESIDENT_REQUEST_ACCEPTANCE_CHECKLIST.md) (Layer 1)<br>
 **Author:** Implementation Engineer (Antigravity Mobile & Architecture Team)<br>
@@ -15,32 +15,31 @@
 
 ## 1. Executive Summary
 
-This report establishes the final format-validation correction and verification for Module 2 Phase 1A (*Pure Kotlin Domain Foundation & Unit Test Suite*), resolving the remaining technical findings on commit `cac9f57`:
+This report establishes the final format-validation correction and verification for Module 2 Phase 1A (*Pure Kotlin Domain Foundation & Unit Test Suite*), resolving the remaining technical findings on commit `8f29bf9`:
 
-1. **Strict VP8X Header & Reserved Field Validation**:
-   - Upgraded [`RequestValidator.validateWebpStructure`](../core/domain/src/main/java/com/waste/link/domain/validation/RequestValidator.kt) to enforce that the VP8X chunk payload is **strictly and exactly 10 bytes** (`firstChunkSize == 10L`), rejecting payloads shorter or larger than 10 bytes immediately before subsequent offset computation.
-   - Enforced validation of the 8-bit Feature Flags byte (byte 20): bits 7, 6, and 0 (`0x80`, `0x40`, `0x01`, mask `0xC1`) are reserved and **MUST be 0**.
-   - Enforced strict rejection of animated WebP: bit 1 (Animation flag `0x02`) and chunks `'ANIM'` or `'ANMF'` are rejected for the static gate reference photo requirement.
-   - Enforced validation of the 24-bit Reserved field (bytes 21..23): all three bytes **MUST be `0x00`**.
-   - Validated canvas dimensions (bytes 24..29): 24-bit little-endian canvas width and height, enforcing that `canvasWidth * canvasHeight <= 2^32 - 1`.
-2. **Sequential State-Based Extended-Container Parser**:
-   - Implemented a clear sequential state-based parser that enforces RFC 9649 / Google WebP Container Specification rules:
-     - **Exactly one primary image bitstream:** Exactly one of `'VP8 '` (lossy) or `'VP8L'` (lossless). Duplicate image chunks and multiple image streams are strictly rejected.
-     - **Strict ALPH pairing and ordering:** `'ALPH'` is only valid with a lossy `'VP8 '` image and MUST immediately precede the `'VP8 '` chunk. Pairing `'ALPH'` with `'VP8L'`, placing `'ALPH'` after the image, or failing to immediately follow `'ALPH'` with `'VP8 '` is strictly rejected.
-     - **Metadata ordering:** `'EXIF'` and `'XMP '` metadata chunks MUST appear after the image bitstream. When both are present, `'EXIF'` MUST precede `'XMP '`. Misplaced or duplicate metadata chunks are strictly rejected.
-     - **Feature flag agreement:** VP8X header flags (`ICC`, `Alpha`, `EXIF`, `XMP`) MUST strictly agree with the actual chunks present in the container. Declaring a flag without the chunk or including a chunk without setting its header flag is rejected.
-     - **Boundary & integrity enforcement:** Continued enforcement of 8-byte chunk headers, container boundary fitting, mandatory `0x00` padding on odd-sized chunks, and exact RIFF consumption without trailing bytes.
-3. **Accurate ServiceZone Geometric Documentation**:
-   - Updated KDoc in [`ServiceZone.kt`](../core/domain/src/main/java/com/waste/link/domain/model/ServiceZone.kt) to remove wording implying that pure Kotlin ray-casting establishes authoritative municipal GIS boundaries:
-     - Documented that bounding-box-only mode is an intentional initial approximation.
-     - Documented that polygon mode performs planar, boundary-inclusive point-in-polygon testing on supplied coordinates.
-     - Documented that accuracy depends directly on the quality, resolution, and validity of the supplied polygon vertices.
-     - Explicitly stated that client-side domain verification is not a substitute for authoritative municipal GIS validation.
-     - Preserved approved boundary-inclusive containment behavior (`pt` on vertex or edge is considered INSIDE).
+1. **VP8L Bitstream Header Parsing & RFC 9649 Version Validation**:
+   - Upgraded [`RequestValidator.validateWebpStructure`](../core/domain/src/main/java/com/waste/link/domain/validation/RequestValidator.kt) to safely parse the 5-byte VP8L bitstream header in both simple lossless files and extended VP8X containers.
+   - Verified the 1-byte magic signature (`0x2F`) at payload byte 0.
+   - Decoded byte 4 of the VP8L header: bits 5..7 contain the 3-bit bitstream `version_number`. Enforced that this field **MUST be 0** per RFC 9649 Section 3.2. Any non-zero version is rejected.
+   - Checked chunk payload boundaries to ensure truncated VP8L headers ($< 5$ bytes) are safely caught and rejected.
+2. **VP8X Alpha Feature Flag Agreement with VP8L Bitstream**:
+   - Extracted the 1-bit `alpha_is_used` hint from bit 4 of byte 4 of the VP8L bitstream header.
+   - When the container image is lossless `'VP8L'`, enforced bidirectional agreement between the VP8X header Alpha flag (`0x10`) and the `alpha_is_used` bit:
+     - If VP8X Alpha flag is set, `alpha_is_used` MUST be 1.
+     - If VP8X Alpha flag is clear, `alpha_is_used` MUST be 0.
+   - Lossless `'VP8L'` does not require or accept an auxiliary `'ALPH'` chunk because transparency is native to the VP8L bitstream.
+   - Preserved the existing rule that an `'ALPH'` chunk is valid only when paired with lossy `'VP8 '`.
+3. **Corrected Metadata Specification Policy & Supported-Format Documentation**:
+   - Clarified that RFC 9649 allows `'EXIF'` and `'XMP '` metadata chunks to appear in either order following the image bitstream.
+   - Updated the extended container parser to accept `'EXIF'` followed by `'XMP '` or `'XMP '` followed by `'EXIF'`, while maintaining strict duplicate rejection and VP8X feature-flag agreement.
+   - Explicitly documented that:
+     - Metadata ordering flexibility is aligned with RFC 9649.
+     - Rejecting unrecognized/unknown chunks is a deliberate, application-specific security profile for resident gate photos.
+     - Rejecting animated WebP (`'ANIM'`/`'ANMF'` chunks and animation flag `0x02`) is a deliberate application policy to enforce static-image capture.
 4. **Comprehensive Test Suite & XML Reconciliation**:
-   - Total **149 unit tests** in `:core:domain` (134 Module 2 tests + 15 Module 1 tests), all executed and passing (100%).
-   - Total **267 unit tests** project-wide across all 5 Gradle modules with zero failures, zero errors, and zero skipped tests.
-   - Project-wide debug APK build (`assembleDebug`) succeeds cleanly in 5 seconds.
+   - Total **157 unit tests** in `:core:domain` (142 Module 2 tests + 15 Module 1 tests), all executed and passing (100%).
+   - Total **275 unit tests** project-wide across all 5 Gradle modules with zero failures, zero errors, and zero skipped tests.
+   - Project-wide debug APK build (`assembleDebug`) succeeds cleanly in 11 seconds (248 tasks executed/up-to-date).
 5. **Strict Governance Boundaries**:
    - Zero Room entities, DAOs, migrations, Firestore DTOs, security rules, Cloud Functions, UI screens, MapLibre, or Storage uploads introduced. Pure Kotlin `:core:domain` scope strictly maintained.
 
@@ -55,10 +54,23 @@ This report establishes the final format-validation correction and verification 
 | Format Type | FourCC | Structural Requirements & Invariants |
 | :--- | :---: | :--- |
 | **Simple Lossy (VP8)** | `'VP8 '` | Header size $\ge 10$ bytes. Verified VP8 frame tag and keyframe start code `0x9D 0x01 0x2A`. Must completely consume the container: $20 + \text{chunkSize} + \text{pad} == \text{fileSize}$. Trailing garbage or subsequent chunks are strictly rejected. |
-| **Simple Lossless (VP8L)** | `'VP8L'` | Header size $\ge 5$ bytes. Verified lossless signature `0x2F`. If payload is odd, required `0x00` padding byte must exist. Must completely consume the container: $20 + \text{chunkSize} + \text{pad} == \text{fileSize}$. Trailing data rejected. |
-| **Extended WebP (VP8X)** | `'VP8X'` | Header size MUST be exactly 10 bytes. Reserved bits in flags byte (bits 7, 6, 0) and 24-bit reserved field (bytes 21..23) MUST be `0`. Traverses subsequent chunks in sequential order: optional `ICCP` $\rightarrow$ optional `ALPH` (only with `VP8 `) $\rightarrow$ exactly one primary image (`VP8 ` or `VP8L`) $\rightarrow$ optional `EXIF` $\rightarrow$ optional `XMP `. Enforces complete 8-byte chunk headers, bounds, `0x00` padding on odd chunks, and strict feature-flag agreement. |
+| **Simple Lossless (VP8L)** | `'VP8L'` | Header size $\ge 5$ bytes. Verified lossless signature `0x2F` at byte 0. Byte 4 bits 5..7 (version) MUST be 0. If payload is odd, required `0x00` padding byte must exist. Must completely consume the container: $20 + \text{chunkSize} + \text{pad} == \text{fileSize}$. Trailing data rejected. |
+| **Extended WebP (VP8X)** | `'VP8X'` | Header size MUST be exactly 10 bytes. Reserved bits in flags byte (bits 7, 6, 0) and 24-bit reserved field (bytes 21..23) MUST be `0`. Traverses subsequent chunks in sequential order: optional `ICCP` $\rightarrow$ optional `ALPH` (only with `VP8 `) $\rightarrow$ exactly one primary image (`VP8 ` or `VP8L`) $\rightarrow$ optional metadata (`EXIF` and/or `XMP ` in either order). Enforces complete 8-byte chunk headers, bounds, `0x00` padding on odd chunks, and strict feature-flag agreement (including VP8L `alpha_is_used` bit). |
 
-### 2.2 Extended Container (VP8X) Invariant Matrix
+### 2.2 VP8L 5-Byte Bitstream Header Layout (RFC 9649 Section 3.2)
+
+The 5-byte header begins immediately at the start of the VP8L chunk payload:
+
+```
+ Byte 0:   [ 0x2F ]  (Mandatory Lossless Signature)
+ Bytes 1..4: 32 bits (Least-Significant-Bit-First):
+   Bits 0..13  (14 bits): image_width - 1
+   Bits 14..27 (14 bits): image_height - 1
+   Bit 28      (1 bit)  : alpha_is_used (located at Byte 4, Bit 4)
+   Bits 29..31 (3 bits) : version_number (located at Byte 4, Bits 5..7; MUST be 0)
+```
+
+### 2.3 Extended Container (VP8X) Invariant Matrix
 
 | Invariant Category | Rule & Specification Requirement | Rejection Error Message |
 | :--- | :--- | :--- |
@@ -70,14 +82,20 @@ This report establishes the final format-validation correction and verification 
 | **Image Bitstream Cardinality** | Exactly one `'VP8 '` or `'VP8L'` image chunk. Multiple or duplicate streams rejected. | `Gate reference photo contains duplicate or multiple image chunks...` |
 | **ALPH Association** | `'ALPH'` is only valid with lossy `'VP8 '`. Pairing with `'VP8L'` is rejected. | `Gate reference photo contains invalid ALPH chunk paired with lossless VP8L...` |
 | **ALPH Immediate Succession** | `'ALPH'` MUST immediately precede `'VP8 '`. Any intervening chunk is rejected. | `Gate reference photo contains ALPH chunk not immediately followed by lossy VP8 image chunk...` |
-| **Metadata Ordering** | `'EXIF'` and `'XMP '` MUST appear after image data. If both exist, `'EXIF'` precedes `'XMP '`. | `Gate reference photo contains misplaced EXIF/XMP chunk...` |
+| **VP8L Alpha Agreement** | When image is `'VP8L'`, VP8X Alpha flag (`0x10`) MUST agree with `alpha_is_used` bit. | `Gate reference photo VP8X header declared alpha flag but VP8L bitstream alpha_is_used bit is not set` / `Gate reference photo VP8L bitstream has alpha_is_used bit set but VP8X header did not set alpha flag.` |
+| **VP8L Version Check** | Bits 5..7 of VP8L header byte 4 MUST be 0 per RFC 9649. | `Gate reference photo contains corrupted VP8L stream... (invalid version bits: <v>; must be 0).` |
+| **Metadata Location** | `'EXIF'` and `'XMP '` MUST appear after image data. Either order (`EXIF` $\rightarrow$ `XMP ` or `XMP ` $\rightarrow$ `EXIF`) is accepted. | `Gate reference photo contains misplaced EXIF/XMP chunk at offset <offset> (metadata must follow image data).` |
 | **Auxiliary Chunk Duplicates** | Duplicate `'ICCP'`, `'ALPH'`, `'EXIF'`, or `'XMP '` chunks are rejected. | `Gate reference photo contains duplicate <FourCC> chunk at offset <offset>.` |
-| **Feature Flag Agreement** | Declared VP8X flags MUST agree with chunks actually present in the file. | `Gate reference photo VP8X header declared <flag> flag but no <chunk> chunk was present...` |
+| **Feature Flag Agreement** | Declared VP8X flags MUST agree with chunks/bits actually present in the file. | `Gate reference photo VP8X header declared <flag> flag but no <chunk> chunk was present...` |
 
-### 2.3 Architectural Disclaimer
+### 2.4 Application-Specific Supported-Format Restrictions
 
 > [!NOTE]
-> Pure Kotlin domain validation verifies container structure, stream signatures, chunk bounds, padding bytes, and header invariants. Full pixel raster decoding belongs to the Android platform layer (`BitmapFactory`/`ImageDecoder`), while photographic authenticity, GPS provenance, and anti-spoofing belong to Play Integrity API and Cloud Storage security rules.
+> WasteLink deliberately restricts accepted WebP files to a secure static-photo profile:
+> 1. **No Animation:** Animated WebP (`ANIM`/`ANMF` chunks, flag `0x02`) is rejected to ensure gate reference photos are unambiguous single-frame evidence.
+> 2. **No Unrecognized Chunks:** Chunks outside the supported set (`ICCP`, `ALPH`, `VP8 `, `VP8L`, `EXIF`, `XMP `) are rejected to prevent arbitrary binary embedding.
+> 3. **Strict RIFF Envelope:** Trailing bytes, odd RIFF lengths, and missing/non-zero chunk padding bytes are rejected to prevent file-tampering or steganographic payload appending.
+> 4. **Decoding Boundary:** Pure Kotlin domain checks confirm container and stream structural integrity. Platform raster decoding is delegated to the UI layer, and cryptographic image authenticity to Cloud Storage and Play Integrity.
 
 ---
 
@@ -116,12 +134,12 @@ Audited every XML test report generated by `.\gradlew.bat testDebugUnitTest` and
 | | `GeoCoordinatesTest` | 5 | 0 | 0 | 0 | 100% PASS |
 | | `RequestRefSpecificationTest` | 5 | 0 | 0 | 0 | 100% PASS |
 | | `RequestStateTransitionValidatorTest` | 26 | 0 | 0 | 0 | 100% PASS |
-| | `RequestValidatorTest` | 64 | 0 | 0 | 0 | 100% PASS |
+| | `RequestValidatorTest` | 72 | 0 | 0 | 0 | 100% PASS |
 | | `ServiceZoneTest` | 14 | 0 | 0 | 0 | 100% PASS |
 | | `VolumeTierTest` | 4 | 0 | 0 | 0 | 100% PASS |
 | | `WasteCategoryTest` | 7 | 0 | 0 | 0 | 100% PASS |
 | | `WasteRequestDomainTest` | 9 | 0 | 0 | 0 | 100% PASS |
-| **`:core:domain` Subtotal** | **9 Test Classes** | **149** | **0** | **0** | **0** | **100% PASS** |
+| **`:core:domain` Subtotal** | **9 Test Classes** | **157** | **0** | **0** | **0** | **100% PASS** |
 | **`:core:data`** | `UserDomainAndMapperTest` | 13 | 0 | 0 | 0 | 100% PASS |
 | **`:core:data` Subtotal** | **1 Test Class** | **13** | **0** | **0** | **0** | **100% PASS** |
 | **`:core:firebase`** | `FirebaseEnvironmentManagerTest` | 6 | 0 | 0 | 0 | 100% PASS |
@@ -134,39 +152,19 @@ Audited every XML test report generated by `.\gradlew.bat testDebugUnitTest` and
 | **`:feature:auth` Subtotal** | **5 Test Classes** | **98** | **0** | **0** | **0** | **100% PASS** |
 | **`:app`** | `ExampleUnitTest` | 1 | 0 | 0 | 0 | 100% PASS |
 | **`:app` Subtotal** | **1 Test Class** | **1** | **0** | **0** | **0** | **100% PASS** |
-| **Project-Wide Grand Total** | **17 Test Classes** | **267** | **0** | **0** | **0** | **100% PASS** |
+| **Project-Wide Grand Total** | **17 Test Classes** | **275** | **0** | **0** | **0** | **100% PASS** |
 
-### 4.1 Summary of 29 VP8X Regression Tests in `RequestValidatorTest.kt`
+### 4.1 Summary of New VP8L & Metadata Regression Tests in `RequestValidatorTest.kt`
 
-1. `gatePhoto_vp8xHeaderShorterThan10Bytes_returnsError`: Validates that a 9-byte VP8X payload is rejected.
-2. `gatePhoto_vp8xHeaderLargerThan10Bytes_returnsError`: Validates that a 12-byte VP8X payload is rejected.
-3. `gatePhoto_vp8xReservedBitsInFlagsByte_returnsError`: Validates that reserved bits 7 (`0x80`) and 0 (`0x01`) in the flags byte are rejected.
-4. `gatePhoto_vp8xReserved24BitFieldNonZero_returnsError`: Validates that a non-zero byte in bytes 21..23 is rejected.
-5. `gatePhoto_vp8xAnimationFlagRejected_returnsError`: Validates that animation flag (`0x02`) is rejected.
-6. `gatePhoto_vp8xAnimatedChunks_returnsError`: Validates that `'ANIM'` and `'ANMF'` chunks are rejected.
-7. `gatePhoto_vp8xDuplicateImageChunks_returnsError`: Validates that multiple lossy `'VP8 '` chunks are rejected.
-8. `gatePhoto_vp8xMultipleImageStreams_returnsError`: Validates that mixed `'VP8 '` and `'VP8L'` chunks are rejected.
-9. `gatePhoto_vp8xAlphPairedWithLosslessVp8l_returnsError`: Validates that pairing `'ALPH'` with `'VP8L'` is rejected.
-10. `gatePhoto_vp8xAlphMisplacedAfterImage_returnsError`: Validates that `'ALPH'` occurring after `'VP8 '` is rejected.
-11. `gatePhoto_vp8xAlphNotFollowedByVp8_returnsError`: Validates that `'ALPH'` followed by metadata instead of `'VP8 '` is rejected.
-12. `gatePhoto_vp8xDuplicateAlphChunk_returnsError`: Validates that duplicate `'ALPH'` chunks are rejected.
-13. `gatePhoto_vp8xExifBeforeImage_returnsError`: Validates that `'EXIF'` preceding the image bitstream is rejected.
-14. `gatePhoto_vp8xDuplicateExif_returnsError`: Validates that duplicate `'EXIF'` chunks are rejected.
-15. `gatePhoto_vp8xDuplicateXmp_returnsError`: Validates that duplicate `'XMP '` chunks are rejected.
-16. `gatePhoto_vp8xExifAfterXmp_returnsError`: Validates that `'EXIF'` appearing after `'XMP '` is rejected.
-17. `gatePhoto_vp8xIccpAfterImage_returnsError`: Validates that `'ICCP'` appearing after the image bitstream is rejected.
-18. `gatePhoto_vp8xDuplicateIccp_returnsError`: Validates that duplicate `'ICCP'` chunks are rejected.
-19. `gatePhoto_vp8xFlagIccWithoutIccpChunk_returnsError`: Validates that ICC flag set without `'ICCP'` chunk is rejected.
-20. `gatePhoto_vp8xIccpChunkWithoutFlagIcc_returnsError`: Validates that `'ICCP'` chunk present without ICC flag is rejected.
-21. `gatePhoto_vp8xFlagAlphaWithoutAlphChunk_returnsError`: Validates that Alpha flag set without `'ALPH'` chunk in lossy mode is rejected.
-22. `gatePhoto_vp8xAlphChunkWithoutFlagAlpha_returnsError`: Validates that `'ALPH'` chunk present without Alpha flag is rejected.
-23. `gatePhoto_vp8xFlagExifWithoutExifChunk_returnsError`: Validates that EXIF flag set without `'EXIF'` chunk is rejected.
-24. `gatePhoto_vp8xExifChunkWithoutFlagExif_returnsError`: Validates that `'EXIF'` chunk present without EXIF flag is rejected.
-25. `gatePhoto_vp8xFlagXmpWithoutXmpChunk_returnsError`: Validates that XMP flag set without `'XMP '` chunk is rejected.
-26. `gatePhoto_vp8xXmpChunkWithoutFlagXmp_returnsError`: Validates that `'XMP '` chunk present without XMP flag is rejected.
-27. `gatePhoto_validVp8xWithIccpAndLosslessVp8l_succeeds`: Validates that a fully formed VP8X + ICCP + VP8L container passes.
-28. `gatePhoto_validVp8xWithAlphAndLossyVp8_succeeds`: Validates that a fully formed VP8X + ALPH + VP8 container passes.
-29. `gatePhoto_validVp8xWithExifAndXmp_succeeds`: Validates that a fully formed VP8X + VP8 + EXIF + XMP container passes.
+1. `gatePhoto_validVp8xWithXmpPrecedingExif_succeeds`: Validates that metadata chunks in the order `XMP ` $\rightarrow$ `EXIF` following image data are accepted per RFC 9649.
+2. `gatePhoto_vp8xVp8lAlphaSetAndFlagAlphaSet_succeeds`: Validates that VP8L with `alpha_is_used` bit set and VP8X header Alpha flag set passes.
+3. `gatePhoto_vp8xVp8lAlphaSetAndFlagAlphaClear_returnsError`: Validates that VP8L with `alpha_is_used` bit set and VP8X header Alpha flag clear is rejected.
+4. `gatePhoto_vp8xVp8lAlphaClearAndFlagAlphaSet_returnsError`: Validates that VP8L with `alpha_is_used` bit clear and VP8X header Alpha flag set is rejected.
+5. `gatePhoto_vp8xVp8lAlphaClearAndFlagAlphaClear_succeeds`: Validates that VP8L with `alpha_is_used` bit clear and VP8X header Alpha flag clear passes.
+6. `gatePhoto_vp8xVp8lInvalidVersionBits_returnsError`: Validates that non-zero version bits in VP8L inside a VP8X container are rejected per RFC 9649.
+7. `gatePhoto_simpleVp8lInvalidVersionBits_returnsError`: Validates that non-zero version bits in simple VP8L files are rejected per RFC 9649.
+8. `gatePhoto_vp8xTruncatedVp8lHeader_returnsError`: Validates that a truncated VP8L header ($< 5$ bytes) inside a VP8X container is rejected.
+9. `gatePhoto_simpleVp8lTruncatedHeader_returnsError`: Validates that a truncated VP8L header ($< 5$ bytes) in a simple VP8L file is rejected.
 
 ---
 
@@ -174,13 +172,13 @@ Audited every XML test report generated by `.\gradlew.bat testDebugUnitTest` and
 
 ```powershell
 PS C:\Users\JogerBee\Desktop\WasteLink> .\gradlew.bat :core:domain:testDebugUnitTest
-BUILD SUCCESSFUL in 5s (149 tests passed, 0 failures, 0 errors, 0 skipped)
+BUILD SUCCESSFUL in 6s (157 tests passed, 0 failures, 0 errors, 0 skipped)
 
 PS C:\Users\JogerBee\Desktop\WasteLink> .\gradlew.bat testDebugUnitTest
-BUILD SUCCESSFUL in 15s (267 tests passed across all 5 modules, 0 failures, 0 errors, 0 skipped)
+BUILD SUCCESSFUL in 17s (275 tests passed across all 5 modules, 0 failures, 0 errors, 0 skipped)
 
 PS C:\Users\JogerBee\Desktop\WasteLink> .\gradlew.bat assembleDebug
-BUILD SUCCESSFUL in 5s (248 actionable tasks, 0 errors)
+BUILD SUCCESSFUL in 11s (248 actionable tasks, 0 errors)
 
 PS C:\Users\JogerBee\Desktop\WasteLink> git diff --check
 (exited 0, clean whitespace and formatting)

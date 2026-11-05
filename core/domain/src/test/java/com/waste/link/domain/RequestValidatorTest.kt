@@ -301,9 +301,12 @@ class RequestValidatorTest {
         return payload
     }
 
-    private fun validVp8lPayload(): ByteArray {
+    private fun validVp8lPayload(alphaIsUsed: Boolean = false, version: Int = 0): ByteArray {
         val payload = ByteArray(10)
         payload[0] = 0x2F.toByte()
+        val alphaBit = if (alphaIsUsed) 0x10 else 0x00
+        val versionBits = (version and 0x07) shl 5
+        payload[4] = (alphaBit or versionBits).toByte()
         return payload
     }
 
@@ -779,14 +782,13 @@ class RequestValidatorTest {
     }
 
     @Test
-    fun gatePhoto_vp8xExifAfterXmp_returnsError() {
+    fun gatePhoto_validVp8xWithXmpPrecedingExif_succeeds() {
         val b64 = createVp8xContainer(
             flags = 0x0C.toByte(),
             chunks = listOf("VP8 " to validVp8Payload(), "XMP " to ByteArray(6), "EXIF" to ByteArray(6))
         )
         val errors = RequestValidator.validateGatePhoto(b64)
-        assertEquals(1, errors.size)
-        assertTrue(errors[0].contains("misplaced EXIF chunk"))
+        assertTrue(errors.isEmpty())
     }
 
     @Test
@@ -905,6 +907,101 @@ class RequestValidatorTest {
         )
         val errors = RequestValidator.validateGatePhoto(b64)
         assertTrue(errors.isEmpty())
+    }
+
+    // VP8L Bitstream Header & Alpha Agreement Tests (RFC 9649)
+    @Test
+    fun gatePhoto_vp8xVp8lAlphaSetAndFlagAlphaSet_succeeds() {
+        val b64 = createVp8xContainer(
+            flags = 0x10.toByte(),
+            chunks = listOf("VP8L" to validVp8lPayload(alphaIsUsed = true))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertTrue(errors.isEmpty())
+    }
+
+    @Test
+    fun gatePhoto_vp8xVp8lAlphaSetAndFlagAlphaClear_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x00.toByte(),
+            chunks = listOf("VP8L" to validVp8lPayload(alphaIsUsed = true))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("VP8L bitstream has alpha_is_used bit set but VP8X header did not set alpha flag"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xVp8lAlphaClearAndFlagAlphaSet_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x10.toByte(),
+            chunks = listOf("VP8L" to validVp8lPayload(alphaIsUsed = false))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("VP8X header declared alpha flag but VP8L bitstream alpha_is_used bit is not set"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xVp8lAlphaClearAndFlagAlphaClear_succeeds() {
+        val b64 = createVp8xContainer(
+            flags = 0x00.toByte(),
+            chunks = listOf("VP8L" to validVp8lPayload(alphaIsUsed = false))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertTrue(errors.isEmpty())
+    }
+
+    @Test
+    fun gatePhoto_vp8xVp8lInvalidVersionBits_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x00.toByte(),
+            chunks = listOf("VP8L" to validVp8lPayload(alphaIsUsed = false, version = 1))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("invalid version bits: 1; must be 0"))
+    }
+
+    @Test
+    fun gatePhoto_simpleVp8lInvalidVersionBits_returnsError() {
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LosslessWebpBase64)
+        // Corrupt version bits in byte 24: set version to 1 (bit 5 = 0x20)
+        rawBytes[24] = 0x20.toByte()
+        val b64 = Base64.getEncoder().encodeToString(rawBytes)
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("invalid version bits: 1; must be 0"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xTruncatedVp8lHeader_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x00.toByte(),
+            chunks = listOf("VP8L" to ByteArray(4))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("corrupted subsequent VP8L header (chunk size 4 < 5)"))
+    }
+
+    @Test
+    fun gatePhoto_simpleVp8lTruncatedHeader_returnsError() {
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LosslessWebpBase64)
+        val truncated = ByteArray(24) // 12 RIFF + 8 VP8L header + 4 payload
+        System.arraycopy(rawBytes, 0, truncated, 0, 20)
+        // RIFF size = 24 - 8 = 16
+        truncated[4] = 16.toByte()
+        truncated[5] = 0.toByte()
+        // Chunk size = 4
+        truncated[16] = 4.toByte()
+        truncated[17] = 0.toByte()
+        // Payload: 0x2F and 3 zeros
+        truncated[20] = 0x2F.toByte()
+        val b64 = Base64.getEncoder().encodeToString(truncated)
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("corrupted VP8L header (chunk size 4 < 5)"))
     }
 
     // RIFF Declared Length Discrepancy Tests
