@@ -141,7 +141,32 @@ Target test directory: `core/data/src/test/java/com/waste/link/data/repository/`
 | **IT-REP-05** | Stream user requests via `getUserRequests(uid)`. | Emits list ordered by `createdAt DESC`; updates dynamically on Firestore snapshots. | `./gradlew :core:data:testDebugUnitTest` | PENDING |
 | **IT-REP-06** | Stream single request via `watchRequest(id)`. | Emits live updates when collector updates status (`EN_ROUTE`, `ARRIVED`). | `./gradlew :core:data:testDebugUnitTest` | PENDING |
 | **IT-REP-07** | Fetch categories from `/waste_categories`. | Returns Firestore documents mapped to `DynamicWasteCategory`; caches locally for offline use. | `./gradlew :core:data:testDebugUnitTest` | PENDING |
-| **IT-REP-08** | **Mappers Separation Test**: Map between `WasteRequest`, `LocalWasteRequestRecord`, and `WasteRequestDto`. | Bidirectional transformations preserve all fields without dropping or modifying data. | `./gradlew :core:data:testDebugUnitTest` | PENDING |
+| **IT-REP-08** | **Mappers Separation Test**: Map between `WasteRequest` and `LocalWasteRequestRecord`. | Bidirectional transformations preserve all fields without dropping or modifying data. | `./gradlew :core:data:testDebugUnitTest` | **PASSED (Phase 1B)** |
+
+### 5.1 Phase 1B Local Persistence & Repository Foundation Acceptance Matrix
+
+Target test directory: `core/data/src/test/java/com/waste/link/data/`
+
+| ID | Required Behavior | Pass Condition | Test Target | Status |
+| :---: | :--- | :--- | :--- | :---: |
+| **P1B-01** | Save draft | Draft is persisted and can be retrieved | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-02** | Update draft | Updated values survive database reload | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-03** | Restore draft | Draft survives database close/reopen | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-04** | Delete draft | Deleted draft is no longer returned | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-05** | UID isolation | User A cannot retrieve User B's draft | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-06** | UID write isolation | User A cannot overwrite User B's draft | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-07** | Save local request | Request can be reconstructed as the same domain data | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-08** | Request uniqueness | Duplicate user/request ID is handled deterministically | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-09** | Request isolation | User A cannot retrieve User B's local request | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-10** | Update isolation | User A cannot update User B's local request | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-11** | Delete isolation | User A cannot delete User B's local request | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-12** | Queue retrieval | Only the current user's queued records are returned | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-13** | Sync-state separation | Local state does not alter domain lifecycle status | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-14** | No false confirmation | Local insertion never reports remote creation success | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-15** | Transaction integrity | Failed multi-step writes do not leave partial state | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-16** | Migration | Existing data survives the introduced migration (v1 -> v2) | `WasteLinkMigrationTest` | **PASSED** |
+| **P1B-17** | Empty UID | Blank or missing UID fails safely | `LocalWasteRequestRepositoryTest` | **PASSED** |
+| **P1B-18** | Mapping | Supported domain fields round-trip without silent loss | `WasteRequestLocalMapperTest` | **PASSED** |
 
 ---
 
