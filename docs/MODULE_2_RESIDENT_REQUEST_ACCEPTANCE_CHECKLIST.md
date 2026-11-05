@@ -24,7 +24,7 @@ flowchart LR
     L6 --> SignOff([Unconditional Module 2 Acceptance])
 ```
 
-- [ ] 100% of pure Kotlin domain unit tests passing (state machine, coordinate bounds, enum conversions, validation invariants).
+- [x] 100% of pure Kotlin domain unit tests passing (state machine, coordinate bounds, enum conversions, validation invariants).
 - [ ] 100% of ViewModel presentation, wizard navigation (Category $\rightarrow$ Location $\rightarrow$ Volume $\rightarrow$ Confirm), and draft retention tests passing.
 - [ ] 100% of Firestore security rules tests passing on the local emulator (including field whitelist, PoC enforcement, server-authoritative timestamps, and transition-by-transition tests).
 - [ ] Room caching, WorkManager offline synchronization, and multi-user logout isolation verified.
@@ -41,24 +41,24 @@ Target test directory: `core/domain/src/test/java/com/waste/link/domain/`
 
 | Test ID | Test Scenario | Expected Outcome | Verification Command | Status |
 | :---: | :--- | :--- | :--- | :---: |
-| **UT-DOM-01** | Instantiate `GeoCoordinates` with valid coordinates (`-6.7924, 39.2083`). | Object created without exception. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-02** | Instantiate `GeoCoordinates` with invalid latitude (`-91.0` or `95.0`). | Throws `IllegalArgumentException("Latitude out of bounds")`. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-03** | Instantiate `GeoCoordinates` with invalid longitude (`-185.0` or `181.0`). | Throws `IllegalArgumentException("Longitude out of bounds")`. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-04** | **Verified Geohash Test**: Compute 7-character Geohash from Dar es Salaam coordinates (`-6.7924, 39.2083`). | Returns exact verified base-32 string: **`"kygck5q"`** (not `kxnd47q`). | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-05** | Validate `DynamicWasteCategory` parsing from valid ID string. | Returns valid domain entity with correct special handling and hazardous flags. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-06** | **No Silent Fallback Test**: Attempt to resolve an unknown category ID (`"unknown_waste_type"`). | **Throws `UnknownWasteCategoryException`**. Does **not** fall back to `HOUSEHOLD`. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-07** | **Inactive Category Test**: Attempt to select a category with `isActive == false`. | **Throws `InactiveCategoryException`**. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-08** | Validate `VolumeTier.fromId()` with valid IDs (`"small_bag"`, `"standard_bin"`). | Returns corresponding `VolumeTier` constant. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-09** | **No Silent Fallback Test**: Attempt to parse an unknown volume tier ID (`"huge_tank"`). | **Throws `UnknownVolumeTierException`**. Does **not** fall back to `STANDARD_BIN`. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-10** | Validate `VolumeTier` bag capacity calculation for logistics heuristics. | `SMALL_BAG` yields 2 bags, `STANDARD_BIN` yields 5 bags, `LARGE_LOAD` yields 15 bags, `TRUCK_LOAD` yields 40 bags. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-11** | **Collision-Safe Reference Tag**: Format reference tag from deterministic UUID high bits. | Generates `WL-YYMM-XXXXXX` (Crockford Base32, 6 chars). Matches regex `^WL-[0-9]{4}-[0-9A-Z]{6}$`. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-12** | Validate state machine: `DRAFT` to `PENDING_DISPATCH`. | Permitted when resident active and coordinates present. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-13** | Validate state machine: `PENDING_DISPATCH` to `CANCELLED`. | Permitted when actor is resident owner. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-14** | Validate forbidden transition: `PENDING_DISPATCH` to `COMPLETED` by resident. | Rejects with domain error: `InvalidStateTransitionException`. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-15** | Validate forbidden transition: `ASSIGNED_TO_FLEET` to `CANCELLED` by resident. | Rejects with domain error: `CancellationLockedException`. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-16** | Validate transition: `ARRIVED_AT_LOCATION` to `COLLECTION_VERIFIED` requires PoC photo. | Throws `MissingProofOfCollectionException` if photo payload is null or blank. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-17** | Validate transition: `ARRIVED_AT_LOCATION` to `FAILED` requires failure photo & reason. | Throws `MissingFailureEvidenceException` if failure photo or reason is missing. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
-| **UT-DOM-18** | Coordinate bounds check against active `ServiceZone`. | Coordinates inside active bounds return `true`; coordinates outside return `false`. | `./gradlew :core:domain:testDebugUnitTest` | PENDING |
+| **UT-DOM-01** | Instantiate `GeoCoordinates` with valid coordinates (`-6.7924, 39.2083`). | Object created without exception. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-02** | Instantiate `GeoCoordinates` with invalid latitude (`-91.0` or `95.0`). | Throws `IllegalArgumentException("Latitude out of bounds")`. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-03** | Instantiate `GeoCoordinates` with invalid longitude (`-185.0` or `181.0`). | Throws `IllegalArgumentException("Longitude out of bounds")`. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-04** | **Verified Geohash Test**: Compute 7-character Geohash from Dar es Salaam coordinates (`-6.7924, 39.2083`). | Returns exact verified base-32 string: **`"kygck5q"`** (not `kxnd47q`). | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-05** | Validate `DynamicWasteCategory` parsing from valid ID string. | Returns valid domain entity with correct special handling and hazardous flags. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-06** | **No Silent Fallback Test**: Attempt to resolve an unknown category ID (`"unknown_waste_type"`). | **Throws `UnknownWasteCategoryException`**. Does **not** fall back to `HOUSEHOLD`. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-07** | **Inactive Category Test**: Attempt to select a category with `isActive == false`. | **Throws `InactiveCategoryException`**. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-08** | Validate `VolumeTier.fromId()` with valid IDs (`"small_bag"`, `"standard_bin"`). | Returns corresponding `VolumeTier` constant. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-09** | **No Silent Fallback Test**: Attempt to parse an unknown volume tier ID (`"huge_tank"`). | **Throws `UnknownVolumeTierException`**. Does **not** fall back to `STANDARD_BIN`. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-10** | Validate `VolumeTier` bag capacity calculation for logistics heuristics. | `SMALL_BAG` yields 2 bags, `STANDARD_BIN` yields 5 bags, `LARGE_LOAD` yields 15 bags, `TRUCK_LOAD` yields 40 bags. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-11** | **Collision-Safe Reference Tag**: Format reference tag from deterministic UUID high bits. | Generates `WL-YYMM-XXXXXX` (Crockford Base32, 6 chars). Matches regex `^WL-[0-9]{4}-[0-9A-Z]{6}$`. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-12** | Validate state machine: `DRAFT` to `PENDING_DISPATCH`. | Permitted when resident active and coordinates present. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-13** | Validate state machine: `PENDING_DISPATCH` to `CANCELLED`. | Permitted when actor is resident owner. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-14** | Validate forbidden transition: `PENDING_DISPATCH` to `COMPLETED` by resident. | Rejects with domain error: `InvalidStateTransitionException`. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-15** | Validate forbidden transition: `ASSIGNED_TO_FLEET` to `CANCELLED` by resident. | Rejects with domain error: `CancellationLockedException`. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-16** | Validate transition: `ARRIVED_AT_LOCATION` to `COLLECTION_VERIFIED` requires PoC photo. | Throws `MissingProofOfCollectionException` if photo payload is null or blank. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-17** | Validate transition: `ARRIVED_AT_LOCATION` to `FAILED` requires failure photo & reason. | Throws `MissingFailureEvidenceException` if failure photo or reason is missing. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
+| **UT-DOM-18** | Coordinate bounds check against active `ServiceZone`. | Coordinates inside active bounds return `true`; coordinates outside return `false`. | `./gradlew :core:domain:testDebugUnitTest` | **PASSED** |
 
 ---
 
