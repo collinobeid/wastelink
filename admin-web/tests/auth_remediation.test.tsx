@@ -44,6 +44,7 @@ describe('Admin Authentication Remediation Suite', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(Firestore.getDoc).mockReset();
     vi.mocked(FirebaseAuth.onIdTokenChanged).mockImplementation((_auth, cb: any) => {
       authCallback = cb;
       return () => {};
@@ -300,5 +301,312 @@ describe('Admin Authentication Remediation Suite', () => {
     expect(screen.getByTestId('is-admin')).toHaveTextContent('NOT_ADMIN');
     expect(screen.getByTestId('profile')).toHaveTextContent('NO_PROFILE');
     expect(screen.getByTestId('current-user')).toHaveTextContent('NO_USER');
+  });
+
+  // Strict Custom-Claim Validation Suite
+  describe('Strict Boolean Custom-Claim Validation', () => {
+    const activeAdminDoc = {
+      exists: () => true,
+      data: () => ({
+        role: 'admin',
+        accountStatus: 'ACTIVE',
+        email: 'claim_test@wastelink.go.tz',
+        fullName: 'Claim Test Admin',
+      }),
+    };
+
+    it('accepts claim when admin === true', async () => {
+      const mockUser = {
+        uid: 'user_claim_true',
+        email: 'true@wastelink.go.tz',
+        getIdTokenResult: vi.fn().mockResolvedValue({ claims: { admin: true } }),
+      };
+      vi.mocked(Firestore.getDoc).mockResolvedValueOnce(activeAdminDoc as any);
+
+      render(
+        <AuthProvider>
+          <AuthConsumer />
+        </AuthProvider>
+      );
+
+      await act(async () => {
+        await authCallback(mockUser);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('loading')).toHaveTextContent('READY');
+      });
+
+      expect(screen.getByTestId('is-admin')).toHaveTextContent('ADMIN');
+      expect(screen.getByTestId('current-user')).toHaveTextContent('user_claim_true');
+      expect(screen.getByTestId('error')).toHaveTextContent('NO_ERROR');
+      expect(FirebaseAuth.signOut).not.toHaveBeenCalled();
+    });
+
+    it('rejects claim when admin === false', async () => {
+      const mockUser = {
+        uid: 'user_claim_false',
+        email: 'false@wastelink.go.tz',
+        getIdTokenResult: vi.fn().mockResolvedValue({ claims: { admin: false } }),
+      };
+
+      render(
+        <AuthProvider>
+          <AuthConsumer />
+        </AuthProvider>
+      );
+
+      await act(async () => {
+        await authCallback(mockUser);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('loading')).toHaveTextContent('READY');
+      });
+
+      expect(screen.getByTestId('is-admin')).toHaveTextContent('NOT_ADMIN');
+      expect(screen.getByTestId('current-user')).toHaveTextContent('NO_USER');
+      expect(screen.getByTestId('error')).toHaveTextContent(/Access denied: Account does not possess authoritative administrator claims/);
+      expect(FirebaseAuth.signOut).toHaveBeenCalled();
+    });
+
+    it('rejects claim when admin === "true" (string)', async () => {
+      const mockUser = {
+        uid: 'user_claim_str_true',
+        email: 'strtrue@wastelink.go.tz',
+        getIdTokenResult: vi.fn().mockResolvedValue({ claims: { admin: 'true' } }),
+      };
+
+      render(
+        <AuthProvider>
+          <AuthConsumer />
+        </AuthProvider>
+      );
+
+      await act(async () => {
+        await authCallback(mockUser);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('loading')).toHaveTextContent('READY');
+      });
+
+      expect(screen.getByTestId('is-admin')).toHaveTextContent('NOT_ADMIN');
+      expect(screen.getByTestId('current-user')).toHaveTextContent('NO_USER');
+      expect(screen.getByTestId('error')).toHaveTextContent(/Access denied: Account does not possess authoritative administrator claims/);
+      expect(FirebaseAuth.signOut).toHaveBeenCalled();
+    });
+
+    it('rejects claim when admin === "false" (string)', async () => {
+      const mockUser = {
+        uid: 'user_claim_str_false',
+        email: 'strfalse@wastelink.go.tz',
+        getIdTokenResult: vi.fn().mockResolvedValue({ claims: { admin: 'false' } }),
+      };
+
+      render(
+        <AuthProvider>
+          <AuthConsumer />
+        </AuthProvider>
+      );
+
+      await act(async () => {
+        await authCallback(mockUser);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('loading')).toHaveTextContent('READY');
+      });
+
+      expect(screen.getByTestId('is-admin')).toHaveTextContent('NOT_ADMIN');
+      expect(screen.getByTestId('current-user')).toHaveTextContent('NO_USER');
+      expect(screen.getByTestId('error')).toHaveTextContent(/Access denied: Account does not possess authoritative administrator claims/);
+      expect(FirebaseAuth.signOut).toHaveBeenCalled();
+    });
+
+    it('rejects claim when admin claim is missing/undefined', async () => {
+      const mockUser = {
+        uid: 'user_claim_missing',
+        email: 'missing_claim@wastelink.go.tz',
+        getIdTokenResult: vi.fn().mockResolvedValue({ claims: {} }),
+      };
+
+      render(
+        <AuthProvider>
+          <AuthConsumer />
+        </AuthProvider>
+      );
+
+      await act(async () => {
+        await authCallback(mockUser);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('loading')).toHaveTextContent('READY');
+      });
+
+      expect(screen.getByTestId('is-admin')).toHaveTextContent('NOT_ADMIN');
+      expect(screen.getByTestId('current-user')).toHaveTextContent('NO_USER');
+      expect(screen.getByTestId('error')).toHaveTextContent(/Access denied: Account does not possess authoritative administrator claims/);
+      expect(FirebaseAuth.signOut).toHaveBeenCalled();
+    });
+  });
+
+  // Stale Sign-Out Protection Regression Suite
+  describe('Stale Sign-Out Protection Regression', () => {
+    it('prevents an obsolete failed evaluation for User A from signing out newer authoritative User B', async () => {
+      let rejectUserAToken: (err: any) => void;
+      const slowUserATokenPromise = new Promise((_, reject) => {
+        rejectUserAToken = reject;
+      });
+
+      const userA = {
+        uid: 'user_a_failing',
+        email: 'usera@wastelink.go.tz',
+        getIdTokenResult: vi.fn().mockImplementation(() => slowUserATokenPromise),
+      };
+
+      const userB = {
+        uid: 'user_b_active_admin',
+        email: 'userb@wastelink.go.tz',
+        getIdTokenResult: vi.fn().mockResolvedValue({ claims: { admin: true } }),
+      };
+
+      // User B's profile document in Firestore
+      vi.mocked(Firestore.getDoc).mockResolvedValueOnce({
+        exists: () => true,
+        data: () => ({
+          role: 'admin',
+          accountStatus: 'ACTIVE',
+          email: 'userb@wastelink.go.tz',
+          fullName: 'Active Director B',
+        }),
+      } as any);
+
+      render(
+        <AuthProvider>
+          <AuthConsumer />
+        </AuthProvider>
+      );
+
+      // 1. User A starts an asynchronous authentication evaluation
+      act(() => {
+        authCallback(userA);
+      });
+
+      // 2. User B becomes the current authenticated user
+      await act(async () => {
+        await authCallback(userB);
+      });
+
+      // User B must be authoritative admin
+      await waitFor(() => {
+        expect(screen.getByTestId('loading')).toHaveTextContent('READY');
+      });
+      expect(screen.getByTestId('is-admin')).toHaveTextContent('ADMIN');
+      expect(screen.getByTestId('current-user')).toHaveTextContent('user_b_active_admin');
+      expect(screen.getByTestId('profile')).toHaveTextContent('userb@wastelink.go.tz');
+
+      // Clear any prior signOut calls
+      vi.mocked(FirebaseAuth.signOut).mockClear();
+
+      // 3. User A's evaluation fails asynchronously
+      await act(async () => {
+        rejectUserAToken!(new Error('User A network failure / token revoked'));
+      });
+
+      // 4. User A's obsolete callback must not sign out User B
+      expect(FirebaseAuth.signOut).not.toHaveBeenCalled();
+
+      // 5. User B's authentication state must remain authoritative
+      expect(screen.getByTestId('is-admin')).toHaveTextContent('ADMIN');
+      expect(screen.getByTestId('current-user')).toHaveTextContent('user_b_active_admin');
+      expect(screen.getByTestId('profile')).toHaveTextContent('userb@wastelink.go.tz');
+      expect(screen.getByTestId('error')).toHaveTextContent('NO_ERROR');
+    });
+
+    it('prevents an obsolete failed profile lookup for User A from signing out newer authoritative User B', async () => {
+      let rejectUserAProfile: (err: any) => void;
+      const slowUserAProfilePromise = new Promise((_, reject) => {
+        rejectUserAProfile = reject;
+      });
+
+      const userA = {
+        uid: 'user_a_failing_profile',
+        email: 'usera_prof@wastelink.go.tz',
+        getIdTokenResult: vi.fn().mockResolvedValue({ claims: { admin: true } }),
+      };
+
+      const userB = {
+        uid: 'user_b_active_admin_2',
+        email: 'userb2@wastelink.go.tz',
+        getIdTokenResult: vi.fn().mockResolvedValue({ claims: { admin: true } }),
+      };
+
+      // Mock getDoc based on user UID
+      vi.mocked(Firestore.getDoc).mockImplementation((docRef: any) => {
+        if (docRef.path === 'users/user_a_failing_profile') {
+          return slowUserAProfilePromise as any;
+        }
+        if (docRef.path === 'users/user_b_active_admin_2') {
+          return Promise.resolve({
+            exists: () => true,
+            data: () => ({
+              role: 'admin',
+              accountStatus: 'ACTIVE',
+              email: 'userb2@wastelink.go.tz',
+              fullName: 'Active Director B2',
+            }),
+          }) as any;
+        }
+        return Promise.resolve({ exists: () => false }) as any;
+      });
+
+      render(
+        <AuthProvider>
+          <AuthConsumer />
+        </AuthProvider>
+      );
+
+      // 1. User A starts an asynchronous authentication evaluation (hits slow getDoc)
+      act(() => {
+        authCallback(userA);
+      });
+
+      // Wait until User A has invoked getDoc
+      await waitFor(() => {
+        expect(Firestore.getDoc).toHaveBeenCalledWith({ path: 'users/user_a_failing_profile' });
+      });
+
+      // 2. User B becomes the current authenticated user
+      await act(async () => {
+        await authCallback(userB);
+      });
+
+      // User B must be authoritative admin
+      await waitFor(() => {
+        expect(screen.getByTestId('loading')).toHaveTextContent('READY');
+      });
+      expect(screen.getByTestId('is-admin')).toHaveTextContent('ADMIN');
+      expect(screen.getByTestId('current-user')).toHaveTextContent('user_b_active_admin_2');
+      expect(screen.getByTestId('profile')).toHaveTextContent('userb2@wastelink.go.tz');
+
+      // Clear any prior signOut calls
+      vi.mocked(FirebaseAuth.signOut).mockClear();
+
+      // 3. User A's profile evaluation fails asynchronously
+      await act(async () => {
+        rejectUserAProfile!(new Error('User A Firestore permission failure'));
+      });
+
+      // 4. User A's obsolete callback must not sign out User B
+      expect(FirebaseAuth.signOut).not.toHaveBeenCalled();
+
+      // 5. User B's authentication state must remain authoritative
+      expect(screen.getByTestId('is-admin')).toHaveTextContent('ADMIN');
+      expect(screen.getByTestId('current-user')).toHaveTextContent('user_b_active_admin_2');
+      expect(screen.getByTestId('profile')).toHaveTextContent('userb2@wastelink.go.tz');
+      expect(screen.getByTestId('error')).toHaveTextContent('NO_ERROR');
+    });
   });
 });

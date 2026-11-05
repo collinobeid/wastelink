@@ -29,52 +29,80 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const evalSeqRef = useRef<number>(0);
+  const activeSessionUidRef = useRef<string | null>(null);
 
   const evaluateAdminToken = async (user: FirebaseUser | null): Promise<boolean> => {
     const currentSeq = ++evalSeqRef.current;
+    activeSessionUidRef.current = user ? user.uid : null;
 
-    // Fail-closed immediately: clear any existing admin authority while evaluating
-    setIsAdmin(false);
-    setUserProfile(null);
+    const isSessionAuthoritative = (): boolean => {
+      // 1. Sequence check: Must still match the latest evaluation sequence
+      if (currentSeq !== evalSeqRef.current) return false;
+      // 2. Active session identity check: Must match the current active session UID
+      if (activeSessionUidRef.current !== (user ? user.uid : null)) return false;
+      // 3. Auth client check: If Firebase Auth reports a currentUser, it must match this user's UID
+      if (auth.currentUser && user && auth.currentUser.uid !== user.uid) return false;
+      return true;
+    };
 
     if (!user) {
-      setCurrentUser(null);
+      if (isSessionAuthoritative()) {
+        setCurrentUser(null);
+        setIsAdmin(false);
+        setUserProfile(null);
+      }
       return false;
     }
 
+    // Fail-closed immediately for this session while evaluating
+    if (isSessionAuthoritative()) {
+      setIsAdmin(false);
+      setUserProfile(null);
+    }
+
+    const safeSignOutIfAuthoritative = async (errorMessage: string): Promise<void> => {
+      // Reliable session identity and sequence check immediately before performing state mutation & sign-out
+      if (!isSessionAuthoritative()) {
+        return;
+      }
+
+      setError(errorMessage);
+      setCurrentUser(null);
+      setIsAdmin(false);
+      setUserProfile(null);
+
+      // Verify again immediately before the asynchronous sign-out operation
+      if (isSessionAuthoritative()) {
+        try {
+          await fbSignOut(auth);
+        } catch {
+          // ignore signOut error during offline/network failure
+        }
+      }
+    };
+
     try {
       const tokenResult = await user.getIdTokenResult(true);
-      if (currentSeq !== evalSeqRef.current) return false;
+      if (!isSessionAuthoritative()) return false;
 
-      const hasAdminClaim = Boolean(tokenResult.claims.admin);
+      // Strict custom-claim validation: Only literal boolean true qualifies
+      const hasAdminClaim = tokenResult.claims.admin === true;
       if (!hasAdminClaim) {
-        if (currentSeq === evalSeqRef.current) {
-          setError('Access denied: Account does not possess authoritative administrator claims.');
-          setCurrentUser(null);
-          try {
-            await fbSignOut(auth);
-          } catch {
-            // ignore signOut error during offline/network failure
-          }
-        }
+        await safeSignOutIfAuthoritative(
+          'Access denied: Account does not possess authoritative administrator claims.'
+        );
         return false;
       }
 
       // Fetch user profile from Firestore /users/{uid}
       const userDocRef = doc(db, 'users', user.uid);
       const snapshot = await getDoc(userDocRef);
-      if (currentSeq !== evalSeqRef.current) return false;
+      if (!isSessionAuthoritative()) return false;
 
       if (!snapshot.exists()) {
-        if (currentSeq === evalSeqRef.current) {
-          setError('Access denied: Administrative profile document /users/{uid} does not exist.');
-          setCurrentUser(null);
-          try {
-            await fbSignOut(auth);
-          } catch {
-            // ignore
-          }
-        }
+        await safeSignOutIfAuthoritative(
+          'Access denied: Administrative profile document /users/{uid} does not exist.'
+        );
         return false;
       }
 
@@ -82,23 +110,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // Authoritative requirement: must have role === 'admin' and strictly accountStatus === 'ACTIVE'
       // Legacy status must NOT be used as a fallback for ACTIVE.
       if (data.role !== 'admin' || data.accountStatus !== 'ACTIVE') {
-        if (currentSeq === evalSeqRef.current) {
-          const reason = data.role !== 'admin'
-            ? `Account has non-administrative role '${data.role}'`
-            : `Account standing is ${data.accountStatus || 'UNDEFINED'}`;
-          setError(`Access denied: ${reason}. Only ACTIVE administrators may access the console.`);
-          setCurrentUser(null);
-          try {
-            await fbSignOut(auth);
-          } catch {
-            // ignore
-          }
-        }
+        const reason = data.role !== 'admin'
+          ? `Account has non-administrative role '${data.role}'`
+          : `Account standing is ${data.accountStatus || 'UNDEFINED'}`;
+        await safeSignOutIfAuthoritative(
+          `Access denied: ${reason}. Only ACTIVE administrators may access the console.`
+        );
         return false;
       }
 
-      // Profile is valid and ACTIVE; if sequence is still active, grant session
-      if (currentSeq === evalSeqRef.current) {
+      // Profile is valid and ACTIVE; if session is still authoritative, grant session
+      if (isSessionAuthoritative()) {
         setCurrentUser(user);
         setUserProfile({ ...data, id: user.uid, uid: user.uid });
         setIsAdmin(true);
@@ -107,18 +129,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
       return false;
     } catch (err: unknown) {
-      if (currentSeq === evalSeqRef.current) {
-        const msg = err instanceof Error ? err.message : 'Failed to verify admin credentials';
-        setError(`Access denied: ${msg}`);
-        setIsAdmin(false);
-        setUserProfile(null);
-        setCurrentUser(null);
-        try {
-          await fbSignOut(auth);
-        } catch {
-          // ignore
-        }
-      }
+      const msg = err instanceof Error ? err.message : 'Failed to verify admin credentials';
+      await safeSignOutIfAuthoritative(`Access denied: ${msg}`);
       return false;
     }
   };
