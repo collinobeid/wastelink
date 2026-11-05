@@ -77,6 +77,24 @@ class WasteRequestDomainTest {
     }
 
     @Test
+    fun geohashMismatch_throwsIllegalArgumentException() {
+        val ex = assertThrows(IllegalArgumentException::class.java) {
+            WasteRequest(
+                id = "req_1",
+                clientGeneratedId = "req_1",
+                clientUid = "user_1",
+                coordinates = GeoCoordinates(-6.7924, 39.2083),
+                geohash = "s000000",
+                serviceZoneId = "zone_1",
+                pickupAddress = "Address",
+                categoryId = "household",
+                volumeTier = VolumeTier.STANDARD_BIN
+            )
+        }
+        assertTrue(ex.message!!.contains("does not match coordinates"))
+    }
+
+    @Test
     fun blankAddress_throwsIllegalArgumentException() {
         val ex = assertThrows(IllegalArgumentException::class.java) {
             createValidRequest().copy(pickupAddress = "   ")

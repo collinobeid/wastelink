@@ -12,6 +12,7 @@ package com.waste.link.domain.model
  * 4. [requestRef] represents an unallocated server reference when null, until returned by the backend.
  * 5. Timestamps default to null; client does NOT fabricate authoritative timestamps with `System.currentTimeMillis()`.
  * 6. Monetary amounts are integer units in [currency] ("TZS").
+ * 7. [geohash] must strictly match the derived geohash from [coordinates]; silent disagreement is prohibited.
  */
 data class WasteRequest(
     val id: String,
@@ -19,7 +20,7 @@ data class WasteRequest(
     val requestRef: String? = null,
     val clientUid: String,
     val coordinates: GeoCoordinates,
-    val geohash: String,
+    val geohash: String = coordinates.toGeohash(),
     val serviceZoneId: String,
     val pickupAddress: String,
     val categoryId: String,
@@ -62,11 +63,14 @@ data class WasteRequest(
         require(categoryId.isNotBlank()) { "WasteRequest.categoryId must not be blank" }
         require(currency == "TZS") { "Currency must be 'TZS', received '$currency'" }
         require(geohash.length in 5..12) { "geohash length must be between 5 and 12, received '$geohash'" }
+        require(geohash == coordinates.toGeohash(geohash.length)) {
+            "Supplied geohash '$geohash' does not match coordinates ($coordinates)."
+        }
         if (priceTzs != null) {
             require(priceTzs > 0L) { "priceTzs must be strictly positive, received $priceTzs" }
         }
         if (requestRef != null) {
-            require(RequestRefGenerator.isValid(requestRef)) {
+            require(RequestRefSpecification.isValid(requestRef)) {
                 "Invalid requestRef format: '$requestRef'. Must match ^WL-[0-9]{4}-[0-9A-Z]{6}$"
             }
         }

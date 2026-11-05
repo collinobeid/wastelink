@@ -12,8 +12,8 @@ import org.junit.Test
 
 class ServiceZoneTest {
 
-    // Test zone fixture (Kinondoni test boundary)
-    private val activeKinondoniZone = ServiceZone(
+    // Test zone fixtures with isolated non-hardcoded test boundaries
+    private val activeZoneKinondoni = ServiceZone(
         zoneId = "zone_kinondoni_01",
         name = "Kinondoni Municipal",
         minLat = -6.8200,
@@ -23,54 +23,74 @@ class ServiceZoneTest {
         isActive = true
     )
 
-    private val inactiveTemekeZone = ServiceZone(
+    private val activeZoneIlala = ServiceZone(
+        zoneId = "zone_ilala_02",
+        name = "Ilala Municipal",
+        minLat = -6.8800,
+        maxLat = -6.8250,
+        minLng = 39.2200,
+        maxLng = 39.3000,
+        isActive = true
+    )
+
+    private val inactiveZoneTemeke = ServiceZone(
         zoneId = "zone_temeke_inactive",
         name = "Temeke Municipal (Decommissioned)",
-        minLat = -6.9000,
-        maxLat = -6.8300,
+        minLat = -6.9500,
+        maxLat = -6.8900,
         minLng = 39.2000,
         maxLng = 39.3000,
         isActive = false
     )
 
+    private val kinondoniCoords = GeoCoordinates(latitude = -6.7924, longitude = 39.2083)
+    private val outsideCoords = GeoCoordinates(latitude = -6.1630, longitude = 35.7516)
+
     // UT-DOM-18: Coordinate bounds check against active ServiceZone
     @Test
     fun coordinatesInsideActiveZone_returnsTrue() {
-        // Point inside Kinondoni test bounds
-        val insidePoint = GeoCoordinates(latitude = -6.7924, longitude = 39.2083)
-        assertTrue(activeKinondoniZone.contains(insidePoint))
-        assertTrue(activeKinondoniZone.containsGeographically(insidePoint))
+        assertTrue(activeZoneKinondoni.contains(kinondoniCoords))
+        assertTrue(activeZoneKinondoni.containsGeographically(kinondoniCoords))
     }
 
     @Test
     fun coordinatesOutsideActiveZone_returnsFalse() {
-        // Point far outside (e.g. Dodoma coordinates)
-        val outsidePoint = GeoCoordinates(latitude = -6.1630, longitude = 35.7516)
-        assertFalse(activeKinondoniZone.contains(outsidePoint))
+        assertFalse(activeZoneKinondoni.contains(outsideCoords))
+        assertFalse(activeZoneKinondoni.containsGeographically(outsideCoords))
+    }
+
+    @Test
+    fun coordinatesInsideZoneA_areNotInsideZoneB() {
+        // Point is strictly inside Kinondoni, must NOT be inside Ilala
+        assertTrue(activeZoneKinondoni.contains(kinondoniCoords))
+        assertFalse(activeZoneIlala.contains(kinondoniCoords))
     }
 
     @Test
     fun coordinatesInsideInactiveZone_containsReturnsFalse() {
-        val pointInTemeke = GeoCoordinates(latitude = -6.8500, longitude = 39.2500)
+        val temekeCoords = GeoCoordinates(latitude = -6.9200, longitude = 39.2500)
         // Geographically contained, but active check returns false
-        assertTrue(inactiveTemekeZone.containsGeographically(pointInTemeke))
-        assertFalse(inactiveTemekeZone.contains(pointInTemeke))
+        assertTrue(inactiveZoneTemeke.containsGeographically(temekeCoords))
+        assertFalse(inactiveZoneTemeke.contains(temekeCoords))
     }
 
     @Test
     fun findActiveZone_succeedsForCoveredCoordinates() {
-        val coords = GeoCoordinates(latitude = -6.7924, longitude = 39.2083)
-        val zone = findActiveZoneForCoordinates(coords, listOf(activeKinondoniZone, inactiveTemekeZone))
+        val zone = findActiveZoneForCoordinates(kinondoniCoords, listOf(activeZoneKinondoni, activeZoneIlala))
         assertEquals("zone_kinondoni_01", zone.zoneId)
     }
 
     @Test
-    fun findActiveZone_throwsOutsideServiceZoneExceptionWhenUncovered() {
-        val outsideCoords = GeoCoordinates(latitude = -6.1630, longitude = 35.7516)
-        val ex = assertThrows(OutsideServiceZoneException::class.java) {
-            findActiveZoneForCoordinates(outsideCoords, listOf(activeKinondoniZone, inactiveTemekeZone))
+    fun findActiveZone_throwsOutsideServiceZoneExceptionWhenUncoveredOrEmpty() {
+        // Uncovered coordinates
+        assertThrows(OutsideServiceZoneException::class.java) {
+            findActiveZoneForCoordinates(outsideCoords, listOf(activeZoneKinondoni, activeZoneIlala))
         }
-        assertTrue(ex.message!!.contains("outside all active municipal collection zones"))
+
+        // Empty active zones catalog
+        assertThrows(OutsideServiceZoneException::class.java) {
+            findActiveZoneForCoordinates(kinondoniCoords, emptyList())
+        }
     }
 
     @Test

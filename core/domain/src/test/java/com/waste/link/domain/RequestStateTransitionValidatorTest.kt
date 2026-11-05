@@ -30,7 +30,9 @@ class RequestStateTransitionValidatorTest {
         status: RequestLifecycleStatus = RequestLifecycleStatus.PENDING_DISPATCH,
         assignedCollector: String? = null,
         assignedVehicle: String? = null,
-        updatedAt: Long? = nowEpochMs
+        updatedAt: Long? = nowEpochMs,
+        completedAt: Long? = null,
+        failedAt: Long? = null
     ): WasteRequest {
         val id = UUID.randomUUID().toString()
         return WasteRequest(
@@ -46,7 +48,9 @@ class RequestStateTransitionValidatorTest {
             status = status,
             assignedCollectorUid = assignedCollector,
             assignedVehicleId = assignedVehicle,
-            updatedAtEpochMs = updatedAt
+            updatedAtEpochMs = updatedAt,
+            completedAtEpochMs = completedAt,
+            failedAtEpochMs = failedAt
         )
     }
 
@@ -368,12 +372,12 @@ class RequestStateTransitionValidatorTest {
         }
     }
 
-    // TR-14: Dispute within 48h vs after 48h
+    // TR-14: Fail-Closed Dispute Eligibility Tests
     @Test
     fun residentDisputesCompletedRequest_within48h_succeeds() {
         val completedReq = sampleRequest(
             status = RequestLifecycleStatus.COMPLETED,
-            updatedAt = nowEpochMs - (24 * 3600 * 1000L) // 24 hours ago
+            completedAt = nowEpochMs - (24 * 3600 * 1000L) // 24 hours ago
         )
         RequestStateTransitionValidator.validateTransition(
             request = completedReq,
@@ -386,10 +390,42 @@ class RequestStateTransitionValidatorTest {
     }
 
     @Test
+    fun residentDisputesFailedRequest_within48h_succeeds() {
+        val failedReq = sampleRequest(
+            status = RequestLifecycleStatus.FAILED,
+            failedAt = nowEpochMs - (12 * 3600 * 1000L) // 12 hours ago
+        )
+        RequestStateTransitionValidator.validateTransition(
+            request = failedReq,
+            targetStatus = RequestLifecycleStatus.DISPUTED,
+            actorUid = residentUid,
+            actorRole = UserRole.RESIDENT,
+            currentTimeEpochMs = nowEpochMs,
+            disputeReason = "Gate was unlocked; collector did not attempt pickup"
+        )
+    }
+
+    @Test
+    fun residentDisputesCompletedRequest_exactlyAt48hBoundary_succeeds() {
+        val completedReq = sampleRequest(
+            status = RequestLifecycleStatus.COMPLETED,
+            completedAt = nowEpochMs - (48 * 3600 * 1000L) // Exactly 48 hours ago
+        )
+        RequestStateTransitionValidator.validateTransition(
+            request = completedReq,
+            targetStatus = RequestLifecycleStatus.DISPUTED,
+            actorUid = residentUid,
+            actorRole = UserRole.RESIDENT,
+            currentTimeEpochMs = nowEpochMs,
+            disputeReason = "Filed at exact boundary"
+        )
+    }
+
+    @Test
     fun residentDisputesCompletedRequest_after48h_throwsDisputeWindowExpiredException() {
         val completedReq = sampleRequest(
             status = RequestLifecycleStatus.COMPLETED,
-            updatedAt = nowEpochMs - (50 * 3600 * 1000L) // 50 hours ago (> 48h)
+            completedAt = nowEpochMs - (48 * 3600 * 1000L + 1L) // 48h + 1ms
         )
         val ex = assertThrows(DisputeWindowExpiredException::class.java) {
             RequestStateTransitionValidator.validateTransition(
@@ -402,6 +438,97 @@ class RequestStateTransitionValidatorTest {
             )
         }
         assertTrue(ex.message!!.contains("48-hour dispute window has expired"))
+    }
+
+    @Test
+    fun dispute_missingAuthoritativeTerminalTimestamp_failsClosed() {
+        // completedAt is null
+        val completedReq = sampleRequest(
+            status = RequestLifecycleStatus.COMPLETED,
+            completedAt = null
+        )
+        val ex = assertThrows(InvalidStateTransitionException::class.java) {
+            RequestStateTransitionValidator.validateTransition(
+                request = completedReq,
+                targetStatus = RequestLifecycleStatus.DISPUTED,
+                actorUid = residentUid,
+                actorRole = UserRole.RESIDENT,
+                currentTimeEpochMs = nowEpochMs,
+                disputeReason = "Dispute on un-timestamped completion"
+            )
+        }
+        assertTrue(ex.message!!.contains("missing authoritative terminal timestamp"))
+    }
+
+    @Test
+    fun dispute_wrongTerminalStateTimestamp_failsClosed() {
+        // Status is COMPLETED, but only failedAt is populated
+        val req = sampleRequest(
+            status = RequestLifecycleStatus.COMPLETED,
+            completedAt = null,
+            failedAt = nowEpochMs - (5 * 3600 * 1000L)
+        )
+        val ex = assertThrows(InvalidStateTransitionException::class.java) {
+            RequestStateTransitionValidator.validateTransition(
+                request = req,
+                targetStatus = RequestLifecycleStatus.DISPUTED,
+                actorUid = residentUid,
+                actorRole = UserRole.RESIDENT,
+                currentTimeEpochMs = nowEpochMs,
+                disputeReason = "Dispute with mismatched terminal timestamp"
+            )
+        }
+        assertTrue(ex.message!!.contains("missing authoritative terminal timestamp for state COMPLETED"))
+    }
+
+    @Test
+    fun dispute_futureTerminalTimestamp_failsClosed() {
+        val completedReq = sampleRequest(
+            status = RequestLifecycleStatus.COMPLETED,
+            completedAt = nowEpochMs + 60_000L // 1 minute in the future
+        )
+        val ex = assertThrows(InvalidStateTransitionException::class.java) {
+            RequestStateTransitionValidator.validateTransition(
+                request = completedReq,
+                targetStatus = RequestLifecycleStatus.DISPUTED,
+                actorUid = residentUid,
+                actorRole = UserRole.RESIDENT,
+                currentTimeEpochMs = nowEpochMs,
+                disputeReason = "Dispute with future timestamp"
+            )
+        }
+        assertTrue(ex.message!!.contains("in the future"))
+    }
+
+    @Test
+    fun dispute_unauthorizedActor_throwsUnauthorizedException() {
+        val completedReq = sampleRequest(
+            status = RequestLifecycleStatus.COMPLETED,
+            completedAt = nowEpochMs - (5 * 3600 * 1000L)
+        )
+        // Collector attempts to dispute
+        assertThrows(UnauthorizedTransitionException::class.java) {
+            RequestStateTransitionValidator.validateTransition(
+                request = completedReq,
+                targetStatus = RequestLifecycleStatus.DISPUTED,
+                actorUid = collectorUid,
+                actorRole = UserRole.COLLECTOR,
+                currentTimeEpochMs = nowEpochMs,
+                disputeReason = "Collector dispute"
+            )
+        }
+
+        // Different resident attempts to dispute
+        assertThrows(UnauthorizedTransitionException::class.java) {
+            RequestStateTransitionValidator.validateTransition(
+                request = completedReq,
+                targetStatus = RequestLifecycleStatus.DISPUTED,
+                actorUid = otherResidentUid,
+                actorRole = UserRole.RESIDENT,
+                currentTimeEpochMs = nowEpochMs,
+                disputeReason = "Third-party dispute"
+            )
+        }
     }
 
     // TR-15 & TR-16: Admin resolves or dismisses dispute

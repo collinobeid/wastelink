@@ -11,10 +11,17 @@ import com.waste.link.domain.model.UserRole
 import com.waste.link.domain.model.WasteRequest
 
 /**
- * Authoritative, actor-aware state machine validator for WasteLink waste collection requests.
+ * Client-side actor-aware state machine validator for WasteLink waste collection requests.
  *
- * Implements transitions TR-01 through TR-16 from `docs/MODULE_2_RESIDENT_REQUEST_ARCHITECTURE.md`.
+ * Implements client-side checks for transitions TR-01 through TR-16 from `docs/MODULE_2_RESIDENT_REQUEST_ARCHITECTURE.md`.
  * Strictly checks actor identity, roles, preconditions, photo proofs, and dispute windows.
+ *
+ * NOTE ON TRUSTED BACKEND ENFORCEMENT:
+ * This validator enforces business-domain preconditions on the client before operations are transmitted.
+ * It is NOT server-authoritative. Conditions that require trusted server-side proof (such as genuine GPS
+ * proximity, physical geofence arrival at dumpsite polygon, image hash authenticity, and server-authoritative
+ * timestamps via request.time) are enforced independently on the backend by Firestore Security Rules
+ * and Cloud Functions.
  */
 object RequestStateTransitionValidator {
 
@@ -269,13 +276,30 @@ object RequestStateTransitionValidator {
                         "Filing a dispute requires a non-blank grievance explanation (disputeReason)."
                     )
                 }
-                val baseTime = request.updatedAtEpochMs
-                    ?: request.completedAtEpochMs
-                    ?: request.failedAtEpochMs
-                    ?: 0L
-                if (baseTime > 0L && (currentTimeEpochMs - baseTime) > DISPUTE_WINDOW_MS) {
+                // TR-14: Fail-closed dispute eligibility validation
+                // Authoritative terminal timestamp must strictly match the current terminal state
+                val terminalTimestamp = when (current) {
+                    RequestLifecycleStatus.COMPLETED -> request.completedAtEpochMs
+                    RequestLifecycleStatus.FAILED -> request.failedAtEpochMs
+                    else -> null
+                }
+
+                if (terminalTimestamp == null || terminalTimestamp <= 0L) {
+                    throw InvalidStateTransitionException(
+                        "Cannot file dispute: request is missing authoritative terminal timestamp for state $current."
+                    )
+                }
+
+                if (terminalTimestamp > currentTimeEpochMs) {
+                    throw InvalidStateTransitionException(
+                        "Cannot file dispute: authoritative terminal timestamp ($terminalTimestamp) is in the future relative to current time ($currentTimeEpochMs)."
+                    )
+                }
+
+                val elapsedMs = currentTimeEpochMs - terminalTimestamp
+                if (elapsedMs > DISPUTE_WINDOW_MS) {
                     throw DisputeWindowExpiredException(
-                        "The 48-hour dispute window has expired. Grievance cannot be accepted."
+                        "The 48-hour dispute window has expired ($elapsedMs ms elapsed > $DISPUTE_WINDOW_MS ms). Grievance cannot be accepted."
                     )
                 }
             }

@@ -27,7 +27,6 @@ kotlin {
 
 dependencies {
     implementation(project(":core:common"))
-    implementation(libs.androidx.core.ktx)
     implementation(libs.libphonenumber)
 
     testImplementation(libs.junit)
