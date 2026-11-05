@@ -1,8 +1,8 @@
 # WASTELINK — MODULE 2: RESIDENT OPERATIONS & REQUEST FLOW ARCHITECTURE SPECIFICATION
 
-**Document Version:** 1.0.0-ENTERPRISE  
+**Document Version:** 2.0.0-ENTERPRISE (POST-REVIEW HARDENED)  
 **Date:** November 5, 2026  
-**Status:** ARCHITECTURE DESIGN & INVESTIGATION (READY FOR LEAD REVIEW)  
+**Status:** REVISED ARCHITECTURAL SPECIFICATION (AWAITING LEAD AUTHORIZATION)  
 **Target Branch:** `rebuild/modular-workspace`  
 **Reviewer:** Lead Technical Director (GPT)  
 **Author:** Implementation Engineer (Antigravity Mobile & Architecture Team)  
@@ -13,198 +13,452 @@
 ## 1. Architectural Context & Module Boundaries
 
 ### 1.1 Objective
-Module 2 establishes the end-to-end Resident lifecycle: from dashboard entry, through a validated 4-step request creation wizard (Category, Volume, Location & Pin Drop, Confirmation), to optimistic submission, live status synchronization, and historical tracking.
+Module 2 establishes the complete, production-grade Resident lifecycle for WasteLink:
+- Configurable waste category discovery from remote Firestore configuration.
+- A validated, accessible 4-step request creation wizard (Category, Volume, Location, Review).
+- Explicit, zero-cost location acquisition via MapLibre Compose, OpenFreeMap, and Android native Geocoder.
+- Service zone validation preventing out-of-boundary submissions.
+- Decoupled offline request queuing, transactional idempotency, and explicit synchronization tracking.
+- Real-time resident request history, status synchronization, and server-authoritative cancellation.
 
-### 1.2 Module Placement in the Gradle Hierarchy
-In accordance with `docs/MODULAR_ARCHITECTURE.md`, Module 2 is encapsulated in `:feature:resident` while contributing canonical domain models to `:core:domain` and remote data sources to `:core:data` and `:core:firebase`:
+### 1.2 Module Hierarchy & Clean Separation of Concerns
+In accordance with `docs/MODULAR_ARCHITECTURE.md`, code is partitioned strictly across the architectural layers:
 
 ```mermaid
 graph TD
-    app[":app (App Navigation Composition & DI Container)"]
+    app[":app (Composition, Navigation Host, DI Aggregator)"]
     
     subgraph Feature Modules
         featAuth[":feature:auth (Module 1 - Accepted)"]
-        featRes[":feature:resident (Module 2 - Under Design)"]
+        featRes[":feature:resident (Module 2 - UI, ViewModels, Wizard Flow)"]
     end
     
     subgraph Core Modules
-        coreNav[":core:navigation (Destinations, Route Contracts)"]
-        coreDS[":core:design-system (Tokens, GlassCard, Theming)"]
-        coreFB[":core:firebase (Firestore, Auth wrappers)"]
-        coreData[":core:data (DTOs, Repositories, Room DB)"]
-        coreDomain[":core:domain (Canonical Domain Models: WasteRequest, WasteCategory, VolumeTier)"]
+        coreNav[":core:navigation (Destinations, Canonical Routes)"]
+        coreDS[":core:design-system (Tokens, Typography, Shared Cards)"]
+        coreFB[":core:firebase (Firestore, Auth wrappers, Error Mappers)"]
+        coreData[":core:data (Repositories, Room DB, WorkManager, DTOs, Mappers)"]
+        coreDomain[":core:domain (Pure Kotlin Domain Models, Validators, State Machine)"]
         coreCommon[":core:common (Dispatchers, Result, Network Observers)"]
     end
 
     app --> featRes
     featRes --> coreNav
     featRes --> coreDS
-    featRes --> coreFB
-    featRes --> coreData
     featRes --> coreDomain
     featRes --> coreCommon
+    featRes --> coreData
+
+    coreData --> coreDomain
+    coreData --> coreFB
+    coreData --> coreCommon
+
+    coreFB --> coreDomain
+    coreFB --> coreCommon
 ```
 
-### 1.3 Strict Module Invariants
-1. **Zero UI/Framework Leakage to Domain**: `:core:domain` remains 100% pure Kotlin with zero Android SDK, zero Compose, and zero Firebase dependencies.
-2. **Design System Uniformity**: All resident UI components leverage `:core:design-system` dark theme tokens (`DarkBackground #0F1115`, `DarkCard #16181C`, `EmeraldGreen #10B981`, `AmberWarning #F59E0B`, `DarkBorder #262930`).
-3. **No Unilateral Status Escalation**: The client application cannot set or alter privileged lifecycle states (e.g., cannot mark a request `COMPLETED`, `ASSIGNED_TO_FLEET`, or `COLLECTION_VERIFIED`).
-4. **Zero-Cost Infrastructure**: Map rendering, location acquisition, and reverse-geocoding utilize zero-billing open infrastructure (MapLibre Compose, OpenFreeMap, Android Native `Geocoder`). No Google Maps billing or paid APIs are introduced.
+### 1.3 Strict Architectural Invariants
+1. **Pure Domain Core (`:core:domain`)**: Zero Android SDK imports, zero Compose dependencies, zero Firebase libraries. All entities (`WasteRequest`, `WasteCategory`, `VolumeTier`, `GeoCoordinates`, `RequestLifecycleStatus`) and state machine transitions are written in pure Kotlin.
+2. **Decoupled Local vs Server State**: Local synchronization states (`LOCAL_DRAFT`, `QUEUED_OFFLINE`, `SYNCING`, `SYNCED`, `SYNC_FAILED`) are strictly separated from server-authoritative operational states (`PENDING_DISPATCH`, `ASSIGNED_TO_FLEET`, etc.). Local states never pollute remote Firestore documents.
+3. **Zero-Cost Financial Infrastructure**: Map rendering, tile display, and geocoding operate at **$0.00 infrastructure cost**. No Google Maps Platform billing, paid geocoding APIs, or paid tile services are used.
+4. **Immutable Security Guardrails**: Residents can only create requests for their own UID with status `PENDING_DISPATCH`. After submission, coordinates, geohash, address, owner UID, category, volume, assignment, price, and operational timestamps are **strictly immutable** to the resident. Updates are governed by an explicit whitelist.
 
 ---
 
-## 2. Complete Resident Journey & Navigation Flow
+## 2. Requirement Traceability Matrix (A+ Product Specification)
 
-### 2.1 High-Level Resident State Flow
+This matrix establishes 100% explicit traceability to `WasteLink_AplusRequirements(Dont alter this, Read only).md` (REQ-029 through REQ-040). No requirements are omitted.
+
+| REQ ID | Title & Summary | Architectural Treatment | Module Placement & Status | Dependency & Rationale |
+| :---: | :--- | :--- | :---: | :--- |
+| **REQ-029** | **Multi-Step Wizard State Machine**<br>Sealed step state (`Category`, `Volume`, `Location`, `Confirm`) with validated forward-only transitions and back navigation preserving prior inputs. | `NewRequestViewModel` maintains sealed `WizardStep` state. Slide animations (300ms) with progress bar. | **Module 2 (Core)**<br>`IMPLEMENT IN MODULE 2` | Core wizard experience. Implemented in `:feature:resident`. |
+| **REQ-030** | **Firestore-Backed Configurable Categories**<br>Categories loaded dynamically from `/config/waste_categories` rather than hardcoded enums. Remote updates without app releases. | `WasteCategoryRepository` fetches from Firestore collection `/config/waste_categories`, cached locally in Room/DataStore with bundled fallback. | **Module 2 (Core)**<br>`IMPLEMENT IN MODULE 2` | Prevents hardcoded business logic. Managed via `:core:data`. |
+| **REQ-031** | **Location Capture via Map + GPS**<br>FusedLocationProvider + manual pin-drop override + reverse geocoding with 500ms debouncing. | MapLibre Compose + OpenFreeMap tiles. High accuracy GPS with rationale. Android native `Geocoder` debounced at 500ms. | **Module 2 (Core)**<br>`IMPLEMENT IN MODULE 2` | Implemented in `:feature:resident` with zero-cost map engine. |
+| **REQ-032** | **Volume & Server-Side Pricing/Logistics Mapping**<br>Volume tiers mapped to weight/logistics heuristics server-side. | Canonical `VolumeTier` enum with physical volume descriptions and bag equivalents. Price calculation marked as ESTIMATE on client; final price determined server-side. | **Module 2 (Core)**<br>`IMPLEMENT IN MODULE 2` | Final settlement contract executed in Module 6 (Financials). |
+| **REQ-033** | **Confirmation Summary Screen**<br>Aggregate wizard state into read-only summary; edit links jump back to specific steps preserving all other data. | `NewRequestConfirmScreen` renders section cards with deep edit links to step 1, 2, or 3. Inline button loading state. | **Module 2 (Core)**<br>`IMPLEMENT IN MODULE 2` | Full review flow prior to atomic submission. |
+| **REQ-034** | **Optimistic Submission & Acknowledgment**<br>Client-generated UUID (`clientGeneratedId`); immediate UI acknowledgment; graceful rollback on failure. | Write to Room DB and firestore with deterministic `document(clientGeneratedId)`. Displays checkmark screen (`REQ-XXXX`). | **Module 2 (Core)**<br>`IMPLEMENT IN MODULE 2` | Guarantees non-blocking resident experience. |
+| **REQ-035** | **Draft Auto-Save & Explicit Resume Prompt**<br>Persist in-progress wizard state locally; prompt user to resume on next launch rather than silent restore. | Draft saved to Room `resident_drafts` table scoped by `userId`. On wizard entry, dialog prompts: "Continue your pickup request?". | **Module 2 (Core)**<br>`IMPLEMENT IN MODULE 2` | Respects user intent; survives process death and phone calls. |
+| **REQ-036** | **Field-Level Validation & Error Prevention**<br>Next button disabled with helper hints until required inputs pass validation. Double-validated on server. | Client-side validation in `RequestValidator` + Firestore Security Rules schema assertions (`canCreateWasteRequest`). | **Module 2 (Core)**<br>`IMPLEMENT IN MODULE 2` | Defense-in-depth: client UI gating + server-enforced security rules. |
+| **REQ-037** | **Request Type Presets / Templates**<br>Allow saving a request configuration as a reusable template document under `/users/{uid}/templates`. | "Save as template" toggle on Confirm screen saves payload to `/users/{uid}/templates/{templateId}`. | **Module 2 (Contract Defined)**<br>`IMPLEMENT IN MODULE 2` | Data model and Firestore subcollection contract implemented. Template quick-chips on dashboard surfaced. |
+| **REQ-038** | **Cancellation Window Logic**<br>Allow cancellation only while status is `PENDING_DISPATCH`. Server-enforced via Firestore rules. | UI exposes Cancel button conditionally. Firestore rule asserts `existingData.status == 'PENDING_DISPATCH' && newData.status == 'CANCELLED'`. | **Module 2 (Core)**<br>`IMPLEMENT IN MODULE 2` | Full atomic race protection between resident and collector. |
+| **REQ-039** | **Accessibility for Wizard Flow**<br>Semantic labels, live regions, minimum 48dp touch targets, TalkBack announcements per step. | All Compose components specify `Modifier.semantics` and `contentDescription`. Screen titles announced via `AccessibilityLiveRegion`. | **Module 2 (Core)**<br>`IMPLEMENT IN MODULE 2` | Integrated into `:core:design-system` and wizard composables. |
+| **REQ-040** | **Server-Side Duplicate Prevention**<br>Detect existing pending requests within geographic cooldown window before allowing new submission. | 1. Client pre-flight query checks user's active requests within 100m.<br>2. Idempotency key prevents duplicate writes on network retry.<br>3. Cooldown timestamp enforced. | **Module 2 (Core)**<br>`IMPLEMENT IN MODULE 2` | Dual client advisory check + server idempotency enforcement. |
+
+---
+
+## 3. Authoritative Request Lifecycle & Synchronization State Machine
+
+### 3.1 Strict Separation of Concepts
+To prevent architectural confusion, WasteLink strictly isolates two distinct state machines:
+1. **Server-Authoritative Operational State (`RequestLifecycleStatus`)**: The authoritative state of the request in Cloud Firestore, mutated only by permitted actors and validated by security rules.
+2. **Local Client Synchronization State (`LocalSyncStatus`)**: The state of the request record on the local Android device (Room database), tracking network persistence and WorkManager progress.
+
 ```mermaid
 flowchart TD
-    AuthCheck([User Authenticated as ACTIVE Resident]) --> ResHome[ResidentHomeScreen: Active Map & Feeds]
-    
-    ResHome --> ActionSelect{Resident Action}
-    
-    ActionSelect -->|Tap 'Request Pickup' FAB/Card| WizardEntry[Step 1: Category Selection]
-    ActionSelect -->|Tap 'Track Active Pickup' Banner| LiveTracker[ResidentTrackingScreen]
-    ActionSelect -->|Select 'History' Tab| HistoryView[HistoryScreen: Paginated Log]
-    
-    %% Wizard Flow
-    subgraph Wizard_State_Machine ["Request Creation Multi-Step Wizard"]
-        WizardEntry -->|Select Category + Continue| StepVolume[Step 2: Volume / Quantity Selection]
-        StepVolume -->|Back| WizardEntry
-        StepVolume -->|Select Volume Tier + Continue| StepLoc[Step 3: Location, GPS & Pin Drop]
-        StepLoc -->|Back| StepVolume
-        StepLoc -->|Confirm Pin & Address + Continue| StepReview[Step 4: Request Review & Notes]
-        StepReview -->|Back| StepLoc
-        StepReview -->|Tap Edit Section Link| JumpEdit{Jump to Step 1, 2, or 3}
-        JumpEdit --> StepReview
+    subgraph Local_Device_Lifecycle ["Local Client Synchronization Machine (Room DB)"]
+        LD_Draft[LOCAL_DRAFT: In-Progress Wizard] -->|User completes review offline| LD_Queued[QUEUED_OFFLINE: Stored in Room]
+        LD_Draft -->|User completes review online| LD_Uploading[UPLOADING: Dispatching write]
+        LD_Queued -->|WorkManager detects CONNECTED| LD_Uploading
+        LD_Uploading -->|Server returns 200 OK| LD_Synced[SYNCED: Document confirmed in Firestore]
+        LD_Uploading -->|Network dropped| LD_Queued
+        LD_Uploading -->|Rule rejection 403 / Account suspended| LD_Failed[SYNC_FAILED: Permanent error]
     end
-    
-    StepReview -->|Tap 'Submit Pickup' CTA| SubmissionCheck{Online or Offline?}
-    
-    SubmissionCheck -->|Online: Firestore Write| OptimisticAck[Optimistic Success State]
-    SubmissionCheck -->|Offline: Room DB Cache| QueueWorkManager[Enqueue OneTimeWorkRequest]
-    
-    OptimisticAck --> AckScreen[NewRequestSubmittedScreen: Reference REQ-XXXX]
-    QueueWorkManager --> AckScreen
-    
-    AckScreen -->|Tap 'Done' or Auto-navigate| ResHome
-    
-    %% Status Tracking & Cancellation
-    LiveTracker --> StatusCheck{Current Request Status}
-    StatusCheck -->|PENDING_DISPATCH| CanCancel[Allow 'Cancel Request' Action]
-    StatusCheck -->|ASSIGNED_TO_FLEET / EN_ROUTE| DisallowCancel[Lock Cancellation & Show Live Truck/ETA]
-    StatusCheck -->|ARRIVED_AT_LOCATION| ProximityArrival[Show 'Truck Arrived' Visual Pulse]
-    StatusCheck -->|COLLECTION_VERIFIED / COMPLETED| CompletedState[Show Service Receipt & Eco-Points]
-    
-    CanCancel -->|Tap Cancel & Confirm Dialog| CancelMutation[Firestore Update: status = CANCELLED]
-    CancelMutation --> ResHome
+
+    subgraph Server_Authoritative_Lifecycle ["Server-Authoritative Operational Machine (Cloud Firestore)"]
+        SF_Pending[PENDING_DISPATCH: Awaiting Fleet Allocation]
+        SF_Pending -->|Admin or Auto-Dispatch assigns| SF_Assigned[ASSIGNED_TO_FLEET: Driver allocated]
+        SF_Pending -->|Resident cancels before dispatch| SF_Cancelled[CANCELLED: Final State]
+        SF_Pending -->|System fraud/spam trigger| SF_Flagged[FLAGGED_FOR_REVIEW: Admin queue]
+        
+        SF_Flagged -->|Admin approves| SF_Pending
+        SF_Flagged -->|Admin dismisses/bans| SF_Cancelled
+        
+        SF_Assigned -->|Driver starts transit| SF_EnRoute[EN_ROUTE: Truck heading to resident]
+        SF_Assigned -->|Driver rejects/drops task| SF_Pending
+        
+        SF_EnRoute -->|Proximity < 50m or Gate override| SF_Arrived[ARRIVED_AT_LOCATION: Driver at site]
+        SF_EnRoute -->|Vehicle breakdown / access blocked| SF_Failed[FAILED: Exception State]
+        
+        SF_Arrived -->|Proof of Collection photo attached| SF_Verified[COLLECTION_VERIFIED: Waste loaded]
+        SF_Arrived -->|No-show / gate locked + Photo proof| SF_Failed
+        
+        SF_Verified -->|Driver departs site| SF_InTransit[IN_TRANSIT_TO_DUMP: Heading to dumpsite]
+        SF_InTransit -->|Municipal transfer station verified| SF_Completed[COMPLETED: Terminal State]
+        
+        SF_Failed -->|Resident files grievance within 48h| SF_Disputed[DISPUTED: Arbitration queue]
+        SF_Completed -->|Resident disputes damage/incomplete| SF_Disputed
+        
+        SF_Disputed -->|Admin issues refund/reservice| SF_Resolved[RESOLVED: Closed by Admin]
+        SF_Disputed -->|Admin rejects grievance with audit note| SF_Dismissed[DISMISSED: Closed by Admin]
+    end
+
+    LD_Synced -.->|Authoritative Mirror| SF_Pending
 ```
 
-### 2.2 Screen Interaction Contracts
+### 3.2 Canonical State Definitions & Vocabulary Reconciliation
+Historical baselines used differing naming conventions. The following table establishes the canonical standard and explicit migration mappings:
 
-| Screen Composable | Route Key | Allowed Inputs / Interactions | Required Validations | Transitions & Fallbacks |
-| :--- | :--- | :--- | :--- | :--- |
-| **`ResidentHomeScreen`** | `resident_home` | - Quick Action Chips<br>- Active Request Tracker Card<br>- Live Map Background<br>- Pull-to-Refresh | Resident must be `ACTIVE` and `email_verified`. If suspended, redirects to `account_status_lock`. | Tap "Request Pickup" -> opens Category Wizard.<br>Tap active card -> `resident_tracking/{id}`. |
-| **`NewRequestCategoryScreen`** | `request_category` | - 2-column Category Grid<br>- Back navigation<br>- "Continue" Button | Must select exactly 1 category (`HOUSEHOLD`, `CONSTRUCTION`, `GARDEN`, `ELECTRONIC`, `HAZARDOUS`, `BULK_ITEMS`). | "Continue" disabled until category selected. Back exits wizard with draft preserved. |
-| **`NewRequestVolumeScreen`** | `request_volume` | - Volume Tier Cards<br>- Quantity Stepper<br>- Back button<br>- "Continue" Button | Must select valid `VolumeTier` (`SMALL_BAG`, `STANDARD_BIN`, `LARGE_LOAD`, `TRUCK_LOAD`). | Forward to `request_location`. Back returns to `request_category` preserving choice. |
-| **`NewRequestLocationScreen`** | `request_location` | - GPS Auto-locate Button<br>- MapLibre Pin Drag / Tap<br>- Manual Address Input<br>- Landmark Notes (max 280 chars) | Latitude in `[-90, 90]`, Longitude in `[-180, 180]`, Address length `>= 2 chars`. | If GPS denied, surfaces educational rationale; allows manual pin-drop. Forward to `request_confirm`. |
-| **`NewRequestConfirmScreen`** | `request_confirm` | - Read-only Summary Cards<br>- "Edit" Chevron links<br>- "Save as Template" Switch<br>- "Submit Request" CTA | Duplicate active request check: cannot submit if resident already has pending request at identical location. | Tap Submit -> Disables CTA, shows inline spinner, submits to repository. On success -> `request_submitted/{id}`. |
-| **`NewRequestSubmittedScreen`** | `request_submitted/{id}` | - Animated Checkmark<br>- Monospace Reference Tag (`REQ-XXXX`)<br>- Estimated ETA Advisory<br>- "Back to Home" CTA | Validates document ID and reference. | Tap "Back to Home" or 3-second auto-timeout pops back stack to `resident_home`. |
-| **`ResidentTrackingScreen`** | `resident_tracking/{id}` | - Real-time Map with Driver Marker<br>- ETA Countdown Pill<br>- Driver Contact (WhatsApp link)<br>- "Cancel Request" Button (conditional) | "Cancel" button ONLY enabled while status is `PENDING_DISPATCH`. Hidden once `ASSIGNED_TO_FLEET`. | Back returns to `resident_home`. Cancel prompts confirmation modal before Firestore mutation. |
-| **`HistoryScreen`** | `resident_history` | - Chronological Request List<br>- Status Badges<br>- Filter Chips (All, Active, Completed)<br>- Pull-to-refresh | Queries Firestore `/waste_requests` where `clientUid == auth.uid` ordered by `createdAt DESC`. | Tap item -> opens read-only detail bottom sheet. |
+| Canonical Operational Status | Historical / Legacy Aliases | Owning / Mutating Actor | Definition & Boundary Conditions |
+| :--- | :--- | :--- | :--- |
+| `PENDING_DISPATCH` | `PENDING`, `pending`, `NEW` | Resident (create), Collector (drop), Admin | Request has been validated and committed to Firestore. Awaiting fleet allocation. |
+| `FLAGGED_FOR_REVIEW` | `FLAGGED`, `SHADOW_BANNED` | Cloud Function, Admin | Request flagged for administrative review due to user status or cooldown violation. |
+| `ASSIGNED_TO_FLEET` | `ASSIGNED`, `assigned` | Admin, Auto-Dispatch Engine | A specific driver UID and vehicle unit have been assigned. Cancellation is now locked. |
+| `EN_ROUTE` | `en_route`, `STARTED` | Assigned Collector | Driver has pressed "Start Route" and is actively traveling toward pickup coordinates. |
+| `ARRIVED_AT_LOCATION`| `ARRIVED`, `AT_GATE` | Assigned Collector (or GPS geofence) | Driver is within 50 meters of the pickup coordinates. |
+| `COLLECTION_VERIFIED`| `VERIFIED`, `PICKED_UP` | Assigned Collector | Driver has taken custody of waste and attached mandatory Proof of Collection (PoC) photo. |
+| `IN_TRANSIT_TO_DUMP` | `IN_TRANSIT`, `HAULING` | Assigned Collector | Driver has departed pickup location and is en route to an authorized municipal dump. |
+| `COMPLETED` | `completed`, `DONE` | Assigned Collector, Transfer Station | Waste has been weighed and offloaded at municipal facility. Eco-points awarded. |
+| `CANCELLED` | `cancelled`, `USER_CANCELLED`| Resident Owner, Admin | Request cancelled prior to dispatch. Terminal state. |
+| `FAILED` | `FAILED_NO_SHOW`, `ABORTED` | Assigned Collector | Pickup could not be completed. Mandatory photo proof and failure reason required. |
+| `DISPUTED` | `disputed`, `IN_DISPUTE` | Resident Owner | Resident submitted a formal grievance regarding a `FAILED` or `COMPLETED` pickup within 48 hours. |
+| `RESOLVED` | `resolved` | Admin strictly | Admin resolved dispute with refund or re-service. Terminal state. |
+| `DISMISSED` | `dismissed` | Admin strictly | Admin dismissed dispute with explanation. Terminal state. |
+
+### 3.3 Complete Transition-by-Transition Enforcement Matrix
+
+| Transition | From State | To State | Triggering Actor | Mandatory Preconditions & Validation Rules | Failure / Rejection Result |
+| :---: | :---: | :---: | :---: | :--- | :--- |
+| **TR-01** | `None` | `PENDING_DISPATCH` | Resident Owner | `clientUid == auth.uid`, active resident, verified email, valid coordinates within active service zone, valid category, volume tier, `assignedTruckId == null`, `agreedPrice == null`. | `HTTP 403 PERMISSION_DENIED`. UI keeps draft intact. |
+| **TR-02** | `PENDING_DISPATCH` | `CANCELLED` | Resident Owner | `clientUid == auth.uid`, existing status `PENDING_DISPATCH`. No fields modified except `status` and `updatedAt`. | If collector accepted concurrently, write fails; UI informs user request is already en route. |
+| **TR-03** | `PENDING_DISPATCH` | `FLAGGED_FOR_REVIEW`| Cloud Function / Admin | Cooldown anomaly, duplicate address flag, or restricted resident status detected. | Diverted to Admin Operations console. |
+| **TR-04** | `FLAGGED_FOR_REVIEW`| `PENDING_DISPATCH` | Admin strictly | Admin verifies resident legitimacy and clears request for dispatch. | Audit log recorded. |
+| **TR-05** | `PENDING_DISPATCH` | `ASSIGNED_TO_FLEET`| Admin / Dispatcher | Collector is approved, active, on-duty, and has capacity < 100%. Sets `assignedTruckId`, `assignedCollectorUid`, `assignedAt`. | Race condition prevented via atomic Firestore transaction. |
+| **TR-06** | `ASSIGNED_TO_FLEET` | `PENDING_DISPATCH` | Assigned Collector / Admin | Driver drops job due to breakdown or shift expiry. `assignedTruckId` reset to null. | Returns to active dispatch pool. |
+| **TR-07** | `ASSIGNED_TO_FLEET` | `EN_ROUTE` | Assigned Collector | `assignedTruckId == auth.uid`. Sets `enRouteAt == request.time`. | Rejected if collector is not the assigned driver. |
+| **TR-08** | `EN_ROUTE` | `ARRIVED_AT_LOCATION`| Assigned Collector / GPS | Haversine distance < 50m or manual arrival confirmed. Sets `arrivedAt == request.time`. | Triggers resident arrival notification. |
+| **TR-09** | `EN_ROUTE` | `FAILED` | Assigned Collector | Route completely blocked or emergency breakdown. Mandatory `failureReason` and photo evidence. | Diverted to failed queue; resident notified. |
+| **TR-10** | `ARRIVED_AT_LOCATION`| `COLLECTION_VERIFIED`| Assigned Collector | **Mandatory Proof of Collection (PoC)**: `pocPhotoUrl` or `pocPhotoBase64` must be attached. Sets `collectedAt == request.time`. | **REJECTED** if photo payload is absent. |
+| **TR-11** | `ARRIVED_AT_LOCATION`| `FAILED` | Assigned Collector | Resident no-show or gate locked. Mandatory photo proof of closed gate/missing trash + `failureReason`. | Sets `failedAt == request.time`. |
+| **TR-12** | `COLLECTION_VERIFIED`| `IN_TRANSIT_TO_DUMP` | Assigned Collector | Driver departs pickup location toward transfer station. | Resident tracking updates to "In Transit". |
+| **TR-13** | `IN_TRANSIT_TO_DUMP` | `COMPLETED` | Assigned Collector / Dump Geofence | Truck coordinates intersect municipal dumpsite polygon. Sets `completedAt == request.time`. | Awards +10 GreenPoints; surfaces rating prompt. |
+| **TR-14** | `FAILED` / `COMPLETED` | `DISPUTED` | Resident Owner | `clientUid == auth.uid`. Time since `updatedAt` <= 48 hours. Sets `disputeReason`. | Created in `/service_disputes`; status updated to `DISPUTED`. |
+| **TR-15** | `DISPUTED` | `RESOLVED` | Admin strictly | Admin reviews evidence and issues resolution note (`adminResolutionNote`). | Terminal state. Audit log written. |
+| **TR-16** | `DISPUTED` | `DISMISSED` | Admin strictly | Admin reviews evidence and dismisses grievance with explanation. | Terminal state. Audit log written. |
 
 ---
 
-## 3. Canonical Request State Machine
+## 4. Firestore Security Rules Specification
 
-### 3.1 State Hierarchy & Allowed Transitions
-The WasteLink Request Lifecycle is strictly unidirectional. Transitioning directly from `PENDING_DISPATCH` to `COMPLETED` or bypassing field verification is strictly prevented by Firestore Security Rules.
+### 4.1 Identified Vulnerability Gaps in Existing Rules
+A thorough audit of the existing `firestore.rules` (lines 588–740) revealed four security weaknesses that must be remediated in the design:
+
+1. **Vulnerability 1 — Flawed Resident Blacklist Permitted Coordinate & Identity Tampering**:
+   The current resident update rule (`lines 682-688`) uses a blacklist:
+   ```javascript
+   !newData.diff(existingData).affectedKeys().hasAny(['id', 'requestRef', 'clientUid', 'category', 'volumeTier', ...])
+   ```
+   **Security Gap**: This blacklist omits `lat`, `lng`, `geohash`, `pickupAddress`, and `residentPhoneNumber`. A malicious resident could alter their pickup location to another district after creating the request while keeping the status `PENDING_DISPATCH`.
+   **Remediation**: Replace the blacklist with an explicit **whitelist**:
+   ```javascript
+   newData.diff(existingData).affectedKeys().hasOnly(['status', 'notes', 'gatePhotoBase64', 'gatePhotoUrl', 'updatedAt'])
+   ```
+2. **Vulnerability 2 — Missing Proof of Collection at Collection Verification**:
+   In `isValidCollectorRequestTransition` (`lines 657-659`), transitioning from `ARRIVED_AT_LOCATION` to `COLLECTION_VERIFIED` only asserted `isTimestampOrPositiveInt(newData.collectedAt)`. Proof of Collection (`hasProofOfCollection`) was only checked on `COMPLETED`.
+   **Security Gap**: A driver could mark a collection verified without providing photographic proof of waste pickup.
+   **Remediation**: Require `hasProofOfCollection(newData)` directly on transition to `COLLECTION_VERIFIED`.
+3. **Vulnerability 3 — Step Skipping to Completed**:
+   The existing rule allowed:
+   ```javascript
+   existingData.status in ['ARRIVED_AT_LOCATION', 'COLLECTION_VERIFIED', 'IN_TRANSIT_TO_DUMP'] && newData.status == 'COMPLETED'
+   ```
+   **Security Gap**: A driver could bypass municipal dumpsite verification and jump straight from arrival to completion.
+   **Remediation**: Enforce strict sequential progression: `COMPLETED` can only be reached from `IN_TRANSIT_TO_DUMP`.
+4. **Vulnerability 4 — Unverified Failure Transitions**:
+   The existing rule permitted `FAILED` with only a text string `failureReason`.
+   **Remediation**: Require photographic evidence of access denial or missing trash whenever `FAILED` is triggered from `ARRIVED_AT_LOCATION`.
+
+### 4.2 Hardened Security Rules Blueprint
+
+```javascript
+// =========================================================================
+// REVISED SPECIFICATION FOR /waste_requests/{requestId}
+// =========================================================================
+
+function hasAllowedWasteRequestKeys(data) {
+  return data.keys().hasOnly([
+    'id', 'clientGeneratedId', 'requestRef', 'clientUid', 'geohash', 'lat', 'lng',
+    'serviceZoneId', 'pickupAddress', 'category', 'volumeTier', 'notes',
+    'gatePhotoBase64', 'pocPhotoBase64', 'gatePhotoUrl', 'pocPhotoUrl',
+    'status', 'assignedCollectorUid', 'assignedVehicleId', 'assignedTruckId',
+    'assignedAt', 'enRouteAt', 'arrivedAt', 'collectedAt', 'completedAt',
+    'failedAt', 'failureReason', 'failurePhotoUrl', 'failurePhotoBase64',
+    'priceTzs', 'currency', 'residentPhoneNumber', 'collectorPhoneNumber',
+    'disputeReason', 'adminResolutionNote', 'createdAt', 'updatedAt'
+  ]);
+}
+
+function canCreateWasteRequest(requestId, reqData) {
+  return isActiveResident(request.auth.uid)
+    && hasAllowedWasteRequestKeys(reqData)
+    && reqData.id == requestId
+    && reqData.clientUid == request.auth.uid
+    && isValidNonEmptyString(reqData.clientGeneratedId, 16, 64)
+    && isValidNonEmptyString(reqData.requestRef, 8, 32)
+    && isValidNonEmptyString(reqData.serviceZoneId, 2, 64)
+    && isValidNonEmptyString(reqData.pickupAddress, 2, 300)
+    && isValidNonEmptyString(reqData.category, 2, 60)
+    && isValidNonEmptyString(reqData.volumeTier, 2, 60)
+    && isValidLat(reqData.lat)
+    && isValidLng(reqData.lng)
+    && isValidNonEmptyString(reqData.geohash, 5, 12)
+    && reqData.status == 'PENDING_DISPATCH'
+    && (!('assignedCollectorUid' in reqData) || reqData.assignedCollectorUid == null)
+    && (!('assignedVehicleId' in reqData) || reqData.assignedVehicleId == null)
+    && (!('assignedTruckId' in reqData) || reqData.assignedTruckId == null)
+    && (!('assignedAt' in reqData) || reqData.assignedAt == null)
+    && (!('enRouteAt' in reqData) || reqData.enRouteAt == null)
+    && (!('arrivedAt' in reqData) || reqData.arrivedAt == null)
+    && (!('collectedAt' in reqData) || reqData.collectedAt == null)
+    && (!('completedAt' in reqData) || reqData.completedAt == null)
+    && (!('failedAt' in reqData) || reqData.failedAt == null)
+    && (!('failureReason' in reqData) || reqData.failureReason == null)
+    && (!('pocPhotoUrl' in reqData) || reqData.pocPhotoUrl == null)
+    && (!('pocPhotoBase64' in reqData) || reqData.pocPhotoBase64 == null)
+    && (!('priceTzs' in reqData) || reqData.priceTzs == null)
+    && (!('collectorPhoneNumber' in reqData) || reqData.collectorPhoneNumber == null)
+    && isTimestampOrPositiveInt(reqData.createdAt)
+    && isTimestampOrPositiveInt(reqData.updatedAt);
+}
+
+function canUpdateWasteRequest(existingData, newData) {
+  return hasAllowedWasteRequestKeys(newData)
+    && isTimestampOrPositiveInt(newData.updatedAt)
+    && (
+      // Branch 1: Resident Owner (Strict Whitelist: notes, gatePhoto, or cancellation)
+      (
+        isActiveResident(request.auth.uid)
+        && existingData.clientUid == request.auth.uid
+        && existingData.status == 'PENDING_DISPATCH'
+        && newData.diff(existingData).affectedKeys().hasOnly([
+             'status', 'notes', 'gatePhotoBase64', 'gatePhotoUrl', 'updatedAt'
+           ])
+        && (newData.status == 'PENDING_DISPATCH' || newData.status == 'CANCELLED')
+      )
+      // Branch 2: Resident Dispute Filing (Within 48 hours of terminal state)
+      || (
+        isActiveResident(request.auth.uid)
+        && existingData.clientUid == request.auth.uid
+        && existingData.status in ['COMPLETED', 'FAILED']
+        && newData.status == 'DISPUTED'
+        && newData.diff(existingData).affectedKeys().hasOnly([
+             'status', 'disputeReason', 'updatedAt'
+           ])
+        && isValidNonEmptyString(newData.disputeReason, 10, 1000)
+      )
+      // Branch 3: Assigned Collector (Strict Operational Progression)
+      || (
+        isApprovedActiveCollector(request.auth.uid)
+        && (existingData.assignedCollectorUid == request.auth.uid || existingData.assignedTruckId == request.auth.uid)
+        && isValidCollectorRequestTransition(existingData, newData)
+      )
+      // Branch 4: Administrator (Dispatch, Allocation, Pricing, Dispute Arbitration)
+      || (
+        isAdmin()
+        && !newData.diff(existingData).affectedKeys().hasAny([
+             'id', 'clientGeneratedId', 'requestRef', 'clientUid', 'createdAt'
+           ])
+      )
+    );
+}
+```
+
+---
+
+## 5. Location, Service Zones & Map Infrastructure
+
+### 5.1 Service Zone Architecture & Bounds Enforcement
+To prevent requests being submitted in unserviceable wilderness or outside municipal jurisdictions:
+1. **Service Zone Model**:
+   Municipal service zones are defined in Firestore `/service_zones/{zoneId}`:
+   ```kotlin
+   data class ServiceZone(
+       val zoneId: String,          // e.g., "TZ-DSM-KINONDONI"
+       val name: String,            // "Kinondoni Municipality"
+       val minLat: Double,          // Bounding Box Min Latitude
+       val maxLat: Double,          // Bounding Box Max Latitude
+       val minLng: Double,          // Bounding Box Min Longitude
+       val maxLng: Double,          // Bounding Box Max Longitude
+       val isActive: Boolean = true
+   )
+   ```
+2. **Pre-Submission Boundary Validation**:
+   - When a pin is selected (via GPS or manual placement), coordinates are checked against cached active `ServiceZone` boundaries.
+   - If coordinates fall outside all active zones:
+     - The UI displays an explicit warning banner: `"Location is outside active municipal collection zones."`
+     - The "Continue" button on Step 3 remains **disabled**.
+   - No request can be submitted without an assigned `serviceZoneId`.
+3. **Removal of City Center Fallback**:
+   - The previous default coordinate (`-6.7924, 39.2083`) is **strictly prohibited as a submission value**.
+   - It is used **only** as the initial visual camera center when the map opens if GPS is disabled.
+   - The resident must explicitly tap or drag the pin to set a confirmed location before Step 3 validation passes.
+
+### 5.2 OpenFreeMap & MapLibre Operational Reality
+To ensure engineering honesty and operational resilience:
+- **No Enterprise SLA**: OpenFreeMap is a community-supported open tile service without uptime guarantees.
+- **Attribution Requirement**: The map view includes required legal attribution: `"© OpenMapTiles © OpenStreetMap contributors"`.
+- **Tile Caching**: MapLibre's local tile cache stores downloaded vector tiles in app storage, allowing previously viewed map areas to render offline.
+- **Graceful Map Degradation**:
+  If vector tiles fail to load due to network outage or CDN downtime:
+  1. The map canvas displays a dark textured grid with coordinate indicators.
+  2. Pin dragging remains 100% operational (coordinates update on drag).
+  3. The resident can manually type their address and landmark description into the text field.
+  4. The request flow is never blocked by a tile outage.
+
+---
+
+## 6. Offline Queuing, Idempotency & Session Lifecycle
+
+### 6.1 Deterministic Idempotency Key Architecture
+To eliminate duplicate requests caused by network timeouts or repeated button presses:
 
 ```mermaid
-stateDiagram-v2
-    [*] --> DRAFT : User opens Wizard
-    DRAFT --> PENDING_DISPATCH : Resident submits request (Online)
-    DRAFT --> PENDING_OFFLINE : Resident submits request (Offline)
-    PENDING_OFFLINE --> PENDING_DISPATCH : WorkManager syncs upon NetworkType.CONNECTED
+sequenceDiagram
+    autonumber
+    actor Resident as Resident User
+    participant VM as NewRequestViewModel
+    participant Room as Local Room DB (cached_waste_requests)
+    participant WM as WorkManager (OfflineSyncWorker)
+    participant FS as Cloud Firestore (/waste_requests)
+
+    Resident->>VM: Taps "Submit Pickup"
+    Note over VM: Generate UUID clientGeneratedId once per draft
+    VM->>Room: insert(request.copy(id = clientGeneratedId, syncStatus = UPLOADING))
     
-    PENDING_DISPATCH --> CANCELLED : Resident cancels pickup (Owner only)
-    PENDING_DISPATCH --> FLAGGED_FOR_REVIEW : Shadow-banned / Cooldown trigger
-    PENDING_DISPATCH --> ASSIGNED_TO_FLEET : Municipal Admin or Auto-Dispatch allocates Driver
-    
-    ASSIGNED_TO_FLEET --> EN_ROUTE : Collector starts route toward resident
-    ASSIGNED_TO_FLEET --> PENDING_DISPATCH : Driver drops/reassigns task
-    
-    EN_ROUTE --> ARRIVED_AT_LOCATION : Geofence auto-detect (< 50m) or Collector confirm
-    EN_ROUTE --> FAILED : Driver reports inaccessible route / mechanical fault
-    
-    ARRIVED_AT_LOCATION --> COLLECTION_VERIFIED : Proof of Collection (PoC) photo attached
-    ARRIVED_AT_LOCATION --> FAILED : Resident no-show / gate locked (Photo proof mandatory)
-    
-    COLLECTION_VERIFIED --> IN_TRANSIT_TO_DUMP : Driver departs for municipal disposal site
-    IN_TRANSIT_TO_DUMP --> COMPLETED : Disposal confirmed at official transfer facility
-    
-    FAILED --> DISPUTED : Resident files grievance within 48h
-    COMPLETED --> DISPUTED : Resident reports incomplete/damaged service within 48h
-    
-    CANCELLED --> [*]
-    COMPLETED --> [*]
-    DISPUTED --> [*]
+    alt Network is Available
+        VM->>FS: document(clientGeneratedId).set(requestPayload)
+        alt Server Acknowledged (200 OK)
+            FS-->>VM: Success Ack
+            VM->>Room: updateSyncStatus(clientGeneratedId, SYNCED)
+            VM-->>Resident: Show Success Screen (REQ-XXXX)
+        else Network Timeout / Socket Error
+            FS-->>VM: Timeout Exception
+            VM->>Room: updateSyncStatus(clientGeneratedId, QUEUED_OFFLINE)
+            VM->>WM: enqueueUniqueWork(clientGeneratedId, CONNECTED constraint)
+            VM-->>Resident: Show "Saved Offline — Will Sync Automatically"
+        end
+    else Device is Offline
+        VM->>Room: updateSyncStatus(clientGeneratedId, QUEUED_OFFLINE)
+        VM->>WM: enqueueUniqueWork(clientGeneratedId, CONNECTED constraint)
+        VM-->>Resident: Show "Saved Offline — Will Sync Automatically"
+    end
+
+    Note over WM, FS: When Network Restores (Background Execution)
+    WM->>Room: getQueuedRequests()
+    loop For each queued request
+        WM->>FS: document(clientGeneratedId).set(requestPayload)
+        FS-->>WM: Success Ack
+        WM->>Room: updateSyncStatus(clientGeneratedId, SYNCED)
+    end
 ```
 
-### 3.2 Formal Transition & Permission Matrix
-
-| Transition | Initial State | Target State | Permitted Actor | Mandatory Invariants & Preconditions | Rejection / Rollback Consequence |
-| :---: | :---: | :---: | :---: | :--- | :--- |
-| **T-01** | `DRAFT` | `PENDING_DISPATCH` | `RESIDENT` | - Resident status `ACTIVE` and `email_verified == true`.<br>- Valid category, volume tier, and GPS coordinates.<br>- `assignedTruckId`, `agreedPrice`, and timestamps must be null. | Rejection via rule: `403 PERMISSION_DENIED`. Wizard remains on confirm screen with error banner. |
-| **T-02** | `DRAFT` | `PENDING_OFFLINE` | `RESIDENT` (Client local) | Device has no internet connection. Payload persisted to Room `cached_waste_requests`. | WorkManager retries with exponential backoff until `CONNECTED`. |
-| **T-03** | `PENDING_DISPATCH` | `CANCELLED` | `RESIDENT` (Owner) | - Document `clientUid == request.auth.uid`.<br>- Status must be strictly `PENDING_DISPATCH`.<br>- Cannot mutate category, location, or server fields. | If collector was assigned concurrently, cancellation is blocked with "Request has already been dispatched". |
-| **T-04** | `PENDING_DISPATCH` | `ASSIGNED_TO_FLEET` | `ADMIN` / System Dispatch | - Collector must be `ACTIVE`, `APPROVED`, and `ON_DUTY`.<br>- Collector capacity must be `< 100%`. | Driver queue collision rejected via atomic Firestore transaction. |
-| **T-05** | `ASSIGNED_TO_FLEET` | `EN_ROUTE` | `COLLECTOR` (Assigned) | `assignedTruckId == request.auth.uid`. Timestamp `enRouteAt` recorded. | Collector app shows error dialog if unassigned. |
-| **T-06** | `EN_ROUTE` | `ARRIVED_AT_LOCATION` | `COLLECTOR` (Assigned) | Haversine distance `< 50m` or manual gate override. Timestamp `arrivedAt` recorded. | Resident receives live arrival notification and vibration burst. |
-| **T-07** | `ARRIVED_AT_LOCATION`| `COLLECTION_VERIFIED` | `COLLECTOR` (Assigned) | Proof of Collection (PoC) image payload (Base64 or Storage URL) attached. `collectedAt` set. | State transition blocked if photo is missing. |
-| **T-08** | `ARRIVED_AT_LOCATION`| `FAILED` | `COLLECTOR` (Assigned) | Mandatory photo proof of blocked access or missing trash + `failureReason` string. | Alert displayed on resident home screen with WhatsApp dispute link. |
-| **T-09** | `COLLECTION_VERIFIED`| `IN_TRANSIT_TO_DUMP` | `COLLECTOR` (Assigned) | Truck departs pickup coordinates. | Resident tracking screen updates to "In Transit". |
-| **T-10** | `IN_TRANSIT_TO_DUMP` | `COMPLETED` | `COLLECTOR` / Cloud Function | Vehicle reaches municipal dumpsite geofence polygon. `completedAt` set. | Resident awarded +10 GreenPoints; rating sheet surfaced. |
-
-### 3.3 Server-Authoritative State Enforcement Invariant
-Under no circumstances may a resident client mutate the `status` field to any state other than `CANCELLED`. Security rules strictly assert:
-```javascript
-existingData.clientUid == request.auth.uid
-&& existingData.status == 'PENDING_DISPATCH'
-&& newData.status in ['PENDING_DISPATCH', 'CANCELLED']
-```
-Any attempt to spoof an assignment, verify collection, or self-complete a request results in immediate transaction termination and security audit logging.
+### 6.2 Session Boundary & Logout Isolation
+What happens to queued offline requests during authentication state changes?
+1. **User Identity Binding**:
+   Every record in Room `cached_waste_requests` includes `clientUid`.
+2. **Account Sign-Out Guard**:
+   If the resident initiates a sign-out while requests are in state `QUEUED_OFFLINE`:
+   - An explanatory warning dialog is presented:
+     `"You have 1 pending request waiting to upload. Signing out will pause sync until you sign back in."`
+   - If the user confirms sign-out: WorkManager tasks for that user are cancelled. Queued records remain encrypted in Room tied to `clientUid`.
+3. **Multi-User Isolation**:
+   If User B logs into the same physical device, `OfflineSyncWorker` verifies:
+   ```kotlin
+   val currentAuthUid = authRepository.getCurrentUserId()
+   if (currentAuthUid != request.clientUid) {
+       // DO NOT SYNC: Foreign user credentials must never upload another user's request
+       return Result.retry() // Suspended until original owner authenticates
+   }
+   ```
+   This prevents cross-account data leakage and security rule rejections.
 
 ---
 
-## 4. Data Architecture & Canonical Contracts
+## 7. Canonical Data Contracts & Models
 
-### 4.1 Domain Models (`:core:domain`)
-Pure Kotlin entities with zero framework dependencies:
+### 7.1 Pure Domain Model (`:core:domain`)
 
 ```kotlin
 package com.waste.link.domain.model
 
-import java.time.Instant
-
-enum class WasteCategory(val id: String, val displayName: String) {
+enum class WasteCategory(
+    val id: String,
+    val displayName: String,
+    val isHazardous: Boolean = false,
+    val requiresSpecialHandling: Boolean = false
+) {
     HOUSEHOLD("household", "Household Waste"),
-    CONSTRUCTION("construction", "Construction Debris"),
+    CONSTRUCTION("construction", "Construction Debris", requiresSpecialHandling = true),
     GARDEN("garden", "Garden & Organic"),
-    ELECTRONIC("electronic", "E-Waste & Batteries"),
-    HAZARDOUS("hazardous", "Hazardous & Medical"),
-    BULK_ITEMS("bulk", "Bulky Furniture & Scrap")
+    ELECTRONIC("electronic", "E-Waste & Batteries", requiresSpecialHandling = true),
+    HAZARDOUS("hazardous", "Hazardous & Medical", isHazardous = true, requiresSpecialHandling = true),
+    BULK_ITEMS("bulk", "Bulky Furniture & Scrap", requiresSpecialHandling = true);
+
+    companion object {
+        fun fromId(id: String?): WasteCategory =
+            entries.find { it.id.equals(id, ignoreCase = true) } ?: HOUSEHOLD
+    }
 }
 
-enum class VolumeTier(val id: String, val displayName: String, val approximateBags: Int) {
-    SMALL_BAG("small_bag", "Small Bags (1-3)", 2),
-    STANDARD_BIN("standard_bin", "Standard Wheelie Bin (240L)", 5),
-    LARGE_LOAD("large_load", "Large Load (Truck Bed 1/2)", 15),
-    TRUCK_LOAD("truck_load", "Full Tipper Truck Load", 40)
+enum class VolumeTier(
+    val id: String,
+    val displayName: String,
+    val volumeDescription: String,
+    val bagEquivalent: Int
+) {
+    SMALL_BAG("small_bag", "Small Bag", "1 – 3 standard bags (~50L)", 2),
+    STANDARD_BIN("standard_bin", "Standard Bin", "240L municipal wheelie bin", 5),
+    LARGE_LOAD("large_load", "Large Load", "Half pickup bed (~1.5 m³)", 15),
+    TRUCK_LOAD("truck_load", "Truck Load", "Full tipper truck (~5.0 m³)", 40);
+
+    companion object {
+        fun fromId(id: String?): VolumeTier =
+            entries.find { it.id.equals(id, ignoreCase = true) } ?: STANDARD_BIN
+    }
 }
 
-enum class WasteRequestStatus {
-    DRAFT,
+enum class RequestLifecycleStatus {
     PENDING_DISPATCH,
+    FLAGGED_FOR_REVIEW,
     ASSIGNED_TO_FLEET,
     EN_ROUTE,
     ARRIVED_AT_LOCATION,
@@ -213,8 +467,17 @@ enum class WasteRequestStatus {
     COMPLETED,
     CANCELLED,
     FAILED,
-    FLAGGED_FOR_REVIEW,
-    DISPUTED
+    DISPUTED,
+    RESOLVED,
+    DISMISSED
+}
+
+enum class LocalSyncStatus {
+    LOCAL_DRAFT,
+    QUEUED_OFFLINE,
+    UPLOADING,
+    SYNCED,
+    SYNC_FAILED
 }
 
 data class GeoCoordinates(
@@ -222,32 +485,43 @@ data class GeoCoordinates(
     val longitude: Double
 ) {
     init {
-        require(latitude in -90.0..90.0) { "Latitude must be between -90 and 90 degrees." }
-        require(longitude in -180.0..180.0) { "Longitude must be between -180 and 180 degrees." }
+        require(latitude in -90.0..90.0) { "Latitude out of bounds: $latitude" }
+        require(longitude in -180.0..180.0) { "Longitude out of bounds: $longitude" }
     }
 }
 
 data class WasteRequest(
-    val id: String,
-    val requestRef: String,
-    val clientUid: String,
-    val coordinates: GeoCoordinates,
-    val geohash: String,
-    val pickupAddress: String,
-    val category: WasteCategory,
-    val volumeTier: VolumeTier,
-    val notes: String = "",
-    val gatePhotoUrl: String? = null,
-    val gatePhotoBase64: String? = null,
-    val pocPhotoUrl: String? = null,
-    val status: WasteRequestStatus = WasteRequestStatus.PENDING_DISPATCH,
-    val assignedTruckId: String? = null,
-    val agreedPrice: Double? = null,
-    val residentPhoneNumber: String? = null,
-    val collectorPhoneNumber: String? = null,
-    val failureReason: String? = null,
+    val id: String,                         // Equals clientGeneratedId
+    val clientGeneratedId: String,          // UUID v4 idempotency key
+    val requestRef: String,                 // User-friendly reference: WL-YYMM-XXXX
+    val clientUid: String,                  // Owner resident UID
+    val coordinates: GeoCoordinates,        // Latitude & Longitude
+    val geohash: String,                    // 7-character Geohash
+    val serviceZoneId: String,              // Validated municipal zone ID
+    val pickupAddress: String,              // Human-readable address
+    val category: WasteCategory,            // Validated category
+    val volumeTier: VolumeTier,              // Validated volume tier
+    val notes: String = "",                 // Resident landmark notes
+    val gatePhotoUrl: String? = null,       // Gate reference photo URL
+    val gatePhotoBase64: String? = null,    // Fallback Base64 gate photo
+    val pocPhotoUrl: String? = null,        // Driver PoC photo URL
+    val pocPhotoBase64: String? = null,     // Driver PoC Base64
+    val status: RequestLifecycleStatus = RequestLifecycleStatus.PENDING_DISPATCH,
+    val syncStatus: LocalSyncStatus = LocalSyncStatus.SYNCED,
+    val assignedCollectorUid: String? = null,// Assigned Driver UID
+    val assignedVehicleId: String? = null,  // Truck plate / unit ID
+    val assignedTruckId: String? = null,    // Backward-compatibility alias
+    val priceTzs: Long? = null,             // Integer monetary units in TZS
+    val currency: String = "TZS",           // Explicit currency ISO code
+    val residentPhoneNumber: String? = null,// E.164 phone string
+    val collectorPhoneNumber: String? = null,// Assigned collector phone
+    val failureReason: String? = null,      // Reason if status == FAILED
+    val failurePhotoUrl: String? = null,    // Photo evidence of failure
+    val disputeReason: String? = null,      // Resident grievance text
+    val adminResolutionNote: String? = null,// Admin arbitration note
     val createdAtEpochMs: Long = System.currentTimeMillis(),
     val updatedAtEpochMs: Long = System.currentTimeMillis(),
+    val assignedAtEpochMs: Long? = null,
     val enRouteAtEpochMs: Long? = null,
     val arrivedAtEpochMs: Long? = null,
     val collectedAtEpochMs: Long? = null,
@@ -256,144 +530,84 @@ data class WasteRequest(
 )
 ```
 
-### 4.2 Firestore Document Schema (`/waste_requests/{requestId}`)
-
-| Field Name | Type | Nullable | Description & Invariant Rules |
-| :--- | :--- | :---: | :--- |
-| `id` | String | NO | Auto-generated Firestore Document ID matching `docRef.id`. |
-| `requestRef` | String | NO | User-facing reference code (e.g., `REQ-4921`). Formatted `REQ-[1000-9999]`. |
-| `clientUid` | String | NO | UID of creating resident. Must equal `request.auth.uid`. |
-| `lat` | Double | NO | Latitude coordinate. Valid range `[-90.0, 90.0]`. |
-| `lng` | Double | NO | Longitude coordinate. Valid range `[-180.0, 180.0]`. |
-| `geohash` | String | NO | 7-character geohash for geospatial boundary indexing and fleet proximity queries. |
-| `pickupAddress` | String | NO | Human-readable reverse-geocoded string (2 - 300 characters). |
-| `category` | String | NO | Canonical uppercase name of `WasteCategory` (e.g., `"HOUSEHOLD"`). |
-| `volumeTier` | String | NO | Canonical uppercase name of `VolumeTier` (e.g., `"STANDARD_BIN"`). |
-| `notes` | String | NO | Optional resident notes / landmark hints (0 - 280 characters). |
-| `gatePhotoUrl` | String | YES | Storage URL of compressed gate/landmark reference image. |
-| `gatePhotoBase64` | String | YES | Fallback Base64 encoded WebP string (max 50KB) for zero-storage operation. |
-| `pocPhotoUrl` | String | YES | Driver Proof of Collection photo URL. Restricted write: Collector only. |
-| `pocPhotoBase64` | String | YES | Driver Proof of Collection Base64 string. Restricted write: Collector only. |
-| `status` | String | NO | Current canonical state. Default on creation: `"PENDING_DISPATCH"`. |
-| `assignedTruckId` | String | YES | UID of assigned collector. Must be null on creation. |
-| `agreedPrice` | Double | YES | Agreed service tariff in TZS. Must be null on creation; set by Admin/Collector. |
-| `residentPhoneNumber` | String | YES | International E.164 phone string (e.g., `+255712345678`). |
-| `collectorPhoneNumber`| String | YES | International E.164 phone string of assigned driver. |
-| `failureReason` | String | YES | Populated only when `status == "FAILED"`. |
-| `createdAt` | Timestamp/Int | NO | Server-authoritative timestamp on document creation. |
-| `updatedAt` | Timestamp/Int | NO | Server-authoritative timestamp on document mutation. |
-
 ---
 
-## 5. Security & Permission Architecture
+## 8. Module 2 Live Tracking Boundaries & Future Dependencies
 
-### 5.1 Enforced Relationship-Based Access Control (ReBAC)
-Access to `/waste_requests` is governed by strict relationship rules rather than open collection reads:
-1. **Resident Owner**: `resource.data.clientUid == request.auth.uid` grants read access to all own historical and active requests.
-2. **Assigned Collector**: `resource.data.assignedTruckId == request.auth.uid` grants read access and operational update access only while assigned.
-3. **Municipal Administrator**: `request.auth.token.admin == true` grants universal visibility, manual fleet allocation, and dispute arbitration.
-4. **Public / Unauthenticated**: Zero read access; `HTTP 403 PERMISSION_DENIED` strictly enforced.
-5. **Deletion**: Deletions are forbidden across all roles (`allow delete: if false`). Requests form an immutable audit log.
+To avoid promising functionality that depends on unbuilt infrastructure, the exact scope of tracking in Module 2 is established:
 
-### 5.2 Composite Query Indexes
-To support live real-time filtering, offline ordering, and dispatch pagination without full-table scans, the following composite indexes in `firestore.indexes.json` are mandated:
+```mermaid
+graph LR
+    subgraph Module_2_Scope ["MODULE 2: RESIDENT CORE (IN SCOPE)"]
+        M2_1[Live Firestore Snapshot Listener on User Requests]
+        M2_2[Status Stepper: Pending -> Assigned -> En Route -> Arrived -> Done]
+        M2_3[Cancel Button: Active strictly during PENDING_DISPATCH]
+        M2_4[Historical Feed: Chronological paginated request list]
+        M2_5[Driver Contact Card: Displays collector phone via WhatsApp intent if En Route]
+    end
 
-```json
-[
-  {
-    "collectionGroup": "waste_requests",
-    "queryScope": "COLLECTION",
-    "fields": [
-      { "fieldPath": "clientUid", "order": "ASCENDING" },
-      { "fieldPath": "createdAt", "order": "DESCENDING" }
-    ]
-  },
-  {
-    "collectionGroup": "waste_requests",
-    "queryScope": "COLLECTION",
-    "fields": [
-      { "fieldPath": "clientUid", "order": "ASCENDING" },
-      { "fieldPath": "status", "order": "ASCENDING" },
-      { "fieldPath": "createdAt", "order": "DESCENDING" }
-    ]
-  },
-  {
-    "collectionGroup": "waste_requests",
-    "queryScope": "COLLECTION",
-    "fields": [
-      { "fieldPath": "assignedTruckId", "order": "ASCENDING" },
-      { "fieldPath": "status", "order": "ASCENDING" }
-    ]
-  }
-]
+    subgraph Future_Modules_Scope ["FUTURE MODULE DEPENDENCIES (DEFERRED)"]
+        M3[Module 3: Collector Node - Telemetry Publisher] -->|Broadcasts truck GPS every 5s| M5
+        M5[Module 5: Operations & Fleet Engine] -->|Publishes /truckTelemetry/{id}| F_Map[Moving Truck Marker on Map]
+        M5 -->|Calculates OSRM driving distance| F_ETA[Real dynamic ETA countdown]
+        M8[Module 8: FCM Notifications] -->|Triggers when truck < 50m| F_Push[Geofence Proximity Push Alert]
+    end
+
+    M2_2 -.->|Awaits Telemetry Stream| F_Map
+    M2_2 -.->|Awaits Distance Matrix| F_ETA
 ```
 
----
-
-## 6. Location & Mapping Architecture
-
-### 6.1 Provider Evaluation & Zero-Cost Financial Analysis
-In accordance with system directives, no paid map tiles, paid geocoding APIs, or Google Maps Platform billing accounts may be introduced.
-
-| Component | Selected Technology | Licensing / Cost | Billing Requirement | Performance & Reliability |
-| :--- | :--- | :---: | :---: | :--- |
-| **Vector Map Engine** | **MapLibre Compose** (`org.maplibre.compose:0.13.0`) | Open Source (BSD 2-Clause) | **ZERO** (No credit card or billing) | Hardware-accelerated Metal/Vulkan vector rendering with custom styling. |
-| **Map Tile Provider** | **OpenFreeMap** (`https://tiles.openfreemap.org/styles/bright`) | Free Public CDN | **ZERO** (No API key, no rate limits for app usage) | Fast vector tile caching, full road network for Dar es Salaam, Dodoma, Arusha. |
-| **GPS Acquisition** | **Google Play Services Location** (`FusedLocationProviderClient`) | Free Google Play Service | **ZERO** | Battery-efficient GPS + Wi-Fi cell tower triangulation (`PRIORITY_HIGH_ACCURACY`). |
-| **Reverse Geocoding**| **Android Native Geocoder** (`android.location.Geocoder`) | Built-in Android OS | **ZERO** | On-device / OS system geocoding service; zero HTTP API quotas. |
-
-### 6.2 GPS Lifecycle, Denial Recovery & Debounced Pin-Drop
-1. **Permission Sequence**:
-   - The application checks `ACCESS_FINE_LOCATION` and `ACCESS_COARSE_LOCATION`.
-   - If granted: FusedLocationProvider requests high accuracy location and animates the map camera to current coordinates with a 15.0 zoom level.
-   - If denied: An in-app educational rationale card explains why location is required for waste truck dispatch. If permanently denied by OS, the user is offered a 1-tap intent to open Android App Settings.
-2. **Manual Pin Drop & Fallback**:
-   - Even without GPS permission, the resident can pan and tap anywhere on the MapLibre canvas to drop a manual pickup pin.
-   - Default fallback coordinates center on Dar es Salaam city center (`lat: -6.7924, lng: 39.2083`).
-3. **Debounced Reverse Geocoding**:
-   - When the user drags or taps the map pin, the new coordinates trigger reverse-geocoding via `android.location.Geocoder` with a **500ms debounce**.
-   - If the geocoder returns an empty list or network error, the UI gracefully falls back to displaying formatted coordinate strings (`"Coordinates: -6.7924, 39.2083"`) while allowing the resident to enter a manual street/landmark description in the text field.
+- **In Scope for Module 2**:
+  - Live status synchronization via Firestore document listener.
+  - Status progression stepper card on `ResidentHomeScreen` and `ResidentTrackingScreen`.
+  - Conditional cancellation action.
+  - Full request history feed with status filtering chips.
+  - Driver WhatsApp contact intent using assigned driver phone number once dispatched.
+- **Formally Deferred to Future Modules**:
+  - **Moving Truck Marker**: Awaits Module 3 (Collector Location Publisher) & Module 5 (Fleet Telemetry).
+  - **Dynamic ETA Countdown**: Awaits Module 5 (OSRM Waypoint Matrix API).
+  - **Proximity Push Notifications**: Awaits Module 8 (FCM Notification Engine).
+  - **Proof of Collection Capture**: Awaits Module 3 (Collector Camera & Image Pipeline).
 
 ---
 
-## 7. Offline Resilience, Caching & Concurrency
+## 9. Category, Hazmat & Pricing Policy
 
-### 7.1 Offline Queue Architecture (Room + WorkManager)
-To accommodate intermittent mobile data coverage in East Africa:
-1. When a resident submits a request with no active network connectivity (`NetworkConnectivityObserver.isOnline == false`), the request is saved locally to Room table `cached_waste_requests` with status `PENDING_OFFLINE`.
-2. A WorkManager `OneTimeWorkRequest` (`OfflineSyncWorker`) is enqueued with the constraint:
-   `Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()`.
-3. The UI immediately transitions to `NewRequestSubmittedScreen`, displaying an informative offline badge: `"Request saved offline. Will automatically dispatch when connectivity returns."`
-4. When connectivity resumes, `OfflineSyncWorker` executes a transactional write to Firestore, updates the local record status to `SYNCED`, and triggers an in-app banner confirming remote dispatch.
+### 9.1 Remote Category Configuration Schema (`/config/waste_categories/{id}`)
+Categories are remotely driven via Firestore documents:
+```json
+{
+  "id": "hazardous",
+  "displayNameEn": "Hazardous & Medical",
+  "displayNameSw": "Taka Hatari na za Dawa",
+  "isHazardous": true,
+  "requiresSpecialHandling": true,
+  "baseEstimateTzs": 15000,
+  "warningAdvisoryEn": "Hazardous waste requires specialized licensed disposal. Medical sharps and chemical waste must be double-bagged.",
+  "warningAdvisorySw": "Taka hatari zinahitaji wataalamu maalum. Sindano na kemikali lazima zifungwe vizuri.",
+  "isActive": true,
+  "version": 1
+}
+```
 
-### 7.2 Duplicate Submission Protection
-1. **Idempotency Key**: Every draft generates a unique UUID `clientGeneratedId`. Multiple rapid taps on "Submit Request" reuse the same ID, preventing duplicate document creation in Firestore.
-2. **Coincidence / Cooldown Check**: Before writing a new request, the client queries active requests for the user:
-   `clientUid == uid AND status IN ['PENDING_DISPATCH', 'ASSIGNED_TO_FLEET', 'EN_ROUTE']`.
-   If an active request already exists at coordinates within 100 meters, the UI presents an advisory modal: `"You already have a pending pickup nearby (#REQ-XXXX). Do you want to submit another?"`
+### 9.2 Hazmat Handling Safeguards
+When a resident selects `HAZARDOUS` or `ELECTRONIC`:
+1. The wizard presents an explicit educational warning banner highlighting municipal safety regulations.
+2. The request is tagged with `requiresSpecialHandling: true` in Firestore.
+3. Ordinary tricycle and light compactor collectors cannot accept hazardous loads; dispatch is restricted to certified hazardous waste disposal units.
 
 ---
 
-## 8. Technical Risks & Migration Strategy from Legacy Code
+## 10. Unresolved Product Decisions (Submitted for Leadership Review)
 
-### 8.1 Evaluated Legacy Code Assets (`origin/legacy/original-app`)
+The following product decisions remain open for final confirmation by the Product Owner and Lead Technical Director:
 
-| Legacy Asset | Assessment | Migration Action |
-| :--- | :--- | :--- |
-| `NewRequestCategoryScreen.kt` | Working Compose UI, uses hardcoded colors and material theme. | Migrate to `:feature:resident`, update to use `:core:design-system` dark theme tokens and strings. |
-| `NewRequestVolumeScreen.kt` | Working volume selector with illustrated icons. | Migrate to `:feature:resident`, adapt to canonical `VolumeTier` domain model. |
-| `NewRequestLocationScreen.kt` | Working MapLibre integration with OpenFreeMap and Geocoder fallback. | Extract map rendering to reusable component, integrate debounced geocoding and manual address input. |
-| `NewRequestConfirmScreen.kt` | Working summary card with edit links. | Migrate to `:feature:resident`, integrate template saving and duplicate check. |
-| `NewRequestSubmittedScreen.kt` | Working confirmation view with reference number. | Migrate to `:feature:resident`, wire back-navigation to resident home. |
-| `ResidentHomeScreen.kt` | Monolithic screen combining map, active cards, and bottom sheet. | Decompose into clean composables (`ResidentDashboard`, `ActiveRequestCard`, `RecentActivityFeed`). |
-| `WasteRequestRepositoryImpl.kt` | Direct Firestore calls, shadow-ban check, storage upload. | Refactor into clean interface in `:core:data` with Result monad and explicit error mappers. |
-| `Room Database & Worker` | `WasteRequestEntity`, `WasteRequestDao`, `OfflineSyncWorker`. | Refactor to `:core:data` adhering to pure domain model mapping. |
-
-### 8.2 Identified Technical Risks & Mitigation Plan
-
-| Risk | Severity | Root Cause | Technical Mitigation |
-| :--- | :---: | :--- | :--- |
-| **1. Memory Leak from MapLibre Recomposition** | MEDIUM | MapLibre camera state and GeoJson sources can trigger memory leaks if recreated on every Compose recomposition. | Memoize `rememberCameraState` and `rememberGeoJsonSource` outside recomposition scopes. Cleanly dispose map resources in `DisposableEffect`. |
-| **2. Geocoder Blocking UI Thread** | MEDIUM | Legacy code called `Geocoder.getFromLocation()` synchronously inside coroutines without proper dispatcher isolation. | Wrap all Geocoder invocations in `withContext(Dispatchers.IO)` with explicit 3-second timeout and string fallback. |
-| **3. Concurrent Cancellation Collision** | HIGH | Resident taps "Cancel" at the exact moment a driver accepts the pickup in the field. | Enforce atomic Firestore transaction: cancellation fails with a friendly message if status changed from `PENDING_DISPATCH`. |
-| **4. Base64 vs Storage Quota Spike** | LOW | Storing large photos as Base64 in Firestore documents risks hitting the 1MB document size limit. | Enforce strict image compression to WebP `< 50KB` and max dimensions `800x600` before Base64 encoding. |
+1. **Hazardous Waste Tariff Policy**:
+   *Current Design*: Hazardous waste displays an estimated tariff advisory (`15,000 TZS base`), but final pricing is set by municipal dispatch.  
+   *Decision Required*: Should the app require upfront municipal dispatcher quotation before dispatching hazardous loads, or allow immediate submission?
+2. **Cancellation Fee Window**:
+   *Current Design*: Free cancellation while `PENDING_DISPATCH`. Cancellation completely disabled once `ASSIGNED_TO_FLEET`.  
+   *Decision Required*: Is a grace period (e.g. 2 minutes post-assignment) required, or is instant locking upon driver allocation the desired municipal policy?
+3. **Multi-Photo Gate References**:
+   *Current Design*: Single gate photo (WebP < 50KB) compressed and stored directly.  
+   *Decision Required*: Is a single landmark photo sufficient for Phase 1, or should multi-photo gallery storage via Cloud Storage be brought forward?
