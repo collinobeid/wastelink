@@ -1,7 +1,7 @@
 # WASTELINK — MODULE 2 PHASE 1A FINAL ACCEPTANCE REPORT
 ## Strict VP8L Bitstream Header Parsing (RFC 9649), Advisory Alpha Hint Semantics, Flexible Metadata Ordering, and Architecture Boundaries
 
-**Document Version:** 1.4.0<br>
+**Document Version:** 1.5.0<br>
 **Date:** November 5, 2026<br>
 **Status:** PHASE 1A COMPLETE & FULLY TESTED — READY FOR INDEPENDENT REVIEW<br>
 **Branch:** `rebuild/modular-workspace`<br>
@@ -23,12 +23,13 @@ This report establishes the final pure Kotlin domain remediation and verificatio
    - Verified the 1-byte magic signature (`0x2F`) at payload byte 0.
    - Decoded byte 4 of the VP8L header: bits 5..7 contain the 3-bit bitstream `version_number`. Enforced that this field **MUST be 0** per RFC 9649 Section 3.2. Any non-zero version is rejected.
    - Enforced chunk payload boundaries to ensure truncated VP8L headers ($< 5$ bytes) are safely caught and rejected.
-2. **Correct Interpretation of VP8L `alpha_is_used` Advisory Hint**:
+2. **Correct Interpretation of VP8L `alpha_is_used` Advisory Hint & Alpha Boundaries**:
    - Per RFC 9649 Section 3.2, `alpha_is_used` (bit 4 of byte 4) is an **advisory decoder hint only** ("it SHOULD NOT impact decoding"). It does not constitute an authoritative claim of actual image transparency.
-   - Parsing the VP8L header in pure Kotlin does not decode raster pixels and therefore cannot prove whether transparent pixels actually exist.
-   - Structurally valid VP8L images are **not rejected** solely due to discrepancy between the advisory `alpha_is_used` bit and the VP8X header Alpha feature flag.
-   - Lossless `'VP8L'` carries transparency information natively within its bitstream and never requires or permits an auxiliary `'ALPH'` chunk.
-   - Preserved strict VP8X Alpha flag validation for lossy `'VP8 '` images: declaring the Alpha flag requires an immediate preceding `'ALPH'` chunk, and including an `'ALPH'` chunk requires the Alpha flag.
+   - The VP8X Alpha feature flag represents actual transparency in the image canvas, whereas VP8L `alpha_is_used` is merely an advisory decoder hint.
+   - Because the Phase 1A pure Kotlin validator does not decode raster pixels, it cannot prove whether the VP8X Alpha flag accurately represents the image's actual transparency; this is a decoding-layer validation responsibility that cannot be established from the VP8L bitstream header alone.
+   - Structurally valid VP8L images are therefore **not rejected** solely due to discrepancy between the advisory `alpha_is_used` hint and the VP8X header Alpha feature flag.
+   - **VP8L and ALPH Relationship:** RFC 9649 Section 2.7.2 specifies that a VP8L frame SHOULD NOT contain an ALPH chunk (since lossless VP8L natively encodes transparency). WasteLink deliberately enforces a stricter application-specific profile by explicitly rejecting the pairing of an ALPH chunk with VP8L for resident gate photos.
+   - Preserved strict VP8X Alpha flag validation for lossy `'VP8 '` images: declaring the Alpha flag requires an immediately preceding `'ALPH'` chunk, and including an `'ALPH'` chunk requires the Alpha flag.
 3. **Corrected Metadata Specification Policy & Supported-Format Documentation**:
    - Aligned with RFC 9649 Section 2.7 by accepting metadata chunks `'EXIF'` and `'XMP '` in either order following the image bitstream (`EXIF` $\rightarrow$ `XMP ` or `XMP ` $\rightarrow$ `EXIF`), while maintaining strict duplicate rejection.
    - Explicitly documented application-specific format restrictions:
@@ -78,7 +79,7 @@ The 5-byte header begins immediately at the start of the VP8L chunk payload:
 | **Canvas Dimensions** | $\text{width} \times \text{height} \le 2^{32} - 1$. | `Gate reference photo contains invalid VP8X canvas dimensions (width * height exceeds 2^32 - 1).` |
 | **Animation Prohibition** | Animation flag (bit 1 of flags byte) or `'ANIM'`/`'ANMF'` chunks rejected. | `Gate reference photo must be a static image (animated WebP is not supported).` |
 | **Image Bitstream Cardinality** | Exactly one `'VP8 '` or `'VP8L'` image chunk. Multiple or duplicate streams rejected. | `Gate reference photo contains duplicate or multiple image chunks...` |
-| **ALPH Association** | `'ALPH'` is only valid with lossy `'VP8 '`. Pairing with `'VP8L'` is rejected. | `Gate reference photo contains invalid ALPH chunk paired with lossless VP8L...` |
+| **ALPH Association** | RFC 9649 states a VP8L frame SHOULD NOT contain an ALPH chunk. Under WasteLink's supported static-photo profile, pairing an `'ALPH'` chunk with lossless `'VP8L'` is deliberately rejected. | `Gate reference photo contains invalid ALPH chunk paired with lossless VP8L...` |
 | **ALPH Immediate Succession** | `'ALPH'` MUST immediately precede `'VP8 '`. Any intervening chunk is rejected. | `Gate reference photo contains ALPH chunk not immediately followed by lossy VP8 image chunk...` |
 | **VP8L Alpha Handling** | `alpha_is_used` is an advisory decoder hint per RFC 9649 Section 3.2. Structural validation does not reject VP8L based on hint divergence from VP8X flag. | N/A (Accepted per RFC 9649 advisory hint semantics) |
 | **VP8L Version Check** | Bits 5..7 of VP8L header byte 4 MUST be 0 per RFC 9649. | `Gate reference photo contains corrupted VP8L stream... (invalid version bits: <v>; must be 0).` |
@@ -90,7 +91,8 @@ The 5-byte header begins immediately at the start of the VP8L chunk payload:
 
 > [!IMPORTANT]
 > - **Domain Layer Boundary:** Pure Kotlin validation in `:core:domain` performs strict structural container checks: RIFF envelope, chunk boundaries, zero-padding, VP8 keyframe codes, VP8L signatures, and RFC 9649 version numbers.
-> - **Transparency Verification:** In lossless VP8L, the bitstream carries transparency data natively, and the header bit is merely an advisory decoder hint. Actual pixel transparency verification cannot be established by header parsing and requires full pixel raster decoding (delegated to platform image decoders).
+> - **VP8X Alpha vs. VP8L Advisory Hint:** The VP8X Alpha flag represents actual transparency within the canvas, whereas VP8L `alpha_is_used` is merely an advisory decoder hint (RFC 9649 Section 3.2). The Phase 1A pure Kotlin validator does not decode raster pixels and therefore cannot prove whether the VP8X Alpha flag accurately represents the image's actual transparency. Establishing whether pixels have alpha $< 255$ is a decoding-layer validation responsibility that cannot be determined from the VP8L header alone.
+> - **VP8L and ALPH Policy Distinction:** RFC 9649 Section 2.7.2 states that a VP8L frame SHOULD NOT contain an ALPH chunk. WasteLink deliberately enforces this as a hard rejection in its supported static-photo validation profile to guarantee a strictly bounded, tamper-evident container format.
 > - **Authenticity & Security:** Proof of image provenance, device integrity, and tamper-resistance belongs to Play Integrity API and Cloud Storage security rules.
 
 ---
