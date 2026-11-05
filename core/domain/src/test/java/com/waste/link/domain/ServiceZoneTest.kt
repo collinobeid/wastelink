@@ -119,6 +119,53 @@ class ServiceZoneTest {
     }
 
     @Test
+    fun polygonZone_pointOnVertex_isConsideredInside() {
+        // Boundary-inclusive policy: Vertex 0 is exactly (-6.70, 39.20)
+        val vertexPoint = polygonVertices[0]
+        assertTrue(activePolygonZone.contains(vertexPoint))
+        assertTrue(activePolygonZone.containsGeographically(vertexPoint))
+
+        // Vertex 1: (-6.70, 39.30)
+        assertTrue(activePolygonZone.contains(polygonVertices[1]))
+        // Vertex 2: (-6.80, 39.20)
+        assertTrue(activePolygonZone.contains(polygonVertices[2]))
+    }
+
+    @Test
+    fun polygonZone_pointOnEdge_isConsideredInside() {
+        // Boundary-inclusive policy: Edge between (-6.70, 39.20) and (-6.70, 39.30)
+        // Midpoint on top horizontal edge: (-6.70, 39.25)
+        val edgePointTop = GeoCoordinates(latitude = -6.70, longitude = 39.25)
+        assertTrue(activePolygonZone.contains(edgePointTop))
+        assertTrue(activePolygonZone.containsGeographically(edgePointTop))
+
+        // Midpoint on left vertical edge: (-6.75, 39.20)
+        val edgePointLeft = GeoCoordinates(latitude = -6.75, longitude = 39.20)
+        assertTrue(activePolygonZone.contains(edgePointLeft))
+        assertTrue(activePolygonZone.containsGeographically(edgePointLeft))
+    }
+
+    @Test
+    fun polygonZone_vertexOutsideBoundingBox_throwsIllegalArgumentException() {
+        // Vertex with latitude -6.65 falls outside declared maxLat -6.70
+        assertThrows(IllegalArgumentException::class.java) {
+            ServiceZone(
+                zoneId = "zone_vertex_outside",
+                name = "Vertex Outside BBox",
+                minLat = -6.80,
+                maxLat = -6.70,
+                minLng = 39.20,
+                maxLng = 39.30,
+                polygonVertices = listOf(
+                    GeoCoordinates(latitude = -6.65, longitude = 39.20), // Outside maxLat!
+                    GeoCoordinates(latitude = -6.70, longitude = 39.30),
+                    GeoCoordinates(latitude = -6.80, longitude = 39.20)
+                )
+            )
+        }
+    }
+
+    @Test
     fun polygonVertices_lessThanThree_throwsIllegalArgumentException() {
         assertThrows(IllegalArgumentException::class.java) {
             ServiceZone(

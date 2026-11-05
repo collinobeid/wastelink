@@ -115,6 +115,143 @@ class RequestValidatorTest {
         return Base64.getEncoder().encodeToString(arr)
     }
 
+    private fun createHeaderOnlyVp8x(): String {
+        // RIFF (12) + VP8X chunk (18) = 30 bytes
+        val totalBytes = 30
+        val arr = ByteArray(totalBytes)
+        // RIFF
+        arr[0] = 'R'.code.toByte()
+        arr[1] = 'I'.code.toByte()
+        arr[2] = 'F'.code.toByte()
+        arr[3] = 'F'.code.toByte()
+        val riffSize = totalBytes - 8
+        arr[4] = (riffSize and 0xFF).toByte()
+        arr[5] = ((riffSize shr 8) and 0xFF).toByte()
+        arr[6] = ((riffSize shr 16) and 0xFF).toByte()
+        arr[7] = ((riffSize shr 24) and 0xFF).toByte()
+        // WEBP
+        arr[8] = 'W'.code.toByte()
+        arr[9] = 'E'.code.toByte()
+        arr[10] = 'B'.code.toByte()
+        arr[11] = 'P'.code.toByte()
+        // VP8X
+        arr[12] = 'V'.code.toByte()
+        arr[13] = 'P'.code.toByte()
+        arr[14] = '8'.code.toByte()
+        arr[15] = 'X'.code.toByte()
+        arr[16] = 10.toByte()
+        return Base64.getEncoder().encodeToString(arr)
+    }
+
+    private fun createVp8xMissingImageData(): String {
+        // RIFF (12) + VP8X (18) + ICCP (16) = 46 bytes
+        val totalBytes = 46
+        val arr = ByteArray(totalBytes)
+        // RIFF
+        arr[0] = 'R'.code.toByte()
+        arr[1] = 'I'.code.toByte()
+        arr[2] = 'F'.code.toByte()
+        arr[3] = 'F'.code.toByte()
+        val riffSize = totalBytes - 8
+        arr[4] = (riffSize and 0xFF).toByte()
+        arr[5] = ((riffSize shr 8) and 0xFF).toByte()
+        arr[6] = ((riffSize shr 16) and 0xFF).toByte()
+        arr[7] = ((riffSize shr 24) and 0xFF).toByte()
+        // WEBP
+        arr[8] = 'W'.code.toByte()
+        arr[9] = 'E'.code.toByte()
+        arr[10] = 'B'.code.toByte()
+        arr[11] = 'P'.code.toByte()
+        // VP8X
+        arr[12] = 'V'.code.toByte()
+        arr[13] = 'P'.code.toByte()
+        arr[14] = '8'.code.toByte()
+        arr[15] = 'X'.code.toByte()
+        arr[16] = 10.toByte()
+        // ICCP chunk at offset 30
+        arr[30] = 'I'.code.toByte()
+        arr[31] = 'C'.code.toByte()
+        arr[32] = 'C'.code.toByte()
+        arr[33] = 'P'.code.toByte()
+        arr[34] = 8.toByte()
+        return Base64.getEncoder().encodeToString(arr)
+    }
+
+    private fun createVp8xTruncatedSubsequentChunk(): String {
+        // RIFF (12) + VP8X (18) + truncated VP8 chunk header (4 bytes) = 34 bytes
+        val totalBytes = 34
+        val arr = ByteArray(totalBytes)
+        // RIFF
+        arr[0] = 'R'.code.toByte()
+        arr[1] = 'I'.code.toByte()
+        arr[2] = 'F'.code.toByte()
+        arr[3] = 'F'.code.toByte()
+        val riffSize = totalBytes - 8
+        arr[4] = (riffSize and 0xFF).toByte()
+        arr[5] = ((riffSize shr 8) and 0xFF).toByte()
+        arr[6] = ((riffSize shr 16) and 0xFF).toByte()
+        arr[7] = ((riffSize shr 24) and 0xFF).toByte()
+        // WEBP
+        arr[8] = 'W'.code.toByte()
+        arr[9] = 'E'.code.toByte()
+        arr[10] = 'B'.code.toByte()
+        arr[11] = 'P'.code.toByte()
+        // VP8X
+        arr[12] = 'V'.code.toByte()
+        arr[13] = 'P'.code.toByte()
+        arr[14] = '8'.code.toByte()
+        arr[15] = 'X'.code.toByte()
+        arr[16] = 10.toByte()
+        // Truncated subsequent chunk at offset 30
+        arr[30] = 'V'.code.toByte()
+        arr[31] = 'P'.code.toByte()
+        arr[32] = '8'.code.toByte()
+        arr[33] = ' '.code.toByte()
+        return Base64.getEncoder().encodeToString(arr)
+    }
+
+    private fun createValidVp8xWithImageData(): String {
+        // RIFF (12) + VP8X (18) + VP8 (56: 8 header + 48 payload) = 86 bytes
+        val totalBytes = 86
+        val arr = ByteArray(totalBytes)
+        // RIFF
+        arr[0] = 'R'.code.toByte()
+        arr[1] = 'I'.code.toByte()
+        arr[2] = 'F'.code.toByte()
+        arr[3] = 'F'.code.toByte()
+        val riffSize = totalBytes - 8
+        arr[4] = (riffSize and 0xFF).toByte()
+        arr[5] = ((riffSize shr 8) and 0xFF).toByte()
+        arr[6] = ((riffSize shr 16) and 0xFF).toByte()
+        arr[7] = ((riffSize shr 24) and 0xFF).toByte()
+        // WEBP
+        arr[8] = 'W'.code.toByte()
+        arr[9] = 'E'.code.toByte()
+        arr[10] = 'B'.code.toByte()
+        arr[11] = 'P'.code.toByte()
+        // VP8X
+        arr[12] = 'V'.code.toByte()
+        arr[13] = 'P'.code.toByte()
+        arr[14] = '8'.code.toByte()
+        arr[15] = 'X'.code.toByte()
+        arr[16] = 10.toByte()
+        // VP8 chunk at offset 30
+        arr[30] = 'V'.code.toByte()
+        arr[31] = 'P'.code.toByte()
+        arr[32] = '8'.code.toByte()
+        arr[33] = ' '.code.toByte()
+        arr[34] = 48.toByte()
+        // VP8 frame tag at offset 38
+        arr[38] = 0xD0.toByte()
+        arr[39] = 0x01.toByte()
+        arr[40] = 0x00.toByte()
+        // VP8 keyframe start code 0x9D, 0x01, 0x2A at offset 41..43
+        arr[41] = 0x9D.toByte()
+        arr[42] = 0x01.toByte()
+        arr[43] = 0x2A.toByte()
+        return Base64.getEncoder().encodeToString(arr)
+    }
+
     // Step 1: Category Tests
     @Test
     fun step1CategoryValidation() {
@@ -244,6 +381,13 @@ class RequestValidatorTest {
         assertTrue(errors.isEmpty())
     }
 
+    @Test
+    fun gatePhoto_validVp8xWithImageData_succeeds() {
+        val validVp8x = createValidVp8xWithImageData()
+        val errors = RequestValidator.validateGatePhoto(validVp8x)
+        assertTrue(errors.isEmpty())
+    }
+
     // Gate Photo Validation: Strict 50 KB Boundary Tests
     @Test
     fun gatePhoto_strict50KbBoundary_immediatelyBelowLimit_succeeds() {
@@ -308,6 +452,62 @@ class RequestValidatorTest {
         assertTrue(errors[0].contains("truncated"))
     }
 
+    // WebP VP8X Extended Container Tests
+    @Test
+    fun gatePhoto_headerOnlyVp8x_returnsError() {
+        val headerOnly = createHeaderOnlyVp8x()
+        val errors = RequestValidator.validateGatePhoto(headerOnly)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("header-only VP8X without image data"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xMissingImageData_returnsError() {
+        val missingData = createVp8xMissingImageData()
+        val errors = RequestValidator.validateGatePhoto(missingData)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("missing image data"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xTruncatedSubsequentChunk_returnsError() {
+        val truncatedSub = createVp8xTruncatedSubsequentChunk()
+        val errors = RequestValidator.validateGatePhoto(truncatedSub)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("truncated subsequent chunk"))
+    }
+
+    // RIFF Declared Length Discrepancy Tests
+    @Test
+    fun gatePhoto_riffDeclaredLengthSmallerThanPayload_returnsError() {
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LossyWebpBase64)
+        // Deliberately set declared RIFF size to 30 (expects 38 bytes, but payload is 68 bytes)
+        rawBytes[4] = 30.toByte()
+        rawBytes[5] = 0.toByte()
+        rawBytes[6] = 0.toByte()
+        rawBytes[7] = 0.toByte()
+        val b64 = Base64.getEncoder().encodeToString(rawBytes)
+
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("extraneous data"))
+    }
+
+    @Test
+    fun gatePhoto_riffDeclaredLengthLargerThanPayload_returnsError() {
+        val rawBytes = Base64.getDecoder().decode(genuine1x1LossyWebpBase64)
+        // Deliberately set declared RIFF size to 200 (expects 208 bytes, but payload is 68 bytes)
+        rawBytes[4] = 200.toByte()
+        rawBytes[5] = 0.toByte()
+        rawBytes[6] = 0.toByte()
+        rawBytes[7] = 0.toByte()
+        val b64 = Base64.getEncoder().encodeToString(rawBytes)
+
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("truncated"))
+    }
+
     @Test
     fun gatePhoto_invalidOrUnsupportedFormats_returnsError() {
         // Fake JPEG (magic header FF D8 FF E0)
@@ -338,6 +538,7 @@ class RequestValidatorTest {
         fakeWave[1] = 'I'.code.toByte()
         fakeWave[2] = 'F'.code.toByte()
         fakeWave[3] = 'F'.code.toByte()
+        fakeWave[4] = 92.toByte() // declared RIFF size = 100 - 8 = 92
         fakeWave[8] = 'W'.code.toByte()
         fakeWave[9] = 'A'.code.toByte()
         fakeWave[10] = 'V'.code.toByte()
