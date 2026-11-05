@@ -13,15 +13,18 @@ package com.waste.link.domain.model
  * - [minLat], [maxLat], [minLng], [maxLng] define an axis-aligned bounding box (AABB).
  *   This rectangular bounding box serves as an intentional initial approximation and high-efficiency
  *   O(1) spatial pre-filter.
- * - When [polygonVertices] is empty, containment evaluates strictly against this bounding box approximation.
- *   This MUST NOT be claimed as exact municipal ward/polygon boundary validation in reports or documentation.
+ * - When [polygonVertices] is empty, containment evaluates strictly against this bounding-box approximation.
+ *   Bounding-box-only mode is an approximation and must not be claimed as exact municipal ward or GIS boundary validation.
  * - When [polygonVertices] is supplied (at least 3 WGS 84 vertices forming a sequential boundary):
  *     1. Invariant: Every polygon vertex must fall within or on the bounding-box limits ([minLat..maxLat] and [minLng..maxLng]).
  *     2. Boundary-Inclusive Policy: Containment is strictly boundary-inclusive. Points lying directly on a polygon
  *        vertex or along a polygon boundary edge are considered INSIDE for service-zone eligibility.
- *     3. Interior Containment: Points within the polygon interior are verified using the pure Kotlin Ray-Casting
- *        algorithm (Jordan curve theorem, even-odd rule).
- *   This provides exact municipal boundary verification without external GIS, Android SDK, or Firebase dependencies.
+ *     3. Planar Point-in-Polygon Testing: Points within the polygon interior are verified using the pure Kotlin
+ *        Ray-Casting algorithm (Jordan curve theorem, even-odd rule).
+ *   Important Architectural Clarification:
+ *   - Polygon mode performs planar, boundary-inclusive point-in-polygon testing on the supplied coordinates.
+ *   - Accuracy depends directly on the quality, resolution, and validity of the supplied polygon.
+ *   - This pure Kotlin domain verification is not a substitute for authoritative municipal GIS validation.
  */
 data class ServiceZone(
     val zoneId: String,
@@ -56,7 +59,7 @@ data class ServiceZone(
 
     /**
      * Checks if coordinates fall within this active service zone.
-     * Evaluates active state, then bounding-box pre-filter, then exact boundary-inclusive polygon if configured.
+     * Evaluates active state, then bounding-box pre-filter, then boundary-inclusive polygon if configured.
      * Returns false if the zone is deactivated.
      */
     fun contains(coordinates: GeoCoordinates): Boolean {

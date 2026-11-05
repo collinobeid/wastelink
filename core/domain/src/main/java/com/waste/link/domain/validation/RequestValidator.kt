@@ -215,6 +215,11 @@ object RequestValidator {
         val firstChunkSize = readLittleEndian32(bytes, 16)
         val firstPad = if (firstChunkSize % 2L != 0L) 1 else 0
 
+        // Strict VP8X payload size requirement: MUST be exactly 10 bytes
+        if (firstFourCC == "VP8X" && firstChunkSize != 10L) {
+            return "Gate reference photo contains invalid VP8X header (chunk size $firstChunkSize; must be exactly 10 bytes)."
+        }
+
         // Check first chunk bounds including padding
         if (20L + firstChunkSize + firstPad > bytes.size) {
             return "Gate reference photo is truncated (chunk '$firstFourCC' declared $firstChunkSize bytes exceeding payload)."
@@ -268,16 +273,59 @@ object RequestValidator {
                 }
             }
             "VP8X" -> {
-                if (firstChunkSize < 10L) {
-                    return "Gate reference photo contains corrupted VP8X header (chunk size $firstChunkSize < 10)."
+                // VP8X payload size MUST be exactly 10 bytes per WebP container specification
+                if (firstChunkSize != 10L) {
+                    return "Gate reference photo contains invalid VP8X header (chunk size $firstChunkSize; must be exactly 10 bytes)."
                 }
-                val nextChunkOffset = (20L + firstChunkSize + firstPad).toInt()
-                if (nextChunkOffset >= bytes.size) {
+
+                // Header-only check: Container must contain chunks beyond the 30-byte VP8X container header
+                if (bytes.size <= 30) {
                     return "Gate reference photo contains header-only VP8X without image data."
                 }
 
-                var subOffset = nextChunkOffset
-                var foundImageChunk = false
+                // 1. Validate Feature Flags and Reserved Bits in Byte 20
+                val flagsByte = bytes[20].toInt() and 0xFF
+                // Bits 7, 6, and 0 are reserved and MUST be 0 (mask: 0x80 or 0x40 or 0x01 = 0xC1)
+                if ((flagsByte and 0xC1) != 0) {
+                    return "Gate reference photo contains invalid VP8X header (reserved bits in flags byte must be 0)."
+                }
+
+                // Bit 1: Animation flag (0x02) - Static photo requirement strictly rejects animation
+                if ((flagsByte and 0x02) != 0) {
+                    return "Gate reference photo must be a static image (animated WebP is not supported)."
+                }
+
+                val flagIcc = (flagsByte and 0x20) != 0
+                val flagAlpha = (flagsByte and 0x10) != 0
+                val flagExif = (flagsByte and 0x08) != 0
+                val flagXmp = (flagsByte and 0x04) != 0
+
+                // 2. Validate 24-bit Reserved Field in Bytes 21..23 (MUST be 0)
+                if (bytes[21] != 0.toByte() || bytes[22] != 0.toByte() || bytes[23] != 0.toByte()) {
+                    return "Gate reference photo contains invalid VP8X header (reserved 24-bit field must be 0)."
+                }
+
+                // 3. Validate Canvas Dimensions in Bytes 24..29 (little-endian 24-bit unsigned)
+                val canvasWidthMinusOne = (bytes[24].toInt() and 0xFF) or
+                    ((bytes[25].toInt() and 0xFF) shl 8) or
+                    ((bytes[26].toInt() and 0xFF) shl 16)
+                val canvasHeightMinusOne = (bytes[27].toInt() and 0xFF) or
+                    ((bytes[28].toInt() and 0xFF) shl 8) or
+                    ((bytes[29].toInt() and 0xFF) shl 16)
+                val canvasWidth = canvasWidthMinusOne + 1L
+                val canvasHeight = canvasHeightMinusOne + 1L
+
+                if (canvasWidth * canvasHeight > 0xFFFFFFFFL) {
+                    return "Gate reference photo contains invalid VP8X canvas dimensions (width * height exceeds 2^32 - 1)."
+                }
+
+                // 4. Sequential State-Based Traversal of Subsequent Chunks
+                var subOffset = 30
+                var hasIccp = false
+                var hasAlph = false
+                var imageChunk: String? = null
+                var hasExif = false
+                var hasXmp = false
 
                 while (subOffset < bytes.size) {
                     // Complete 8-byte chunk header check
@@ -293,7 +341,7 @@ object RequestValidator {
                         return "Gate reference photo contains truncated subsequent chunk '$subFourCC' (declared $subChunkSize bytes exceeding payload)."
                     }
 
-                    // Odd-sized subsequent chunk zero-padding byte check
+                    // Odd-sized chunk zero-padding byte check
                     if (subChunkSize % 2L != 0L) {
                         val padOffset = (subPayloadOffset + subChunkSize).toInt()
                         if (padOffset >= bytes.size) {
@@ -305,8 +353,37 @@ object RequestValidator {
                         }
                     }
 
+                    // Strict immediate adjacency: If ALPH was encountered, the immediately following chunk MUST be lossy VP8
+                    if (hasAlph && imageChunk == null && subFourCC != "VP8 ") {
+                        return "Gate reference photo contains ALPH chunk not immediately followed by lossy VP8 image chunk (got '$subFourCC' at offset $subOffset)."
+                    }
+
                     when (subFourCC) {
+                        "ICCP" -> {
+                            if (hasIccp) {
+                                return "Gate reference photo contains duplicate ICCP chunk at offset $subOffset."
+                            }
+                            if (hasAlph || imageChunk != null || hasExif || hasXmp) {
+                                return "Gate reference photo contains misplaced ICCP chunk at offset $subOffset (ICCP must precede image data)."
+                            }
+                            hasIccp = true
+                        }
+                        "ALPH" -> {
+                            if (hasAlph) {
+                                return "Gate reference photo contains duplicate ALPH chunk at offset $subOffset."
+                            }
+                            if (imageChunk != null || hasExif || hasXmp) {
+                                return "Gate reference photo contains misplaced ALPH chunk at offset $subOffset (ALPH must precede image data)."
+                            }
+                            hasAlph = true
+                        }
                         "VP8 " -> {
+                            if (imageChunk != null) {
+                                return "Gate reference photo contains duplicate or multiple image chunks ('VP8 ' at offset $subOffset; image bitstream already set to '$imageChunk')."
+                            }
+                            if (hasExif || hasXmp) {
+                                return "Gate reference photo contains misplaced VP8 chunk at offset $subOffset (image data must precede metadata)."
+                            }
                             if (subChunkSize < 10L) {
                                 return "Gate reference photo contains corrupted subsequent VP8 header (chunk size $subChunkSize < 10)."
                             }
@@ -316,9 +393,18 @@ object RequestValidator {
                             if (!hasKeyframeCode) {
                                 return "Gate reference photo contains corrupted VP8 stream in extended container (missing keyframe start code)."
                             }
-                            foundImageChunk = true
+                            imageChunk = "VP8 "
                         }
                         "VP8L" -> {
+                            if (imageChunk != null) {
+                                return "Gate reference photo contains duplicate or multiple image chunks ('VP8L' at offset $subOffset; image bitstream already set to '$imageChunk')."
+                            }
+                            if (hasAlph) {
+                                return "Gate reference photo contains invalid ALPH chunk paired with lossless VP8L at offset $subOffset (ALPH is only valid with lossy VP8)."
+                            }
+                            if (hasExif || hasXmp) {
+                                return "Gate reference photo contains misplaced VP8L chunk at offset $subOffset (image data must precede metadata)."
+                            }
                             if (subChunkSize < 5L) {
                                 return "Gate reference photo contains corrupted subsequent VP8L header (chunk size $subChunkSize < 5)."
                             }
@@ -326,10 +412,31 @@ object RequestValidator {
                             if (!hasLosslessSignature) {
                                 return "Gate reference photo contains corrupted VP8L stream in extended container (missing 0x2F signature)."
                             }
-                            foundImageChunk = true
+                            imageChunk = "VP8L"
                         }
-                        "ICCP", "ALPH", "EXIF", "XMP " -> {
-                            // Valid auxiliary chunks
+                        "EXIF" -> {
+                            if (imageChunk == null) {
+                                return "Gate reference photo contains misplaced EXIF chunk at offset $subOffset (metadata must follow image data)."
+                            }
+                            if (hasExif) {
+                                return "Gate reference photo contains duplicate EXIF chunk at offset $subOffset."
+                            }
+                            if (hasXmp) {
+                                return "Gate reference photo contains misplaced EXIF chunk at offset $subOffset (EXIF must precede XMP)."
+                            }
+                            hasExif = true
+                        }
+                        "XMP " -> {
+                            if (imageChunk == null) {
+                                return "Gate reference photo contains misplaced XMP chunk at offset $subOffset (metadata must follow image data)."
+                            }
+                            if (hasXmp) {
+                                return "Gate reference photo contains duplicate XMP chunk at offset $subOffset."
+                            }
+                            hasXmp = true
+                        }
+                        "ANIM", "ANMF" -> {
+                            return "Gate reference photo must be a static image (animated WebP chunk '$subFourCC' is not supported)."
                         }
                         else -> {
                             return "Gate reference photo contains unrecognized subsequent chunk '$subFourCC' in VP8X container."
@@ -339,9 +446,51 @@ object RequestValidator {
                     subOffset = (subPayloadOffset + subChunkSize + subPad).toInt()
                 }
 
-                if (!foundImageChunk) {
-                    "Gate reference photo contains VP8X container with missing image data (no VP8 or VP8L chunk found)."
-                } else null
+                // 5. Container Completion and Post-Parse Validations
+                if (imageChunk == null) {
+                    return "Gate reference photo contains VP8X container missing image data (no VP8 or VP8L chunk found)."
+                }
+
+                if (hasAlph && imageChunk != "VP8 ") {
+                    return "Gate reference photo contains ALPH chunk without required lossy VP8 image chunk."
+                }
+
+                // 6. Enforce VP8X Feature Flags Agreement with Actual Chunks
+                if (flagIcc != hasIccp) {
+                    return if (flagIcc) {
+                        "Gate reference photo VP8X header declared ICC profile flag but no ICCP chunk was present."
+                    } else {
+                        "Gate reference photo contains ICCP chunk but VP8X header did not set ICC profile flag."
+                    }
+                }
+
+                if (imageChunk == "VP8 ") {
+                    if (flagAlpha != hasAlph) {
+                        return if (flagAlpha) {
+                            "Gate reference photo VP8X header declared alpha flag but no ALPH chunk was present with lossy VP8."
+                        } else {
+                            "Gate reference photo contains ALPH chunk but VP8X header did not set alpha flag."
+                        }
+                    }
+                }
+
+                if (flagExif != hasExif) {
+                    return if (flagExif) {
+                        "Gate reference photo VP8X header declared EXIF flag but no EXIF chunk was present."
+                    } else {
+                        "Gate reference photo contains EXIF chunk but VP8X header did not set EXIF flag."
+                    }
+                }
+
+                if (flagXmp != hasXmp) {
+                    return if (flagXmp) {
+                        "Gate reference photo VP8X header declared XMP flag but no XMP chunk was present."
+                    } else {
+                        "Gate reference photo contains XMP chunk but VP8X header did not set XMP flag."
+                    }
+                }
+
+                null
             }
             else -> {
                 "Gate reference photo must be in compressed WebP format (unsupported chunk: '$firstFourCC')."

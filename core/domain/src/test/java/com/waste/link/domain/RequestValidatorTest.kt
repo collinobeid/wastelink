@@ -168,6 +168,8 @@ class RequestValidatorTest {
         arr[14] = '8'.code.toByte()
         arr[15] = 'X'.code.toByte()
         arr[16] = 10.toByte()
+        // Feature flag for ICC Profile in byte 20: 0x20
+        arr[20] = 0x20.toByte()
         // ICCP chunk at offset 30
         arr[30] = 'I'.code.toByte()
         arr[31] = 'C'.code.toByte()
@@ -285,6 +287,94 @@ class RequestValidatorTest {
         arr[41] = 0x9D.toByte()
         arr[42] = 0x01.toByte()
         arr[43] = 0x2A.toByte()
+        return Base64.getEncoder().encodeToString(arr)
+    }
+
+    private fun validVp8Payload(): ByteArray {
+        val payload = ByteArray(48)
+        payload[0] = 0xD0.toByte()
+        payload[1] = 0x01.toByte()
+        payload[2] = 0x00.toByte()
+        payload[3] = 0x9D.toByte()
+        payload[4] = 0x01.toByte()
+        payload[5] = 0x2A.toByte()
+        return payload
+    }
+
+    private fun validVp8lPayload(): ByteArray {
+        val payload = ByteArray(10)
+        payload[0] = 0x2F.toByte()
+        return payload
+    }
+
+    private fun createVp8xContainer(
+        flags: Byte = 0,
+        chunks: List<Pair<String, ByteArray>> = emptyList(),
+        vp8xPayloadSize: Int = 10,
+        reserved24: ByteArray = ByteArray(3)
+    ): String {
+        val vp8xHeaderAndPayload = 8 + vp8xPayloadSize
+        var total = 12 + vp8xHeaderAndPayload
+        for ((_, payload) in chunks) {
+            val pad = if (payload.size % 2 != 0) 1 else 0
+            total += 8 + payload.size + pad
+        }
+        // If total bytes is odd, add 1 byte padding to container to ensure even RIFF size
+        val outerPad = if (total % 2 != 0) 1 else 0
+        total += outerPad
+
+        val arr = ByteArray(total)
+        // RIFF header
+        arr[0] = 'R'.code.toByte()
+        arr[1] = 'I'.code.toByte()
+        arr[2] = 'F'.code.toByte()
+        arr[3] = 'F'.code.toByte()
+        val riffSize = total - 8
+        arr[4] = (riffSize and 0xFF).toByte()
+        arr[5] = ((riffSize shr 8) and 0xFF).toByte()
+        arr[6] = ((riffSize shr 16) and 0xFF).toByte()
+        arr[7] = ((riffSize shr 24) and 0xFF).toByte()
+        // WEBP
+        arr[8] = 'W'.code.toByte()
+        arr[9] = 'E'.code.toByte()
+        arr[10] = 'B'.code.toByte()
+        arr[11] = 'P'.code.toByte()
+        // VP8X FourCC
+        arr[12] = 'V'.code.toByte()
+        arr[13] = 'P'.code.toByte()
+        arr[14] = '8'.code.toByte()
+        arr[15] = 'X'.code.toByte()
+        arr[16] = (vp8xPayloadSize and 0xFF).toByte()
+        arr[17] = ((vp8xPayloadSize shr 8) and 0xFF).toByte()
+        arr[18] = ((vp8xPayloadSize shr 16) and 0xFF).toByte()
+        arr[19] = ((vp8xPayloadSize shr 24) and 0xFF).toByte()
+
+        // VP8X payload
+        if (vp8xPayloadSize >= 1) arr[20] = flags
+        if (vp8xPayloadSize >= 4) {
+            arr[21] = reserved24[0]
+            arr[22] = reserved24[1]
+            arr[23] = reserved24[2]
+        }
+
+        var offset = 12 + vp8xHeaderAndPayload
+        for ((fourCC, payload) in chunks) {
+            arr[offset] = fourCC[0].code.toByte()
+            arr[offset + 1] = fourCC[1].code.toByte()
+            arr[offset + 2] = fourCC[2].code.toByte()
+            arr[offset + 3] = fourCC[3].code.toByte()
+            val cSize = payload.size
+            arr[offset + 4] = (cSize and 0xFF).toByte()
+            arr[offset + 5] = ((cSize shr 8) and 0xFF).toByte()
+            arr[offset + 6] = ((cSize shr 16) and 0xFF).toByte()
+            arr[offset + 7] = ((cSize shr 24) and 0xFF).toByte()
+            System.arraycopy(payload, 0, arr, offset + 8, payload.size)
+            val pad = if (payload.size % 2 != 0) 1 else 0
+            if (pad == 1 && offset + 8 + payload.size < arr.size) {
+                arr[offset + 8 + payload.size] = 0.toByte()
+            }
+            offset += 8 + payload.size + pad
+        }
         return Base64.getEncoder().encodeToString(arr)
     }
 
@@ -519,6 +609,302 @@ class RequestValidatorTest {
         val errors = RequestValidator.validateGatePhoto(truncatedPayload)
         assertEquals(1, errors.size)
         assertTrue(errors[0].contains("truncated subsequent chunk 'VP8 '"))
+    }
+
+    // VP8X Header Payload Size & Reserved Field Invariant Tests
+    @Test
+    fun gatePhoto_vp8xHeaderShorterThan10Bytes_returnsError() {
+        val b64 = createVp8xContainer(flags = 0, chunks = listOf("VP8 " to validVp8Payload()), vp8xPayloadSize = 9)
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("must be exactly 10 bytes"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xHeaderLargerThan10Bytes_returnsError() {
+        val b64 = createVp8xContainer(flags = 0, chunks = listOf("VP8 " to validVp8Payload()), vp8xPayloadSize = 12)
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("must be exactly 10 bytes"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xReservedBitsInFlagsByte_returnsError() {
+        // Bit 7 set (0x80)
+        val b64Bit7 = createVp8xContainer(flags = 0x80.toByte(), chunks = listOf("VP8 " to validVp8Payload()))
+        val err1 = RequestValidator.validateGatePhoto(b64Bit7)
+        assertEquals(1, err1.size)
+        assertTrue(err1[0].contains("reserved bits in flags byte must be 0"))
+
+        // Bit 0 set (0x01)
+        val b64Bit0 = createVp8xContainer(flags = 0x01.toByte(), chunks = listOf("VP8 " to validVp8Payload()))
+        val err2 = RequestValidator.validateGatePhoto(b64Bit0)
+        assertEquals(1, err2.size)
+        assertTrue(err2[0].contains("reserved bits in flags byte must be 0"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xReserved24BitFieldNonZero_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0,
+            chunks = listOf("VP8 " to validVp8Payload()),
+            reserved24 = byteArrayOf(1, 0, 0)
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("reserved 24-bit field must be 0"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xAnimationFlagRejected_returnsError() {
+        val b64 = createVp8xContainer(flags = 0x02.toByte(), chunks = listOf("VP8 " to validVp8Payload()))
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("animated WebP is not supported"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xAnimatedChunks_returnsError() {
+        val b64Anim = createVp8xContainer(flags = 0, chunks = listOf("ANIM" to ByteArray(6), "VP8 " to validVp8Payload()))
+        val err1 = RequestValidator.validateGatePhoto(b64Anim)
+        assertEquals(1, err1.size)
+        assertTrue(err1[0].contains("animated WebP chunk 'ANIM' is not supported"))
+
+        val b64Anmf = createVp8xContainer(flags = 0, chunks = listOf("ANMF" to ByteArray(6), "VP8 " to validVp8Payload()))
+        val err2 = RequestValidator.validateGatePhoto(b64Anmf)
+        assertEquals(1, err2.size)
+        assertTrue(err2[0].contains("animated WebP chunk 'ANMF' is not supported"))
+    }
+
+    // Extended Container: Single Image Stream & Duplicate Chunk Tests
+    @Test
+    fun gatePhoto_vp8xDuplicateImageChunks_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0,
+            chunks = listOf("VP8 " to validVp8Payload(), "VP8 " to validVp8Payload())
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("duplicate or multiple image chunks"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xMultipleImageStreams_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0,
+            chunks = listOf("VP8 " to validVp8Payload(), "VP8L" to validVp8lPayload())
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("duplicate or multiple image chunks"))
+    }
+
+    // Extended Container: ALPH Combinations & Permitted Ordering Tests
+    @Test
+    fun gatePhoto_vp8xAlphPairedWithLosslessVp8l_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x10.toByte(),
+            chunks = listOf("ALPH" to ByteArray(6), "VP8L" to validVp8lPayload())
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("not immediately followed by lossy VP8") || errors[0].contains("invalid ALPH chunk paired with lossless VP8L"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xAlphMisplacedAfterImage_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x10.toByte(),
+            chunks = listOf("VP8 " to validVp8Payload(), "ALPH" to ByteArray(6))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("misplaced ALPH chunk") || errors[0].contains("duplicate ALPH chunk"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xAlphNotFollowedByVp8_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x18.toByte(),
+            chunks = listOf("ALPH" to ByteArray(6), "EXIF" to ByteArray(6))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("not immediately followed by lossy VP8"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xDuplicateAlphChunk_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x10.toByte(),
+            chunks = listOf("ALPH" to ByteArray(6), "VP8 " to validVp8Payload(), "ALPH" to ByteArray(6))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("duplicate ALPH chunk") || errors[0].contains("misplaced ALPH chunk"))
+    }
+
+    // Extended Container: Metadata Ordering & Duplicates Tests
+    @Test
+    fun gatePhoto_vp8xExifBeforeImage_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x08.toByte(),
+            chunks = listOf("EXIF" to ByteArray(6), "VP8 " to validVp8Payload())
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("misplaced EXIF chunk"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xDuplicateExif_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x08.toByte(),
+            chunks = listOf("VP8 " to validVp8Payload(), "EXIF" to ByteArray(6), "EXIF" to ByteArray(6))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("duplicate EXIF chunk"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xDuplicateXmp_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x04.toByte(),
+            chunks = listOf("VP8 " to validVp8Payload(), "XMP " to ByteArray(6), "XMP " to ByteArray(6))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("duplicate XMP chunk"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xExifAfterXmp_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x0C.toByte(),
+            chunks = listOf("VP8 " to validVp8Payload(), "XMP " to ByteArray(6), "EXIF" to ByteArray(6))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("misplaced EXIF chunk"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xIccpAfterImage_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x20.toByte(),
+            chunks = listOf("VP8 " to validVp8Payload(), "ICCP" to ByteArray(8))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("misplaced ICCP chunk"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xDuplicateIccp_returnsError() {
+        val b64 = createVp8xContainer(
+            flags = 0x20.toByte(),
+            chunks = listOf("ICCP" to ByteArray(8), "ICCP" to ByteArray(8), "VP8 " to validVp8Payload())
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("duplicate ICCP chunk"))
+    }
+
+    // Extended Container: Feature Flag / Chunk Agreement Tests
+    @Test
+    fun gatePhoto_vp8xFlagIccWithoutIccpChunk_returnsError() {
+        val b64 = createVp8xContainer(flags = 0x20.toByte(), chunks = listOf("VP8 " to validVp8Payload()))
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("declared ICC profile flag but no ICCP chunk was present"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xIccpChunkWithoutFlagIcc_returnsError() {
+        val b64 = createVp8xContainer(flags = 0x00.toByte(), chunks = listOf("ICCP" to ByteArray(8), "VP8 " to validVp8Payload()))
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("contains ICCP chunk but VP8X header did not set ICC profile flag"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xFlagAlphaWithoutAlphChunk_returnsError() {
+        val b64 = createVp8xContainer(flags = 0x10.toByte(), chunks = listOf("VP8 " to validVp8Payload()))
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("declared alpha flag but no ALPH chunk was present with lossy VP8"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xAlphChunkWithoutFlagAlpha_returnsError() {
+        val b64 = createVp8xContainer(flags = 0x00.toByte(), chunks = listOf("ALPH" to ByteArray(6), "VP8 " to validVp8Payload()))
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("contains ALPH chunk but VP8X header did not set alpha flag"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xFlagExifWithoutExifChunk_returnsError() {
+        val b64 = createVp8xContainer(flags = 0x08.toByte(), chunks = listOf("VP8 " to validVp8Payload()))
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("declared EXIF flag but no EXIF chunk was present"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xExifChunkWithoutFlagExif_returnsError() {
+        val b64 = createVp8xContainer(flags = 0x00.toByte(), chunks = listOf("VP8 " to validVp8Payload(), "EXIF" to ByteArray(6)))
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("contains EXIF chunk but VP8X header did not set EXIF flag"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xFlagXmpWithoutXmpChunk_returnsError() {
+        val b64 = createVp8xContainer(flags = 0x04.toByte(), chunks = listOf("VP8 " to validVp8Payload()))
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("declared XMP flag but no XMP chunk was present"))
+    }
+
+    @Test
+    fun gatePhoto_vp8xXmpChunkWithoutFlagXmp_returnsError() {
+        val b64 = createVp8xContainer(flags = 0x00.toByte(), chunks = listOf("VP8 " to validVp8Payload(), "XMP " to ByteArray(6)))
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertEquals(1, errors.size)
+        assertTrue(errors[0].contains("contains XMP chunk but VP8X header did not set XMP flag"))
+    }
+
+    // Valid Extended VP8X Permutations Tests
+    @Test
+    fun gatePhoto_validVp8xWithIccpAndLosslessVp8l_succeeds() {
+        val b64 = createVp8xContainer(
+            flags = 0x20.toByte(),
+            chunks = listOf("ICCP" to ByteArray(8), "VP8L" to validVp8lPayload())
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertTrue(errors.isEmpty())
+    }
+
+    @Test
+    fun gatePhoto_validVp8xWithAlphAndLossyVp8_succeeds() {
+        val b64 = createVp8xContainer(
+            flags = 0x10.toByte(),
+            chunks = listOf("ALPH" to ByteArray(6), "VP8 " to validVp8Payload())
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertTrue(errors.isEmpty())
+    }
+
+    @Test
+    fun gatePhoto_validVp8xWithExifAndXmp_succeeds() {
+        val b64 = createVp8xContainer(
+            flags = 0x0C.toByte(),
+            chunks = listOf("VP8 " to validVp8Payload(), "EXIF" to ByteArray(6), "XMP " to ByteArray(6))
+        )
+        val errors = RequestValidator.validateGatePhoto(b64)
+        assertTrue(errors.isEmpty())
     }
 
     // RIFF Declared Length Discrepancy Tests
