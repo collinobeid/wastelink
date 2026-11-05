@@ -909,9 +909,9 @@ class RequestValidatorTest {
         assertTrue(errors.isEmpty())
     }
 
-    // VP8L Bitstream Header & Alpha Agreement Tests (RFC 9649)
+    // VP8L Bitstream Header & Advisory Alpha Hint Tests (RFC 9649 Section 3.2)
     @Test
-    fun gatePhoto_vp8xVp8lAlphaSetAndFlagAlphaSet_succeeds() {
+    fun gatePhoto_vp8xVp8lAlphaHintSetAndFlagAlphaSet_succeeds() {
         val b64 = createVp8xContainer(
             flags = 0x10.toByte(),
             chunks = listOf("VP8L" to validVp8lPayload(alphaIsUsed = true))
@@ -921,29 +921,29 @@ class RequestValidatorTest {
     }
 
     @Test
-    fun gatePhoto_vp8xVp8lAlphaSetAndFlagAlphaClear_returnsError() {
+    fun gatePhoto_vp8xVp8lAlphaHintSetAndFlagAlphaClear_succeeds() {
+        // RFC 9649: alpha_is_used is an advisory hint only; discrepancy with VP8X header flag does not reject
         val b64 = createVp8xContainer(
             flags = 0x00.toByte(),
             chunks = listOf("VP8L" to validVp8lPayload(alphaIsUsed = true))
         )
         val errors = RequestValidator.validateGatePhoto(b64)
-        assertEquals(1, errors.size)
-        assertTrue(errors[0].contains("VP8L bitstream has alpha_is_used bit set but VP8X header did not set alpha flag"))
+        assertTrue(errors.isEmpty())
     }
 
     @Test
-    fun gatePhoto_vp8xVp8lAlphaClearAndFlagAlphaSet_returnsError() {
+    fun gatePhoto_vp8xVp8lAlphaHintClearAndFlagAlphaSet_succeeds() {
+        // RFC 9649: alpha_is_used is an advisory hint only; discrepancy with VP8X header flag does not reject
         val b64 = createVp8xContainer(
             flags = 0x10.toByte(),
             chunks = listOf("VP8L" to validVp8lPayload(alphaIsUsed = false))
         )
         val errors = RequestValidator.validateGatePhoto(b64)
-        assertEquals(1, errors.size)
-        assertTrue(errors[0].contains("VP8X header declared alpha flag but VP8L bitstream alpha_is_used bit is not set"))
+        assertTrue(errors.isEmpty())
     }
 
     @Test
-    fun gatePhoto_vp8xVp8lAlphaClearAndFlagAlphaClear_succeeds() {
+    fun gatePhoto_vp8xVp8lAlphaHintClearAndFlagAlphaClear_succeeds() {
         val b64 = createVp8xContainer(
             flags = 0x00.toByte(),
             chunks = listOf("VP8L" to validVp8lPayload(alphaIsUsed = false))

@@ -173,10 +173,12 @@ object RequestValidator {
      *       Extraneous trailing bytes or unparsed subsequent chunks are rejected.
      *     - Extended containers ('VP8X') reject header-only payloads and incomplete trailing chunks, traverse all chunks,
      *       and mandate presence of valid image data ('VP8 ' or 'VP8L').
-     * - Lossless VP8L Bitstream Header (RFC 9649):
-     *     - Validates 5-byte header: signature (0x2F), 14-bit width/height dimensions, 1-bit alpha_is_used,
-     *       and 3-bit version (strictly 0).
-     *     - In VP8X containers, requires the VP8X alpha feature flag to agree with the VP8L alpha_is_used bit.
+     * - Lossless VP8L Bitstream Header (RFC 9649 Section 3.2):
+     *     - Validates 5-byte header: signature (0x2F), 14-bit width/height dimensions, and 3-bit version (strictly 0).
+     *     - The 1-bit alpha_is_used field is defined by RFC 9649 as an advisory decoder hint only, not an authoritative declaration.
+     *       Parsing the VP8L header does not prove actual pixel transparency (which requires full raster decoding).
+     *       Therefore, structurally valid VP8L streams are not rejected based on hint discrepancy against the VP8X header.
+     *     - Lossless VP8L natively encodes transparency and does not use or permit an auxiliary 'ALPH' chunk.
      * - Metadata Chunks (RFC 9649):
      *     - Metadata chunks ('EXIF' and 'XMP ') must follow image data and may appear in either order.
      *     - Duplicate metadata chunks are strictly rejected, and VP8X feature flags must agree with present chunks.
@@ -341,7 +343,6 @@ object RequestValidator {
                 var hasIccp = false
                 var hasAlph = false
                 var imageChunk: String? = null
-                var vp8lAlphaIsUsed: Boolean? = null
                 var hasExif = false
                 var hasXmp = false
 
@@ -430,15 +431,14 @@ object RequestValidator {
                             if (!hasLosslessSignature) {
                                 return "Gate reference photo contains corrupted VP8L stream in extended container (missing 0x2F signature)."
                             }
-                            // RFC 9649: Byte 4 of VP8L bitstream header (subPayloadOffset + 4)
-                            // Bit 4: alpha_is_used
+                            // RFC 9649 Section 3.2: Byte 4 of VP8L bitstream header (subPayloadOffset + 4)
+                            // Bit 4: alpha_is_used (advisory hint only; decoders must not fail if inaccurate)
                             // Bits 5..7: version_number (MUST be 0)
                             val byte4 = bytes[subPayloadOffset + 4].toInt() and 0xFF
                             val version = byte4 shr 5
                             if (version != 0) {
                                 return "Gate reference photo contains corrupted VP8L stream in extended container (invalid version bits: $version; must be 0)."
                             }
-                            vp8lAlphaIsUsed = (byte4 and 0x10) != 0
                             imageChunk = "VP8L"
                         }
                         "EXIF" -> {
@@ -494,15 +494,6 @@ object RequestValidator {
                             "Gate reference photo VP8X header declared alpha flag but no ALPH chunk was present with lossy VP8."
                         } else {
                             "Gate reference photo contains ALPH chunk but VP8X header did not set alpha flag."
-                        }
-                    }
-                } else if (imageChunk == "VP8L") {
-                    val alphaUsed = vp8lAlphaIsUsed ?: false
-                    if (flagAlpha != alphaUsed) {
-                        return if (flagAlpha) {
-                            "Gate reference photo VP8X header declared alpha flag but VP8L bitstream alpha_is_used bit is not set."
-                        } else {
-                            "Gate reference photo VP8L bitstream has alpha_is_used bit set but VP8X header did not set alpha flag."
                         }
                     }
                 }
