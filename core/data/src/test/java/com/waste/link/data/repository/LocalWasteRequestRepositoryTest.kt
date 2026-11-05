@@ -206,7 +206,11 @@ class LocalWasteRequestRepositoryTest {
     @Test
     fun p1b07_saveLocalRequest_canBeReconstructedAsSameDomainData() = runBlocking {
         val request = createSampleRequest(id = "req-uuid-001", clientUid = "user_alpha")
-        val saved = repository.saveLocalRequest(request, LocalSyncStatus.QUEUED_OFFLINE)
+        val saved = repository.saveLocalRequest(
+            authenticatedUid = "user_alpha",
+            request = request,
+            syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+        )
 
         assertEquals(request, saved)
 
@@ -222,11 +226,19 @@ class LocalWasteRequestRepositoryTest {
     @Test
     fun p1b08_requestUniqueness_duplicateUserRequestIdHandledDeterministically() = runBlocking {
         val request = createSampleRequest(id = "req-unique-001", clientUid = "user_alpha")
-        repository.saveLocalRequest(request, LocalSyncStatus.QUEUED_OFFLINE)
+        repository.saveLocalRequest(
+            authenticatedUid = "user_alpha",
+            request = request,
+            syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+        )
 
         // Attempting to insert duplicate (id, clientUid) must be rejected deterministically by primary key constraint
         try {
-            repository.saveLocalRequest(request, LocalSyncStatus.QUEUED_OFFLINE)
+            repository.saveLocalRequest(
+                authenticatedUid = "user_alpha",
+                request = request,
+                syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+            )
             fail("Inserting duplicate request record must throw an exception")
         } catch (expected: Exception) {
             // SQLiteConstraintException or Room exception on conflict ABORT
@@ -242,7 +254,11 @@ class LocalWasteRequestRepositoryTest {
     @Test
     fun p1b09_requestIsolation_userACannotRetrieveUserBLocalRequest() = runBlocking {
         val requestB = createSampleRequest(id = "req-b-001", clientUid = "user_bravo")
-        repository.saveLocalRequest(requestB, LocalSyncStatus.QUEUED_OFFLINE)
+        repository.saveLocalRequest(
+            authenticatedUid = "user_bravo",
+            request = requestB,
+            syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+        )
 
         // User Alpha attempts to query User Bravo's request by ID
         val retrievedByA = repository.getLocalRequest("req-b-001", "user_alpha")
@@ -257,7 +273,11 @@ class LocalWasteRequestRepositoryTest {
     @Test
     fun p1b10_updateIsolation_userACannotUpdateUserBLocalRequest() = runBlocking {
         val requestB = createSampleRequest(id = "req-b-002", clientUid = "user_bravo")
-        repository.saveLocalRequest(requestB, LocalSyncStatus.QUEUED_OFFLINE)
+        repository.saveLocalRequest(
+            authenticatedUid = "user_bravo",
+            request = requestB,
+            syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+        )
 
         // User Alpha attempts to update sync status on User Bravo's request
         val updated = repository.updateSyncStatus(
@@ -276,7 +296,11 @@ class LocalWasteRequestRepositoryTest {
     @Test
     fun p1b11_deleteIsolation_userACannotDeleteUserBLocalRequest() = runBlocking {
         val requestB = createSampleRequest(id = "req-b-003", clientUid = "user_bravo")
-        repository.saveLocalRequest(requestB, LocalSyncStatus.QUEUED_OFFLINE)
+        repository.saveLocalRequest(
+            authenticatedUid = "user_bravo",
+            request = requestB,
+            syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+        )
 
         // User Alpha attempts to delete User Bravo's request
         val deleted = repository.deleteLocalRequest("req-b-003", "user_alpha")
@@ -293,9 +317,9 @@ class LocalWasteRequestRepositoryTest {
         val reqA2 = createSampleRequest(id = "req-a-q2", clientUid = "user_alpha")
         val reqB1 = createSampleRequest(id = "req-b-q1", clientUid = "user_bravo")
 
-        repository.saveLocalRequest(reqA1, LocalSyncStatus.QUEUED_OFFLINE)
-        repository.saveLocalRequest(reqA2, LocalSyncStatus.QUEUED_OFFLINE)
-        repository.saveLocalRequest(reqB1, LocalSyncStatus.QUEUED_OFFLINE)
+        repository.saveLocalRequest("user_alpha", reqA1, LocalSyncStatus.QUEUED_OFFLINE)
+        repository.saveLocalRequest("user_alpha", reqA2, LocalSyncStatus.QUEUED_OFFLINE)
+        repository.saveLocalRequest("user_bravo", reqB1, LocalSyncStatus.QUEUED_OFFLINE)
 
         // User Alpha gets queued records
         val queuedA = repository.getQueuedRequests("user_alpha")
@@ -317,7 +341,11 @@ class LocalWasteRequestRepositoryTest {
             clientUid = "user_alpha",
             status = RequestLifecycleStatus.PENDING_DISPATCH
         )
-        repository.saveLocalRequest(request, LocalSyncStatus.QUEUED_OFFLINE)
+        repository.saveLocalRequest(
+            authenticatedUid = "user_alpha",
+            request = request,
+            syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+        )
 
         // Update local sync status to SYNCED
         repository.updateSyncStatus(
@@ -341,7 +369,11 @@ class LocalWasteRequestRepositoryTest {
         val request = createSampleRequest(id = "req-no-fake", clientUid = "user_alpha")
 
         // Local save returns the locally persisted request, NOT CreateWasteRequestOutcome.Success
-        val localSaved = repository.saveLocalRequest(request, LocalSyncStatus.QUEUED_OFFLINE)
+        val localSaved = repository.saveLocalRequest(
+            authenticatedUid = "user_alpha",
+            request = request,
+            syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+        )
         assertNotNull(localSaved)
         // Canonical requestRef remains unallocated until trusted server allocation
         assertNull(localSaved.requestRef)
@@ -360,7 +392,11 @@ class LocalWasteRequestRepositoryTest {
     @Test
     fun p1b15_transactionIntegrity_failedMultiStepWritesDoNotLeavePartialState() = runBlocking {
         val initialReq = createSampleRequest(id = "req-tx-1", clientUid = "user_tx")
-        repository.saveLocalRequest(initialReq, LocalSyncStatus.QUEUED_OFFLINE)
+        repository.saveLocalRequest(
+            authenticatedUid = "user_tx",
+            request = initialReq,
+            syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+        )
 
         try {
             repository.runInTransaction {
@@ -394,6 +430,67 @@ class LocalWasteRequestRepositoryTest {
         )
     }
 
+    // =========================================================================
+    // REMEDIATION TESTS: AUTHENTICATED UID IDENTITY ENFORCEMENT ON SAVE
+    // =========================================================================
+
+    @Test
+    fun saveLocalRequest_withMatchingAuthenticatedUid_succeeds() = runBlocking {
+        val request = createSampleRequest(id = "req-match-1", clientUid = "user_alpha")
+        val saved = repository.saveLocalRequest(
+            authenticatedUid = "user_alpha",
+            request = request,
+            syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+        )
+        assertEquals(request, saved)
+        assertEquals("user_alpha", repository.getLocalRequest("req-match-1", "user_alpha")?.clientUid)
+    }
+
+    @Test
+    fun saveLocalRequest_withMismatchedAuthenticatedUid_throwsAndDoesNotWriteToDb() = runBlocking {
+        val request = createSampleRequest(id = "req-mismatch-1", clientUid = "user_victim")
+
+        // User Attacker attempts to save a request claiming to be User Victim
+        try {
+            repository.saveLocalRequest(
+                authenticatedUid = "user_attacker",
+                request = request,
+                syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+            )
+            fail("Saving request with mismatched authenticated UID must throw IllegalArgumentException")
+        } catch (expected: IllegalArgumentException) {
+            assertTrue(expected.message!!.contains("does not match authenticated user"))
+            assertTrue(expected.message!!.contains("Caller cannot persist a request carrying another user's UID"))
+        }
+
+        // Assert that zero records were created for either UID
+        assertNull("Attacker must not have request persisted", repository.getLocalRequest("req-mismatch-1", "user_attacker"))
+        assertNull("Victim must not have request persisted", repository.getLocalRequest("req-mismatch-1", "user_victim"))
+        assertEquals(0, database.localWasteRequestDao().countRequestsByUser("user_attacker"))
+        assertEquals(0, database.localWasteRequestDao().countRequestsByUser("user_victim"))
+    }
+
+    @Test
+    fun saveLocalRequest_withBlankAuthenticatedUid_throwsAndDoesNotWriteToDb() = runBlocking {
+        val request = createSampleRequest(id = "req-blank-1", clientUid = "user_alpha")
+        val blankCases = listOf("", "   ", "\t", "\n")
+
+        for (blankUid in blankCases) {
+            try {
+                repository.saveLocalRequest(
+                    authenticatedUid = blankUid,
+                    request = request,
+                    syncStatus = LocalSyncStatus.QUEUED_OFFLINE
+                )
+                fail("Blank authenticated UID must throw IllegalArgumentException")
+            } catch (expected: IllegalArgumentException) {
+                assertTrue(expected.message!!.contains("must not be blank"))
+            }
+        }
+
+        assertEquals(0, database.localWasteRequestDao().countRequestsByUser("user_alpha"))
+    }
+
     @Test
     fun p1b17_emptyUid_blankOrMissingUidFailsSafely() = runBlocking {
         val blankUidCases = listOf("", "   ", "\t", "\n")
@@ -415,6 +512,16 @@ class LocalWasteRequestRepositoryTest {
             }
 
             // Local request operations
+            try {
+                repository.saveLocalRequest(
+                    authenticatedUid = blankUid,
+                    request = createSampleRequest("req-fail", "user_alpha")
+                )
+                fail("saveLocalRequest with blank UID must throw IllegalArgumentException")
+            } catch (e: IllegalArgumentException) {
+                assertTrue(e.message!!.contains("must not be blank"))
+            }
+
             try {
                 repository.getLocalRequest("req-1", blankUid)
                 fail("getLocalRequest with blank UID must throw IllegalArgumentException")

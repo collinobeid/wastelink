@@ -13,6 +13,19 @@ import androidx.sqlite.db.SupportSQLiteDatabase
  */
 object WasteLinkMigrations {
 
+    /**
+     * Explicit unmapped service zone sentinel for migrated historical records.
+     * Prevents fabricating a default municipal service zone (e.g. Kinondoni) when no zone
+     * was recorded in legacy schemas.
+     */
+    const val LEGACY_UNMAPPED_ZONE_ID = "legacy_unmapped_zone"
+
+    /**
+     * Diagnostic error explanation for historical records with unmapped service zones.
+     */
+    const val LEGACY_UNMAPPED_SYNC_ERROR =
+        "Legacy historical record has unmapped serviceZoneId; requires zone resolution before synchronization"
+
     val MIGRATION_1_2: Migration = object : Migration(1, 2) {
         override fun migrate(db: SupportSQLiteDatabase) {
             // 1. Create local_waste_requests table
@@ -122,7 +135,7 @@ object WasteLinkMigrations {
                         lat AS latitude,
                         lng AS longitude,
                         geohash,
-                        'zone_kinondoni' AS serviceZoneId,
+                        '$LEGACY_UNMAPPED_ZONE_ID' AS serviceZoneId,
                         pickupAddress,
                         category AS categoryId,
                         volumeTier AS volumeTierId,
@@ -133,7 +146,7 @@ object WasteLinkMigrations {
                         NULL AS pocPhotoUrl,
                         pocPhotoBase64,
                         status,
-                        'QUEUED_OFFLINE' AS syncStatus,
+                        'SYNC_FAILED' AS syncStatus,
                         NULL AS assignedCollectorUid,
                         NULL AS assignedVehicleId,
                         NULL AS priceTzs,
@@ -154,7 +167,7 @@ object WasteLinkMigrations {
                         NULL AS completedAtEpochMs,
                         NULL AS failedAtEpochMs,
                         NULL AS lastSyncAttemptEpochMs,
-                        NULL AS syncErrorMessage,
+                        '$LEGACY_UNMAPPED_SYNC_ERROR' AS syncErrorMessage,
                         0 AS retryCount
                     FROM `offline_requests`
                     """.trimIndent()

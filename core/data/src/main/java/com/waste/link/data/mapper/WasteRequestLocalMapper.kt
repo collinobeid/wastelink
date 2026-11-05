@@ -71,7 +71,10 @@ object WasteRequestLocalMapper {
 
     fun toDomain(record: LocalWasteRequestRecord): WasteRequest {
         val resolvedStatus = RequestLifecycleStatus.fromLegacyStatus(record.status)
-            ?: RequestLifecycleStatus.PENDING_DISPATCH
+            ?: throw IllegalStateException(
+                "Corrupted or unrecognized lifecycle status in persistence record '${record.id}': '${record.status}'. " +
+                    "Silent fallback to PENDING_DISPATCH or any default operational state is strictly prohibited."
+            )
         val resolvedVolumeTier = VolumeTier.fromId(record.volumeTierId)
 
         return WasteRequest(
@@ -112,6 +115,14 @@ object WasteRequestLocalMapper {
             failedAtEpochMs = record.failedAtEpochMs
         )
     }
+
+    /**
+     * Safe domain mapping helper returning null if the record contains an unrecognized
+     * lifecycle status or unrecognized volume tier.
+     */
+    fun toDomainOrNull(record: LocalWasteRequestRecord): WasteRequest? {
+        return runCatching { toDomain(record) }.getOrNull()
+    }
 }
 
 fun WasteRequest.toLocalRecord(
@@ -131,3 +142,6 @@ fun WasteRequest.toLocalRecord(
 
 fun LocalWasteRequestRecord.toDomain(): WasteRequest =
     WasteRequestLocalMapper.toDomain(this)
+
+fun LocalWasteRequestRecord.toDomainOrNull(): WasteRequest? =
+    WasteRequestLocalMapper.toDomainOrNull(this)

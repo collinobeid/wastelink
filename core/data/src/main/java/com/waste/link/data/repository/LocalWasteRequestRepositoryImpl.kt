@@ -60,11 +60,17 @@ class LocalWasteRequestRepositoryImpl @Inject constructor(
     // =========================================================================
 
     override suspend fun saveLocalRequest(
+        authenticatedUid: String,
         request: WasteRequest,
         syncStatus: LocalSyncStatus,
         gatePhotoLocalPath: String?
     ): WasteRequest {
-        validateUid(request.clientUid)
+        validateUid(authenticatedUid)
+        val normalizedAuthUid = authenticatedUid.trim()
+        require(request.clientUid == normalizedAuthUid) {
+            "Request clientUid ('${request.clientUid}') does not match authenticated user ('$authenticatedUid'). " +
+                "Caller cannot persist a request carrying another user's UID."
+        }
         val record = request.toLocalRecord(
             syncStatus = syncStatus,
             gatePhotoLocalPath = gatePhotoLocalPath

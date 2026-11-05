@@ -184,4 +184,132 @@ class WasteRequestLocalMapperTest {
 
         assertEquals(draft, reconstructed)
     }
+
+    // =========================================================================
+    // REMEDIATION TESTS: STRICT STATUS & VOLUME MAPPING (NO SILENT FALLBACK)
+    // =========================================================================
+
+    @Test
+    fun toDomain_withValidCanonicalStatuses_resolvesDirectly() {
+        val baseRequest = createSampleRequest()
+        RequestLifecycleStatus.entries.forEach { status ->
+            val record = baseRequest.copy(status = status).toLocalRecord()
+            val domain = WasteRequestLocalMapper.toDomain(record)
+            assertEquals(status, domain.status)
+        }
+    }
+
+    @Test
+    fun toDomain_withLegacyStatuses_resolvesAccurately() {
+        val baseRequest = createSampleRequest()
+        val legacyMappings = mapOf(
+            "PENDING" to RequestLifecycleStatus.PENDING_DISPATCH,
+            "NEW" to RequestLifecycleStatus.PENDING_DISPATCH,
+            "ASSIGNED" to RequestLifecycleStatus.ASSIGNED_TO_FLEET,
+            "STARTED" to RequestLifecycleStatus.EN_ROUTE,
+            "AT_GATE" to RequestLifecycleStatus.ARRIVED_AT_LOCATION,
+            "PICKED_UP" to RequestLifecycleStatus.COLLECTION_VERIFIED,
+            "HAULING" to RequestLifecycleStatus.IN_TRANSIT_TO_DUMP,
+            "DONE" to RequestLifecycleStatus.COMPLETED,
+            "USER_CANCELLED" to RequestLifecycleStatus.CANCELLED,
+            "FAILED_NO_SHOW" to RequestLifecycleStatus.FAILED,
+            "IN_DISPUTE" to RequestLifecycleStatus.DISPUTED
+        )
+
+        legacyMappings.forEach { (legacyStatus, expectedEnum) ->
+            val record = baseRequest.toLocalRecord().copy(status = legacyStatus)
+            val domain = WasteRequestLocalMapper.toDomain(record)
+            assertEquals(
+                "Legacy status '$legacyStatus' must resolve to '$expectedEnum'",
+                expectedEnum,
+                domain.status
+            )
+        }
+    }
+
+    @Test
+    fun toDomain_withUnknownStatus_throwsIllegalStateExceptionWithoutSilentFallback() {
+        val baseRequest = createSampleRequest()
+        val record = baseRequest.toLocalRecord().copy(status = "NON_EXISTENT_STATUS_XYZ")
+
+        try {
+            WasteRequestLocalMapper.toDomain(record)
+            org.junit.Assert.fail("Unknown status must throw IllegalStateException")
+        } catch (expected: IllegalStateException) {
+            org.junit.Assert.assertTrue(expected.message!!.contains("Corrupted or unrecognized lifecycle status"))
+            org.junit.Assert.assertTrue(
+                expected.message!!.contains(
+                    "Silent fallback to PENDING_DISPATCH or any default operational state is strictly prohibited."
+                )
+            )
+        }
+    }
+
+    @Test
+    fun toDomain_withBlankOrEmptyStatus_throwsIllegalStateException() {
+        val baseRequest = createSampleRequest()
+        val blankCases = listOf("", "   ", "\t", "\n")
+
+        for (blankStatus in blankCases) {
+            val record = baseRequest.toLocalRecord().copy(status = blankStatus)
+            try {
+                WasteRequestLocalMapper.toDomain(record)
+                org.junit.Assert.fail("Blank status '$blankStatus' must throw IllegalStateException")
+            } catch (expected: IllegalStateException) {
+                org.junit.Assert.assertTrue(expected.message!!.contains("Corrupted or unrecognized lifecycle status"))
+            }
+        }
+    }
+
+    @Test
+    fun toDomain_withUnknownVolumeTier_throwsUnknownVolumeTierException() {
+        val baseRequest = createSampleRequest()
+        val record = baseRequest.toLocalRecord().copy(volumeTierId = "super_mega_tank_9000")
+
+        try {
+            WasteRequestLocalMapper.toDomain(record)
+            org.junit.Assert.fail("Unknown volume tier must throw UnknownVolumeTierException")
+        } catch (expected: com.waste.link.domain.model.UnknownVolumeTierException) {
+            org.junit.Assert.assertTrue(expected.message!!.contains("Unknown volume tier"))
+        }
+    }
+
+    @Test
+    fun toDomainOrNull_withInvalidStatusOrVolume_returnsNullSafely() {
+        val baseRequest = createSampleRequest()
+
+        // Valid record -> returns domain object
+        val validRecord = baseRequest.toLocalRecord()
+        assertNotNull(WasteRequestLocalMapper.toDomainOrNull(validRecord))
+        assertNotNull(validRecord.toDomainOrNull())
+
+        // Invalid status -> returns null
+        val invalidStatusRecord = validRecord.copy(status = "CORRUPTED_STATUS")
+        assertNull(WasteRequestLocalMapper.toDomainOrNull(invalidStatusRecord))
+        assertNull(invalidStatusRecord.toDomainOrNull())
+
+        // Invalid volume tier -> returns null
+        val invalidVolumeRecord = validRecord.copy(volumeTierId = "invalid_tier")
+        assertNull(WasteRequestLocalMapper.toDomainOrNull(invalidVolumeRecord))
+        assertNull(invalidVolumeRecord.toDomainOrNull())
+    }
+
+    private fun createSampleRequest(
+        id: String = "sample-req-1",
+        clientUid: String = "resident_1"
+    ): WasteRequest {
+        return WasteRequest(
+            id = id,
+            clientGeneratedId = id,
+            requestRef = null,
+            clientUid = clientUid,
+            coordinates = GeoCoordinates(-6.7924, 39.2083),
+            geohash = "kygck5q",
+            serviceZoneId = "zone_kinondoni",
+            pickupAddress = "Ali Hassan Mwinyi Rd",
+            categoryId = "cat_household",
+            volumeTier = VolumeTier.STANDARD_BIN,
+            status = RequestLifecycleStatus.PENDING_DISPATCH
+        )
+    }
 }

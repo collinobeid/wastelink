@@ -53,9 +53,15 @@ interface LocalWasteRequestRepository {
 
     /**
      * Inserts a validated [WasteRequest] into local persistence with an initial [syncStatus].
+     *
+     * Strict Identity & Ownership Invariant:
+     * [authenticatedUid] must be non-blank and must match [request.clientUid] exactly.
+     * Mismatches are rejected immediately with [IllegalArgumentException] before any write to persistence.
+     *
      * Fails deterministically on duplicate (id, clientUid).
      */
     suspend fun saveLocalRequest(
+        authenticatedUid: String,
         request: WasteRequest,
         syncStatus: LocalSyncStatus = LocalSyncStatus.QUEUED_OFFLINE,
         gatePhotoLocalPath: String? = null

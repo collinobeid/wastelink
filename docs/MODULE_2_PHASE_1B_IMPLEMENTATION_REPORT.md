@@ -129,22 +129,33 @@ Prior to implementation, the codebase was inspected:
 User isolation is enforced at every architectural tier:
 1. **DAO Queries:** Every `SELECT`, `UPDATE`, and `DELETE` query includes `WHERE clientUid = :clientUid`.
 2. **Repository Guard:** Every repository method verifies `require(clientUid.isNotBlank())`. Blank or whitespace-only UIDs throw `IllegalArgumentException` immediately.
-3. **Mismatched UID Prevention:** In `saveDraft(clientUid, draft)`, the repository enforces `require(draft.clientUid == clientUid)`. User A cannot save a draft tagged with User B's UID.
-4. **Account Switching Safety:** When User A logs out and User B logs in, User B queries `clientUid = "user_b"`. User A's draft remains persisted under `clientUid = "user_a"` and is never surfaced to User B.
-5. **No Blind Deletions:** Logging out does NOT wipe or transfer ownership of queued local requests.
+3. **Mismatched UID Prevention (Drafts):** In `saveDraft(clientUid, draft)`, the repository enforces `require(draft.clientUid == clientUid)`. User A cannot save a draft tagged with User B's UID.
+4. **Mismatched UID Prevention (Requests):** In `saveLocalRequest(authenticatedUid, request, ...)`, the repository validates `authenticatedUid.isNotBlank()` and enforces `require(request.clientUid == normalizedAuthUid)`. Caller cannot persist a request carrying another user's UID. Rejected writes create zero database records.
+5. **Account Switching Safety:** When User A logs out and User B logs in, User B queries `clientUid = "user_b"`. User A's draft remains persisted under `clientUid = "user_a"` and is never surfaced to User B.
+6. **No Blind Deletions:** Logging out does NOT wipe or transfer ownership of queued local requests.
 
 ---
 
 ## 7. Migration Strategy & Verification (v1 $\rightarrow$ v2)
 
-- **Legacy Context:** The legacy database in commit `188b2a1` had schema version 1 with table `offline_requests`.
+- **Legacy Context & Schema Constraints:** The legacy database in commit `188b2a1` had schema version 1 with table `offline_requests` and `exportSchema = false`. It did not contain a `serviceZoneId` column.
 - **Migration `MIGRATION_1_2`:**
   - Creates table `local_waste_requests` and its 3 indexes.
   - Creates table `resident_drafts`.
   - Queries `sqlite_master` to verify if table `offline_requests` exists.
-  - If present, executes an `INSERT OR IGNORE` copying all records from `offline_requests` into `local_waste_requests` with `syncStatus = 'QUEUED_OFFLINE'`, `currency = 'TZS'`, and default zone.
+  - If present, executes an `INSERT OR IGNORE` copying all records from `offline_requests` into `local_waste_requests`.
+  - **Zero Fabricated Service Zones:** Never invents a historical service-zone association (e.g. Kinondoni). Unmapped historical records are explicitly assigned `WasteLinkMigrations.LEGACY_UNMAPPED_ZONE_ID = "legacy_unmapped_zone"`.
+  - **Quarantine from Remote Sync:** Migrated historical records are set to `syncStatus = 'SYNC_FAILED'` with diagnostic `syncErrorMessage = WasteLinkMigrations.LEGACY_UNMAPPED_SYNC_ERROR`. Unmapped legacy requests cannot be treated as valid requests ready for remote synchronization (`getQueuedRequests` returns 0 records for those users).
   - Preserves legacy records without destructive fallback.
-- **Verification:** Verified by `WasteLinkMigrationTest.p1b16_migration_v1_to_v2_existingDataSurvivesWithoutLoss` in Robolectric with actual SQLite engine.
+- **Verification:** Verified by `WasteLinkMigrationTest.p1b16_migration_v1_to_v2_existingDataSurvivesWithoutLoss` in Robolectric with actual SQLite engine, confirming that records are not assigned to Kinondoni and cannot be retrieved as queued requests.
+
+---
+
+## 7.1 Strict Persistence Mapping (No Silent Fallbacks)
+
+- **Elimination of Silent Lifecycle-Status Fallback:** In `WasteRequestLocalMapper.toDomain()`, silent fallback to `PENDING_DISPATCH` or any default operational state has been removed. Any unrecognized, blank, or malformed status string in persistence throws an explicit `IllegalStateException` (`"Corrupted or unrecognized lifecycle status in persistence record '${record.id}': '${record.status}'. Silent fallback to PENDING_DISPATCH or any default operational state is strictly prohibited."`).
+- **Safe Nullable Helper:** `WasteRequestLocalMapper.toDomainOrNull()` and `LocalWasteRequestRecord.toDomainOrNull()` provide safe non-throwing lookups returning `null` when records contain corrupted lifecycle statuses or volume tiers.
+- **Strict Volume Tier Enforcement:** `VolumeTier.fromId(record.volumeTierId)` throws `UnknownVolumeTierException` on unrecognized volume tiers.
 
 ---
 
@@ -180,14 +191,14 @@ User isolation is enforced at every architectural tier:
 ./gradlew :core:data:testDebugUnitTest
 ```
 - **Outcome:** `BUILD SUCCESSFUL`
-- **Tests Executed:** 35
-- **Passed:** 35
+- **Tests Executed:** 44
+- **Passed:** 44
 - **Failed:** 0
 - **Skipped:** 0
 - **Test Suites:**
-  - `LocalWasteRequestRepositoryTest`: 16 tests passed
+  - `LocalWasteRequestRepositoryTest`: 19 tests passed
   - `WasteLinkMigrationTest`: 2 tests passed
-  - `WasteRequestLocalMapperTest`: 4 tests passed
+  - `WasteRequestLocalMapperTest`: 10 tests passed
   - `UserDomainAndMapperTest`: 13 tests passed
 
 ### 2. `:core:domain` Unit Tests (Phase 1A Regression Guard)
@@ -206,8 +217,8 @@ User isolation is enforced at every architectural tier:
 ```
 - **Outcome:** `BUILD SUCCESSFUL`
 - **Total Test Suites:** 20
-- **Total Tests Executed:** 297
-- **Passed:** 297
+- **Total Tests Executed:** 306
+- **Passed:** 306
 - **Failed:** 0
 - **Skipped:** 0
 
@@ -239,7 +250,7 @@ git diff --check
 ## 11. Explicit Boundary Affirmations
 
 - Phase 1A remains 100% accepted, closed, and intact.
-- Phase 1B is 100% implemented, tested, and verified.
+- Phase 1B is 100% implemented, remediated, tested, and verified.
 - Phase 1C has **NOT** been started.
 - No Room entities, DAOs, or migrations beyond Phase 1B have been introduced.
 - No Firestore direct reads, writes, DTOs, security rules, Cloud Functions, or UI screens have been created for Module 2.
