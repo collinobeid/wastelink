@@ -1,11 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { Card, CardHeader, CardContent } from '../../components/ui/Card';
 import { Table, Column } from '../../components/ui/Table';
 import { Badge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
 import { Modal } from '../../components/ui/Modal';
 import { Input } from '../../components/ui/Input';
-import { fetchUsers } from '../../services/dataService';
+import { AlertBanner } from '../../components/feedback/AlertBanner';
+import { fetchUsers, parseFirestoreError } from '../../services/dataService';
 import { UserProfile, UserRole, AccountStatus } from '../../domain/types';
 import { Search, Eye, RefreshCw, UserCheck } from 'lucide-react';
 
@@ -15,27 +16,25 @@ export const UsersView: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedUser, setSelectedUser] = useState<UserProfile | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [queryError, setQueryError] = useState<string | null>(null);
 
-  const loadUsers = async () => {
+  const loadUsers = useCallback(async () => {
     setIsLoading(true);
-    const data = await fetchUsers(roleFilter === 'ALL' ? undefined : roleFilter);
-    setUsers(data);
-    setIsLoading(false);
-  };
+    setQueryError(null);
+    try {
+      const data = await fetchUsers(roleFilter === 'ALL' ? undefined : roleFilter);
+      setUsers(data);
+    } catch (err: unknown) {
+      const parsed = parseFirestoreError(err, 'Failed to fetch user profiles.');
+      setQueryError(parsed.message);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [roleFilter]);
 
   useEffect(() => {
-    let mounted = true;
-    setIsLoading(true);
-    fetchUsers(roleFilter === 'ALL' ? undefined : roleFilter).then((data) => {
-      if (mounted) {
-        setUsers(data);
-        setIsLoading(false);
-      }
-    });
-    return () => {
-      mounted = false;
-    };
-  }, [roleFilter]);
+    loadUsers();
+  }, [loadUsers]);
 
   const filteredUsers = users.filter((u) => {
     if (!searchQuery) return true;
@@ -151,6 +150,10 @@ export const UsersView: React.FC = () => {
           Refresh
         </Button>
       </div>
+
+      {queryError && (
+        <AlertBanner type="error" message={queryError} onClose={() => setQueryError(null)} />
+      )}
 
       <Card variant="default">
         <CardHeader className="flex-col sm:flex-row gap-4 items-start sm:items-center justify-between">

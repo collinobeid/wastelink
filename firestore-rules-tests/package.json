@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Automated Firebase Emulator Security Rules test suite for WasteLink Module 1",
   "scripts": {
-    "test": "node --test --test-concurrency=1 auth_rules.test.mjs auth_repository_integration.test.mjs",
+    "test": "node --test --test-concurrency=1 auth_rules.test.mjs auth_repository_integration.test.mjs admin_vetting_integration.test.mjs",
     "test:rules": "node --test auth_rules.test.mjs",
     "test:auth": "node --test auth_repository_integration.test.mjs",
     "test:emulator": "firebase emulators:exec --only auth,firestore --project demo-wastelink \"npm test\""

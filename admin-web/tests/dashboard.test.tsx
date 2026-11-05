@@ -15,7 +15,7 @@ describe('DashboardView Component', () => {
         activeFleetInTransit: 0,
         completedCollections: 89,
         openDisputes: 1,
-        systemHealth: '100% Operational',
+        systemHealth: 'Authoritative Connected (Operational)',
       },
       isLive: true,
     });
@@ -46,7 +46,7 @@ describe('DashboardView Component', () => {
       expect(screen.getByText('Operations Dashboard')).toBeInTheDocument();
     });
 
-    expect(screen.getByText('Authoritative Firestore Live')).toBeInTheDocument();
+    expect(screen.getByText('Authoritative Connected (Operational)')).toBeInTheDocument();
     expect(screen.getByText('142')).toBeInTheDocument(); // total residents
     expect(screen.getByText('18')).toBeInTheDocument();  // active collectors
     expect(screen.getByText('7')).toBeInTheDocument();   // pending requests

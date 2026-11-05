@@ -6,7 +6,7 @@ import { Button } from '../../components/ui/Button';
 import { Modal } from '../../components/ui/Modal';
 import { Input } from '../../components/ui/Input';
 import { AlertBanner } from '../../components/feedback/AlertBanner';
-import { fetchDisputes } from '../../services/dataService';
+import { fetchDisputes, parseFirestoreError } from '../../services/dataService';
 import { Dispute } from '../../domain/types';
 import { AlertCircle, Scale, CheckCircle2, XCircle, RefreshCw } from 'lucide-react';
 
@@ -17,14 +17,22 @@ export const DisputesView: React.FC = () => {
   const [resolutionNote, setResolutionNote] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [queryError, setQueryError] = useState<string | null>(null);
   const [successBanner, setSuccessBanner] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
   const loadDisputes = async () => {
     setIsLoading(true);
-    const data = await fetchDisputes();
-    setDisputes(data);
-    setIsLoading(false);
+    setQueryError(null);
+    try {
+      const data = await fetchDisputes();
+      setDisputes(data);
+    } catch (err: unknown) {
+      const parsed = parseFirestoreError(err, 'Failed to fetch dispute records.');
+      setQueryError(parsed.message);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -125,6 +133,10 @@ export const DisputesView: React.FC = () => {
           Refresh Queue
         </Button>
       </div>
+
+      {queryError && (
+        <AlertBanner type="error" message={queryError} onClose={() => setQueryError(null)} />
+      )}
 
       {successBanner && (
         <AlertBanner type="success" message={successBanner} onClose={() => setSuccessBanner(null)} />

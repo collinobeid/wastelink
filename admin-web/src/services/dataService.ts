@@ -3,6 +3,7 @@ import {
   query,
   where,
   getDocs,
+  getDoc,
   limit,
   orderBy,
   doc,
@@ -19,6 +20,49 @@ import {
   Dispute,
   AdminActionLog,
 } from '../domain/types';
+
+export type DataServiceErrorKind = 'PERMISSION_DENIED' | 'NETWORK_ERROR' | 'NOT_FOUND' | 'UNKNOWN';
+
+export class DataServiceError extends Error {
+  public readonly kind: DataServiceErrorKind;
+  public readonly originalError?: unknown;
+
+  constructor(message: string, kind: DataServiceErrorKind, originalError?: unknown) {
+    super(message);
+    this.name = 'DataServiceError';
+    this.kind = kind;
+    this.originalError = originalError;
+  }
+}
+
+export function parseFirestoreError(err: unknown, fallbackMessage: string): DataServiceError {
+  if (err instanceof DataServiceError) {
+    return err;
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  const code = (err as { code?: string })?.code || '';
+
+  if (
+    code.includes('permission-denied') ||
+    msg.toLowerCase().includes('permission') ||
+    msg.toLowerCase().includes('insufficient permissions')
+  ) {
+    return new DataServiceError('Access denied: Insufficient Firestore permissions.', 'PERMISSION_DENIED', err);
+  }
+  if (
+    code.includes('unavailable') ||
+    code.includes('deadline-exceeded') ||
+    msg.toLowerCase().includes('network') ||
+    msg.toLowerCase().includes('offline') ||
+    msg.toLowerCase().includes('failed to get document because the client is offline')
+  ) {
+    return new DataServiceError('Network connection failed or Firestore is unavailable.', 'NETWORK_ERROR', err);
+  }
+  if (code.includes('not-found') || msg.toLowerCase().includes('not found')) {
+    return new DataServiceError('Requested resource was not found.', 'NOT_FOUND', err);
+  }
+  return new DataServiceError(msg || fallbackMessage, 'UNKNOWN', err);
+}
 
 /**
  * Standard seed categories used for initialization or when remote rules are pending.
@@ -85,7 +129,7 @@ export const SEED_PRICING = [
 
 /**
  * Fetches dashboard counts across real Firestore collections.
- * Handles fallback gracefully if the database is freshly initialized and empty.
+ * Fails distinctly if permissions or connectivity fail.
  */
 export async function fetchDashboardMetrics(): Promise<{
   metrics: DashboardMetrics;
@@ -112,34 +156,33 @@ export async function fetchDashboardMetrics(): Promise<{
         getDocs(query(disputesRef, where('status', 'in', ['OPEN', 'INVESTIGATING']))),
       ]);
 
+    const totalResidents = residentsSnap.size;
+    const activeCollectors = collectorsSnap.size;
+    const pendingCollectorVetting = vettingSnap.size;
+    const pendingRequests = requestsPendingSnap.size;
+    const openDisputes = disputesSnap.size;
+
+    const totalAuthoritativeRecords =
+      totalResidents + activeCollectors + pendingCollectorVetting + pendingRequests + openDisputes;
+
     return {
       metrics: {
-        totalResidents: residentsSnap.size,
-        activeCollectors: collectorsSnap.size,
-        pendingCollectorVetting: vettingSnap.size,
-        pendingRequests: requestsPendingSnap.size,
+        totalResidents,
+        activeCollectors,
+        pendingCollectorVetting,
+        pendingRequests,
         activeFleetInTransit: 0,
         completedCollections: 0,
-        openDisputes: disputesSnap.size,
-        systemHealth: '100% Operational',
+        openDisputes,
+        systemHealth:
+          totalAuthoritativeRecords > 0
+            ? 'Authoritative Connected (Operational)'
+            : 'Authoritative Connected (Empty Dataset)',
       },
       isLive: true,
     };
-  } catch (err) {
-    // If running in development without emulator data seeded, return honest zeroed metrics
-    return {
-      metrics: {
-        totalResidents: 0,
-        activeCollectors: 0,
-        pendingCollectorVetting: 0,
-        pendingRequests: 0,
-        activeFleetInTransit: 0,
-        completedCollections: 0,
-        openDisputes: 0,
-        systemHealth: '100% Operational',
-      },
-      isLive: false,
-    };
+  } catch (err: unknown) {
+    throw parseFirestoreError(err, 'Failed to fetch authoritative dashboard metrics from Firestore.');
   }
 }
 
@@ -156,8 +199,8 @@ export async function fetchRecentAuditLogs(maxLogs = 10): Promise<AdminActionLog
       id: d.id,
       ...(d.data() as Omit<AdminActionLog, 'id'>),
     }));
-  } catch (_err) {
-    return [];
+  } catch (err: unknown) {
+    throw parseFirestoreError(err, 'Failed to fetch administrative audit logs.');
   }
 }
 
@@ -177,8 +220,8 @@ export async function fetchUsers(roleFilter?: string): Promise<UserProfile[]> {
       uid: d.id,
       ...(d.data() as Omit<UserProfile, 'id' | 'uid'>),
     }));
-  } catch (_err) {
-    return [];
+  } catch (err: unknown) {
+    throw parseFirestoreError(err, 'Failed to fetch user profiles.');
   }
 }
 
@@ -193,8 +236,8 @@ export async function fetchCollectorSubmissions(): Promise<CollectorSubmission[]
       userId: d.id,
       ...(d.data() as Omit<CollectorSubmission, 'userId'>),
     }));
-  } catch (_err) {
-    return [];
+  } catch (err: unknown) {
+    throw parseFirestoreError(err, 'Failed to fetch collector submissions.');
   }
 }
 
@@ -213,8 +256,8 @@ export async function fetchWasteRequests(statusFilter?: string): Promise<WasteRe
       id: d.id,
       ...(d.data() as Omit<WasteRequest, 'id'>),
     }));
-  } catch (_err) {
-    return [];
+  } catch (err: unknown) {
+    throw parseFirestoreError(err, 'Failed to fetch waste collection requests.');
   }
 }
 
@@ -229,13 +272,19 @@ export async function fetchDisputes(): Promise<Dispute[]> {
       id: d.id,
       ...(d.data() as Omit<Dispute, 'id'>),
     }));
-  } catch (_err) {
-    return [];
+  } catch (err: unknown) {
+    throw parseFirestoreError(err, 'Failed to fetch dispute records.');
   }
 }
 
 /**
- * Performs atomic collector vetting decision according to firestore.rules lines 405-449.
+ * Performs atomic collector vetting decision strictly adhering to firestore.rules lines 405-449 and 101-108.
+ * Guarantees:
+ * 1. Read existing submission to verify submissionAttempt matches and prevent stale attempt races.
+ * 2. Atomic update to /collector_submissions/{collectorUid} with required fields and without altering collector-immutable keys.
+ * 3. Atomic update to /users/{collectorUid} verification status.
+ * 4. Atomic append-only creation of /collector_submissions/{collectorUid}/history/{attemptId} including submissionAttempt.
+ * 5. Atomic append-only creation of /admin_actions_log with authenticated actorUid.
  */
 export async function reviewCollectorVetting(
   adminUid: string,
@@ -245,12 +294,58 @@ export async function reviewCollectorVetting(
   rejectionReason?: string
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    const batch = writeBatch(db);
-    const now = Date.now();
+    if (!adminUid) {
+      return { success: false, error: 'Administrative actor UID is required.' };
+    }
+    if (!collectorUid) {
+      return { success: false, error: 'Collector target UID is required.' };
+    }
+    if (!Number.isInteger(attempt) || attempt < 1) {
+      return { success: false, error: 'Invalid submission attempt number.' };
+    }
+
+    if (decision === 'REJECTED') {
+      if (!rejectionReason || rejectionReason.trim().length < 3 || rejectionReason.trim().length > 500) {
+        return { success: false, error: 'Rejection reason must be between 3 and 500 characters.' };
+      }
+    }
 
     const submissionRef = doc(db, 'collector_submissions', collectorUid);
     const userRef = doc(db, 'users', collectorUid);
-    const historyDocId = `attempt_${attempt}_${decision.toLowerCase()}`;
+
+    // Fetch existing submission to verify state and avoid stale attempt races
+    const subDocSnap = await getDoc(submissionRef);
+    if (!subDocSnap.exists()) {
+      return { success: false, error: 'Collector submission document does not exist.' };
+    }
+
+    const subData = subDocSnap.data() as CollectorSubmission;
+
+    // Fail safely if attempt is stale or mismatched
+    if (subData.submissionAttempt !== attempt) {
+      return {
+        success: false,
+        error: `Stale submission attempt: client expected #${attempt}, but server record is on attempt #${subData.submissionAttempt}.`,
+      };
+    }
+
+    if (decision === 'APPROVED' && subData.status !== 'PENDING_REVIEW') {
+      return {
+        success: false,
+        error: `Cannot approve submission with status '${subData.status}'. Only PENDING_REVIEW submissions can be approved.`,
+      };
+    }
+
+    if (decision === 'REJECTED' && !['PENDING_REVIEW', 'APPROVED'].includes(subData.status)) {
+      return {
+        success: false,
+        error: `Cannot reject submission with status '${subData.status}'.`,
+      };
+    }
+
+    const now = Date.now();
+    const batch = writeBatch(db);
+    const historyDocId = `attempt_${subData.submissionAttempt}_${decision.toLowerCase()}`;
     const historyRef = doc(db, `collector_submissions/${collectorUid}/history`, historyDocId);
     const logRef = doc(collection(db, 'admin_actions_log'));
 
@@ -265,6 +360,7 @@ export async function reviewCollectorVetting(
       batch.update(userRef, {
         collectorVerificationStatus: 'APPROVED',
         isVerified: true,
+        collectorRejectionReason: null,
         updatedAtEpochMs: now,
       });
 
@@ -272,37 +368,43 @@ export async function reviewCollectorVetting(
         attemptId: historyDocId,
         userId: collectorUid,
         eventType: 'APPROVED',
-        actorUid: adminUid,
+        vehicleType: subData.vehicleType || '',
+        vehiclePlateNumber: subData.vehiclePlateNumber || '',
+        licenseNumber: subData.licenseNumber || '',
+        serviceZoneId: subData.serviceZoneId || '',
+        submissionAttempt: subData.submissionAttempt,
         timestampEpochMs: now,
+        actorUid: adminUid,
         rejectionReason: null,
       });
 
       batch.set(logRef, {
+        id: logRef.id,
         adminId: adminUid,
+        actorId: adminUid,
         targetUserId: collectorUid,
+        targetId: collectorUid,
         action: 'COLLECTOR_APPROVED',
-        reason: 'Credentials and vehicle vetted successfully',
+        reason: 'Collector credentials and vehicle vetted successfully',
         title: 'Collector Application Approved',
         description: `Collector ${collectorUid} application approved for municipal operations.`,
         iconType: 'FLEET',
         timestampMs: now,
       });
     } else {
-      if (!rejectionReason || rejectionReason.trim().length < 3) {
-        return { success: false, error: 'Rejection reason must be at least 3 characters.' };
-      }
+      const cleanReason = rejectionReason!.trim();
 
       batch.update(submissionRef, {
         status: 'REJECTED',
         reviewedByUid: adminUid,
         reviewedAtEpochMs: now,
-        rejectionReason: rejectionReason.trim(),
+        rejectionReason: cleanReason,
       });
 
       batch.update(userRef, {
         collectorVerificationStatus: 'REJECTED',
         isVerified: false,
-        collectorRejectionReason: rejectionReason.trim(),
+        collectorRejectionReason: cleanReason,
         updatedAtEpochMs: now,
       });
 
@@ -310,18 +412,26 @@ export async function reviewCollectorVetting(
         attemptId: historyDocId,
         userId: collectorUid,
         eventType: 'REJECTED',
-        actorUid: adminUid,
+        vehicleType: subData.vehicleType || '',
+        vehiclePlateNumber: subData.vehiclePlateNumber || '',
+        licenseNumber: subData.licenseNumber || '',
+        serviceZoneId: subData.serviceZoneId || '',
+        submissionAttempt: subData.submissionAttempt,
         timestampEpochMs: now,
-        rejectionReason: rejectionReason.trim(),
+        actorUid: adminUid,
+        rejectionReason: cleanReason,
       });
 
       batch.set(logRef, {
+        id: logRef.id,
         adminId: adminUid,
+        actorId: adminUid,
         targetUserId: collectorUid,
+        targetId: collectorUid,
         action: 'COLLECTOR_REJECTED',
-        reason: rejectionReason.trim(),
+        reason: cleanReason,
         title: 'Collector Application Rejected',
-        description: `Collector ${collectorUid} application rejected: ${rejectionReason.trim()}`,
+        description: `Collector ${collectorUid} application rejected: ${cleanReason}`,
         iconType: 'FLEET',
         timestampMs: now,
       });
@@ -330,7 +440,8 @@ export async function reviewCollectorVetting(
     await batch.commit();
     return { success: true };
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : 'Collector review failed';
-    return { success: false, error: msg };
+    const parsed = parseFirestoreError(err, 'Collector review failed');
+    return { success: false, error: parsed.message };
   }
 }
+

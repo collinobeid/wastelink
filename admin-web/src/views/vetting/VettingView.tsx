@@ -6,7 +6,7 @@ import { Button } from '../../components/ui/Button';
 import { Modal } from '../../components/ui/Modal';
 import { Input } from '../../components/ui/Input';
 import { AlertBanner } from '../../components/feedback/AlertBanner';
-import { fetchCollectorSubmissions, reviewCollectorVetting } from '../../services/dataService';
+import { fetchCollectorSubmissions, reviewCollectorVetting, parseFirestoreError } from '../../services/dataService';
 import { CollectorSubmission } from '../../domain/types';
 import { useAuth } from '../../context/AuthContext';
 import { ShieldCheck, Check, X, RefreshCw } from 'lucide-react';
@@ -18,6 +18,7 @@ export const VettingView: React.FC = () => {
   const [rejectionReason, setRejectionReason] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [queryError, setQueryError] = useState<string | null>(null);
   const [successBanner, setSuccessBanner] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
@@ -25,9 +26,16 @@ export const VettingView: React.FC = () => {
 
   const loadSubmissions = async () => {
     setIsLoading(true);
-    const data = await fetchCollectorSubmissions();
-    setSubmissions(data);
-    setIsLoading(false);
+    setQueryError(null);
+    try {
+      const data = await fetchCollectorSubmissions();
+      setSubmissions(data);
+    } catch (err: unknown) {
+      const parsed = parseFirestoreError(err, 'Failed to fetch collector submissions.');
+      setQueryError(parsed.message);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -157,6 +165,10 @@ export const VettingView: React.FC = () => {
           Refresh Queue
         </Button>
       </div>
+
+      {queryError && (
+        <AlertBanner type="error" message={queryError} onClose={() => setQueryError(null)} />
+      )}
 
       {successBanner && (
         <AlertBanner type="success" message={successBanner} onClose={() => setSuccessBanner(null)} />

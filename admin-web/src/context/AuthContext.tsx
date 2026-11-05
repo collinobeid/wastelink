@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
+import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
 import {
   User as FirebaseUser,
   onIdTokenChanged,
@@ -28,66 +28,97 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [isAdmin, setIsAdmin] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const evalSeqRef = useRef<number>(0);
 
   const evaluateAdminToken = async (user: FirebaseUser | null): Promise<boolean> => {
+    const currentSeq = ++evalSeqRef.current;
+
+    // Fail-closed immediately: clear any existing admin authority while evaluating
+    setIsAdmin(false);
+    setUserProfile(null);
+
     if (!user) {
-      setIsAdmin(false);
-      setUserProfile(null);
+      setCurrentUser(null);
       return false;
     }
 
     try {
       const tokenResult = await user.getIdTokenResult(true);
-      const hasAdminClaim = Boolean(tokenResult.claims.admin);
+      if (currentSeq !== evalSeqRef.current) return false;
 
+      const hasAdminClaim = Boolean(tokenResult.claims.admin);
       if (!hasAdminClaim) {
-        setIsAdmin(false);
-        setUserProfile(null);
+        if (currentSeq === evalSeqRef.current) {
+          setError('Access denied: Account does not possess authoritative administrator claims.');
+          setCurrentUser(null);
+          try {
+            await fbSignOut(auth);
+          } catch {
+            // ignore signOut error during offline/network failure
+          }
+        }
         return false;
       }
 
       // Fetch user profile from Firestore /users/{uid}
       const userDocRef = doc(db, 'users', user.uid);
       const snapshot = await getDoc(userDocRef);
+      if (currentSeq !== evalSeqRef.current) return false;
 
-      if (snapshot.exists()) {
-        const data = snapshot.data() as UserProfile;
-        // Verify account standing is ACTIVE
-        if (data.accountStatus === 'ACTIVE' || data.status === 'ACTIVE') {
-          setUserProfile({ ...data, id: user.uid, uid: user.uid });
-          setIsAdmin(true);
-          return true;
-        } else {
-          setIsAdmin(false);
-          setUserProfile(null);
-          setError(`Administrative account is locked (standing: ${data.accountStatus || data.status})`);
-          return false;
+      if (!snapshot.exists()) {
+        if (currentSeq === evalSeqRef.current) {
+          setError('Access denied: Administrative profile document /users/{uid} does not exist.');
+          setCurrentUser(null);
+          try {
+            await fbSignOut(auth);
+          } catch {
+            // ignore
+          }
         }
-      } else {
-        // Fallback for provisioned admins whose Firestore profile has not synced
-        setUserProfile({
-          id: user.uid,
-          uid: user.uid,
-          fullName: user.displayName || user.email || 'Administrator',
-          email: user.email || '',
-          phoneNumber: user.phoneNumber || '',
-          role: 'admin',
-          accountStatus: 'ACTIVE',
-          onboardingStatus: 'COMPLETED',
-          isVerified: true,
-          collectorVerificationStatus: 'NOT_APPLICABLE',
-          preferredLanguage: 'en',
-          createdAtEpochMs: Date.now(),
-          updatedAtEpochMs: Date.now(),
-        });
+        return false;
+      }
+
+      const data = snapshot.data() as UserProfile;
+      // Authoritative requirement: must have role === 'admin' and strictly accountStatus === 'ACTIVE'
+      // Legacy status must NOT be used as a fallback for ACTIVE.
+      if (data.role !== 'admin' || data.accountStatus !== 'ACTIVE') {
+        if (currentSeq === evalSeqRef.current) {
+          const reason = data.role !== 'admin'
+            ? `Account has non-administrative role '${data.role}'`
+            : `Account standing is ${data.accountStatus || 'UNDEFINED'}`;
+          setError(`Access denied: ${reason}. Only ACTIVE administrators may access the console.`);
+          setCurrentUser(null);
+          try {
+            await fbSignOut(auth);
+          } catch {
+            // ignore
+          }
+        }
+        return false;
+      }
+
+      // Profile is valid and ACTIVE; if sequence is still active, grant session
+      if (currentSeq === evalSeqRef.current) {
+        setCurrentUser(user);
+        setUserProfile({ ...data, id: user.uid, uid: user.uid });
         setIsAdmin(true);
+        setError(null);
         return true;
       }
+      return false;
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to verify admin credentials';
-      setError(msg);
-      setIsAdmin(false);
-      setUserProfile(null);
+      if (currentSeq === evalSeqRef.current) {
+        const msg = err instanceof Error ? err.message : 'Failed to verify admin credentials';
+        setError(`Access denied: ${msg}`);
+        setIsAdmin(false);
+        setUserProfile(null);
+        setCurrentUser(null);
+        try {
+          await fbSignOut(auth);
+        } catch {
+          // ignore
+        }
+      }
       return false;
     }
   };
@@ -96,7 +127,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const unsubscribe = onIdTokenChanged(auth, async (user) => {
       setIsLoading(true);
       setError(null);
-      setCurrentUser(user);
       await evaluateAdminToken(user);
       setIsLoading(false);
     });
@@ -112,9 +142,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const isVerifiedAdmin = await evaluateAdminToken(cred.user);
 
       if (!isVerifiedAdmin) {
-        await fbSignOut(auth);
-        const errMsg = 'Access denied: Account does not possess authoritative administrator claims.';
-        setError(errMsg);
+        const errMsg = error || 'Access denied: Account does not possess authoritative administrator claims.';
         setIsLoading(false);
         return { success: false, error: errMsg };
       }

@@ -5,7 +5,7 @@ import { Badge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
 import { AlertBanner } from '../../components/feedback/AlertBanner';
-import { fetchRecentAuditLogs } from '../../services/dataService';
+import { fetchRecentAuditLogs, parseFirestoreError } from '../../services/dataService';
 import { AdminActionLog } from '../../domain/types';
 import { History, Search, RefreshCw, ShieldCheck } from 'lucide-react';
 
@@ -13,12 +13,20 @@ export const AuditView: React.FC = () => {
   const [logs, setLogs] = useState<AdminActionLog[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
+  const [queryError, setQueryError] = useState<string | null>(null);
 
   const loadLogs = async () => {
     setIsLoading(true);
-    const data = await fetchRecentAuditLogs(50);
-    setLogs(data);
-    setIsLoading(false);
+    setQueryError(null);
+    try {
+      const data = await fetchRecentAuditLogs(50);
+      setLogs(data);
+    } catch (err: unknown) {
+      const parsed = parseFirestoreError(err, 'Failed to fetch administrative audit logs.');
+      setQueryError(parsed.message);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -88,6 +96,10 @@ export const AuditView: React.FC = () => {
           Refresh Ledger
         </Button>
       </div>
+
+      {queryError && (
+        <AlertBanner type="error" message={queryError} onClose={() => setQueryError(null)} />
+      )}
 
       <AlertBanner
         type="info"

@@ -1,11 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { Card, CardHeader, CardContent } from '../../components/ui/Card';
 import { Table, Column } from '../../components/ui/Table';
 import { Badge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
 import { Modal } from '../../components/ui/Modal';
 import { Input } from '../../components/ui/Input';
-import { fetchWasteRequests } from '../../services/dataService';
+import { AlertBanner } from '../../components/feedback/AlertBanner';
+import { fetchWasteRequests, parseFirestoreError } from '../../services/dataService';
 import { WasteRequest, RequestLifecycleStatus } from '../../domain/types';
 import { Search, Eye, RefreshCw } from 'lucide-react';
 
@@ -15,27 +16,25 @@ export const RequestsView: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedRequest, setSelectedRequest] = useState<WasteRequest | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [queryError, setQueryError] = useState<string | null>(null);
 
-  const loadRequests = async () => {
+  const loadRequests = useCallback(async () => {
     setIsLoading(true);
-    const data = await fetchWasteRequests(statusFilter === 'ALL' ? undefined : statusFilter);
-    setRequests(data);
-    setIsLoading(false);
-  };
+    setQueryError(null);
+    try {
+      const data = await fetchWasteRequests(statusFilter === 'ALL' ? undefined : statusFilter);
+      setRequests(data);
+    } catch (err: unknown) {
+      const parsed = parseFirestoreError(err, 'Failed to fetch waste collection requests.');
+      setQueryError(parsed.message);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [statusFilter]);
 
   useEffect(() => {
-    let mounted = true;
-    setIsLoading(true);
-    fetchWasteRequests(statusFilter === 'ALL' ? undefined : statusFilter).then((data) => {
-      if (mounted) {
-        setRequests(data);
-        setIsLoading(false);
-      }
-    });
-    return () => {
-      mounted = false;
-    };
-  }, [statusFilter]);
+    loadRequests();
+  }, [loadRequests]);
 
   const filteredRequests = requests.filter((r) => {
     if (!searchQuery) return true;
@@ -145,6 +144,10 @@ export const RequestsView: React.FC = () => {
           Refresh
         </Button>
       </div>
+
+      {queryError && (
+        <AlertBanner type="error" message={queryError} onClose={() => setQueryError(null)} />
+      )}
 
       <Card variant="default">
         <CardHeader className="flex-col sm:flex-row gap-4 items-start sm:items-center justify-between">

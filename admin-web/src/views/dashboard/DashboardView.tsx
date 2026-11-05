@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, CardHeader, CardContent } from '../../components/ui/Card';
 import { Badge } from '../../components/ui/Badge';
@@ -14,8 +14,17 @@ import {
   Clock,
   Radio,
   CheckCircle2,
+  RefreshCw,
+  AlertTriangle,
+  WifiOff,
+  ShieldAlert,
 } from 'lucide-react';
-import { fetchDashboardMetrics, fetchRecentAuditLogs } from '../../services/dataService';
+import {
+  fetchDashboardMetrics,
+  fetchRecentAuditLogs,
+  DataServiceError,
+  parseFirestoreError,
+} from '../../services/dataService';
 import { DashboardMetrics, AdminActionLog } from '../../domain/types';
 
 export const DashboardView: React.FC = () => {
@@ -23,37 +32,101 @@ export const DashboardView: React.FC = () => {
   const [recentLogs, setRecentLogs] = useState<AdminActionLog[]>([]);
   const [isLive, setIsLive] = useState<boolean>(true);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [queryError, setQueryError] = useState<DataServiceError | null>(null);
 
   const navigate = useNavigate();
 
-  useEffect(() => {
-    let mounted = true;
-
-    async function loadData() {
-      setIsLoading(true);
+  const loadData = useCallback(async () => {
+    setIsLoading(true);
+    setQueryError(null);
+    try {
       const [metricsRes, logs] = await Promise.all([
         fetchDashboardMetrics(),
         fetchRecentAuditLogs(6),
       ]);
 
-      if (mounted) {
-        setMetrics(metricsRes.metrics);
-        setIsLive(metricsRes.isLive);
-        setRecentLogs(logs);
-        setIsLoading(false);
-      }
+      setMetrics(metricsRes.metrics);
+      setIsLive(metricsRes.isLive);
+      setRecentLogs(logs);
+      setIsLoading(false);
+    } catch (err: unknown) {
+      setQueryError(parseFirestoreError(err, 'Failed to load dashboard operational data.'));
+      setIsLoading(false);
     }
-
-    loadData();
-
-    return () => {
-      mounted = false;
-    };
   }, []);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   if (isLoading) {
     return <LoadingSpinner label="Loading operational dashboard..." size="lg" />;
   }
+
+  if (queryError) {
+    const isPermission = queryError.kind === 'PERMISSION_DENIED';
+    const isNetwork = queryError.kind === 'NETWORK_ERROR';
+
+    return (
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-white">Operations Dashboard</h1>
+          <p className="text-xs text-slate-400 mt-1">
+            Authoritative municipal overview of citizens, requests, disputes, and field fleet units.
+          </p>
+        </div>
+
+        <Card variant="bordered" className="border-rose-500/40 bg-rose-950/20">
+          <CardContent className="p-6 space-y-4">
+            <div className="flex items-start gap-4">
+              <div className="w-10 h-10 rounded-xl bg-rose-900/40 border border-rose-500/30 flex items-center justify-center text-rose-400 flex-shrink-0">
+                {isPermission ? (
+                  <ShieldAlert className="w-5 h-5" />
+                ) : isNetwork ? (
+                  <WifiOff className="w-5 h-5" />
+                ) : (
+                  <AlertTriangle className="w-5 h-5" />
+                )}
+              </div>
+              <div className="space-y-1 flex-1">
+                <h3 className="text-base font-semibold text-rose-200">
+                  {isPermission
+                    ? 'Security Rule Access Denied'
+                    : isNetwork
+                    ? 'Firestore Connectivity Offline'
+                    : 'Backend Operational Query Failure'}
+                </h3>
+                <p className="text-sm text-rose-300/80 leading-relaxed">
+                  {queryError.message}
+                </p>
+                <p className="text-xs text-rose-400/60 font-mono mt-1">
+                  Error Code: {queryError.kind} — Authoritative counts cannot be reported under query failure.
+                </p>
+              </div>
+            </div>
+
+            <div className="pt-2 flex items-center gap-3">
+              <Button
+                variant="danger"
+                size="sm"
+                onClick={() => loadData()}
+                leftIcon={<RefreshCw className="w-4 h-4" />}
+              >
+                Retry Authoritative Query
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  const isDatasetEmpty =
+    (metrics?.totalResidents ?? 0) === 0 &&
+    (metrics?.activeCollectors ?? 0) === 0 &&
+    (metrics?.pendingRequests ?? 0) === 0 &&
+    (metrics?.pendingCollectorVetting ?? 0) === 0 &&
+    (metrics?.openDisputes ?? 0) === 0;
 
   const metricCards = [
     {
@@ -120,10 +193,22 @@ export const DashboardView: React.FC = () => {
         <div className="flex items-center gap-3">
           <Badge variant={isLive ? 'emerald' : 'slate'} size="md">
             <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
-            {isLive ? 'Authoritative Firestore Live' : 'Offline / Standby Mode'}
+            {metrics?.systemHealth || (isLive ? 'Authoritative Firestore Live' : 'Offline / Standby Mode')}
           </Badge>
         </div>
       </div>
+
+      {/* Dataset Status Banner for genuinely empty dataset */}
+      {isDatasetEmpty && (
+        <Card variant="glass" className="border-slate-700/60 bg-slate-900/40">
+          <CardContent className="p-4 flex items-center gap-3 text-xs text-slate-300">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+            <span>
+              <strong>Authoritative Database Connected:</strong> All Firestore queries executed successfully, returning zero active records. Collections are currently empty.
+            </span>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Metrics Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">

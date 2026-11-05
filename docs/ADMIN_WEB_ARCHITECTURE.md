@@ -135,8 +135,10 @@ sequenceDiagram
     end
 ```
 
-### 4.2 Security Boundary Invariants
-1. **Cryptographic Custom Claims**: In Firestore Security Rules:
+### 4.2 Security Boundary Invariants & Distinction Between UI Standing and Backend Authorization
+
+1. **Authoritative Backend Authorization (`request.auth.token.admin == true`)**:
+   In `firestore.rules`, authorization is enforced cryptographically by the server:
    ```javascript
    function isAdmin() {
      return request.auth != null
@@ -144,14 +146,24 @@ sequenceDiagram
        && request.auth.token.admin == true;
    }
    ```
-   Having `role: "admin"` in a Firestore document without `request.auth.token.admin == true` grants **zero privilege**.
-2. **Server-Side Admin Provisioning Only**:
-   - Client web code is **never** equipped with service accounts or administrative credentials.
-   - Administrators are provisioned exclusively server-side via trusted scripts (`scripts/provision-admin.mjs` or Cloud Functions using `firebase-admin`).
-3. **Session Invalidation & Re-Authentication**:
-   - ID tokens expire after 60 minutes.
-   - If an administrator is revoked or their account status is set to `SUSPENDED` or `BANNED`, token refresh will fail or the security rules will block subsequent Firestore queries immediately.
-   - The web app listens to `onIdTokenChanged` and forces re-verification.
+   Having `role: "admin"` in a Firestore profile document without `request.auth.token.admin == true` grants **zero privilege**.
+   Security rules evaluate tokens minted and signed by Google's backend. The client web app cannot mint, alter, or forge custom claims.
+
+2. **Crucial Distinction: Client-Side Account Standing vs Authoritative Privilege Revocation**:
+   - **UI Account-Standing Verification**: The client `AuthContext` queries `/users/{uid}` and strictly checks `accountStatus === 'ACTIVE'`. If the document is missing, malformed, or has `accountStatus` in `['SUSPENDED', 'BANNED', 'RESTRICTED']`, the web application fails closed, purges local session state, and executes `signOut(auth)` to lock the user out of the admin console.
+   - **Backend Authorization Remains Claim-Bound**: Client-side UI checks **do not by themselves revoke administrative privileges on the Firebase backend**. If an administrator's profile document is marked `SUSPENDED` in Firestore, their existing Firebase Auth ID token will continue to satisfy `request.auth.token.admin == true` in `firestore.rules` until:
+     a) The 60-minute token lifetime expires, OR
+     b) A trusted backend operation (Cloud Function or server-side Admin SDK script) calls `admin.auth().setCustomUserClaims(uid, { admin: false })` and `admin.auth().revokeRefreshTokens(uid)`.
+   - Therefore, the UI check is an essential defensive front-line gate, but true administrative revocation is an authoritative backend responsibility.
+
+3. **Server-Side Admin Provisioning & Revocation Only**:
+   - Client web code is **never** equipped with service accounts or administrative keys.
+   - Administrators are provisioned and de-provisioned exclusively server-side via trusted scripts (`scripts/provision-admin.mjs` or Cloud Functions using `firebase-admin`).
+
+4. **Fail-Closed & Race-Free Client Authentication**:
+   - Missing or unreadable `/users/{uid}` profiles immediately fail closed with access denied.
+   - No synthetic fallback profiles are generated under any circumstances.
+   - An asynchronous generation sequence counter (`evalSeqRef`) prevents older or out-of-order authentication callbacks from overwriting a newer session state.
 
 ---
 
