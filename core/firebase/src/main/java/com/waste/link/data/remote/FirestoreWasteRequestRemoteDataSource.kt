@@ -6,7 +6,9 @@ import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
 import com.waste.link.data.remote.dto.WasteRequestDto
 import com.waste.link.data.remote.mapper.WasteRequestRemoteMapper
+import com.waste.link.domain.model.GeoCoordinates
 import com.waste.link.domain.model.RequestRefSpecification
+import com.waste.link.domain.model.ServiceZone
 import com.waste.link.domain.model.WasteRequest
 import kotlinx.coroutines.tasks.await
 import java.io.IOException
@@ -129,14 +131,7 @@ class FirestoreWasteRequestRemoteDataSource internal constructor(
                     }
 
                     // Verify immutable identity and payload consistency
-                    val matchesCategory = dto.category == request.categoryId
-                    val matchesVolumeTier = dto.volumeTier.equals(request.volumeTier.name, ignoreCase = true) ||
-                        dto.volumeTier.equals(request.volumeTier.id, ignoreCase = true)
-                    val matchesAddress = dto.pickupAddress == request.pickupAddress
-                    val matchesCoords = kotlin.math.abs(dto.lat - request.coordinates.latitude) < 0.00001 &&
-                        kotlin.math.abs(dto.lng - request.coordinates.longitude) < 0.00001
-
-                    if (!matchesCategory || !matchesVolumeTier || !matchesAddress || !matchesCoords) {
+                    if (checkPayloadConflict(dto, request)) {
                         return@runTransaction RemoteRequestOutcome.Rejected(
                             errorCode = "CONFLICTING_EXISTING_DOCUMENT",
                             message = "Remote document '${request.id}' already exists with conflicting payload.",
@@ -148,6 +143,12 @@ class FirestoreWasteRequestRemoteDataSource internal constructor(
                     val existingDomain = WasteRequestRemoteMapper.toDomain(dto, request.serviceZoneId)
                     val serverCreatedAt = dto.createdAt?.toDate()?.time ?: 0L
                     val serverUpdatedAt = dto.updatedAt?.toDate()?.time ?: serverCreatedAt
+
+                    if (serverCreatedAt <= 0L || serverUpdatedAt <= 0L) {
+                        return@runTransaction RemoteRequestOutcome.TransientFailure(
+                            IllegalStateException("Existing remote document '${request.id}' has unresolved timestamps.")
+                        )
+                    }
 
                     return@runTransaction RemoteRequestOutcome.AlreadyExists(
                         existingRequest = existingDomain,
@@ -190,18 +191,31 @@ class FirestoreWasteRequestRemoteDataSource internal constructor(
                     )
                 }
 
-                val minLat = zoneSnap.getDouble("minLat")
-                val maxLat = zoneSnap.getDouble("maxLat")
-                val minLng = zoneSnap.getDouble("minLng")
-                val maxLng = zoneSnap.getDouble("maxLng")
-                if (minLat != null && maxLat != null && minLng != null && maxLng != null) {
-                    if (request.coordinates.latitude !in minLat..maxLat || request.coordinates.longitude !in minLng..maxLng) {
-                        return@runTransaction RemoteRequestOutcome.Rejected(
-                            errorCode = "OUTSIDE_SERVICE_ZONE",
-                            message = "Request coordinates (${request.coordinates.latitude}, ${request.coordinates.longitude}) fall outside service zone '${request.serviceZoneId}' boundary.",
-                            requiresUserIntervention = true
-                        )
-                    }
+                // Authoritative service-zone geometry contract validation (fail-closed)
+                val geoResult = validateServiceZoneGeometry(
+                    zoneId = request.serviceZoneId,
+                    zoneName = zoneSnap.getString("name"),
+                    minLat = zoneSnap.getDouble("minLat"),
+                    maxLat = zoneSnap.getDouble("maxLat"),
+                    minLng = zoneSnap.getDouble("minLng"),
+                    maxLng = zoneSnap.getDouble("maxLng"),
+                    rawVertices = zoneSnap.get("polygonVertices") as? List<*>
+                )
+                val authoritativeZone = when (geoResult) {
+                    is GeometryValidation.Malformed -> return@runTransaction RemoteRequestOutcome.Rejected(
+                        errorCode = "MALFORMED_SERVICE_ZONE_GEOMETRY",
+                        message = geoResult.message,
+                        requiresUserIntervention = true
+                    )
+                    is GeometryValidation.Valid -> geoResult.zone
+                }
+
+                if (!authoritativeZone.containsGeographically(request.coordinates)) {
+                    return@runTransaction RemoteRequestOutcome.Rejected(
+                        errorCode = "OUTSIDE_SERVICE_ZONE",
+                        message = "Request coordinates (${request.coordinates.latitude}, ${request.coordinates.longitude}) fall outside service zone '${request.serviceZoneId}' boundary.",
+                        requiresUserIntervention = true
+                    )
                 }
 
                 // Atomic creation with server timestamps
@@ -226,6 +240,11 @@ class FirestoreWasteRequestRemoteDataSource internal constructor(
                 val committedDto = committedSnapshot.toObject(WasteRequestDto::class.java)
                 val resolvedCreatedAt = committedDto?.createdAt?.toDate()?.time ?: 0L
                 val resolvedUpdatedAt = committedDto?.updatedAt?.toDate()?.time ?: resolvedCreatedAt
+                if (resolvedCreatedAt <= 0L || resolvedUpdatedAt <= 0L) {
+                    return RemoteRequestOutcome.TransientFailure(
+                        IllegalStateException("Committed remote document '${request.id}' has unresolved server timestamps.")
+                    )
+                }
                 val fullyConfirmed = request.copy(
                     requestRef = outcome.requestRef,
                     createdAtEpochMs = resolvedCreatedAt,
@@ -300,6 +319,12 @@ class FirestoreWasteRequestRemoteDataSource internal constructor(
             val serverCreatedAt = dto.createdAt?.toDate()?.time ?: 0L
             val serverUpdatedAt = dto.updatedAt?.toDate()?.time ?: serverCreatedAt
 
+            if (serverCreatedAt <= 0L || serverUpdatedAt <= 0L) {
+                return RemoteRequestOutcome.TransientFailure(
+                    IllegalStateException("Remote document '$requestId' has unresolved timestamps.")
+                )
+            }
+
             RemoteRequestOutcome.AlreadyExists(
                 existingRequest = domainRequest,
                 requestRef = dto.requestRef,
@@ -356,5 +381,83 @@ class FirestoreWasteRequestRemoteDataSource internal constructor(
                     message = throwable.message ?: "Unexpected error during Firestore communication"
                 )
         }
+    }
+
+    sealed interface GeometryValidation {
+        data class Valid(val zone: ServiceZone) : GeometryValidation
+        data class Malformed(val message: String) : GeometryValidation
+    }
+
+    @VisibleForTesting
+    internal fun validateServiceZoneGeometry(
+        zoneId: String,
+        zoneName: String?,
+        minLat: Double?,
+        maxLat: Double?,
+        minLng: Double?,
+        maxLng: Double?,
+        rawVertices: List<*>?
+    ): GeometryValidation {
+        if (minLat == null || maxLat == null || minLng == null || maxLng == null) {
+            return GeometryValidation.Malformed(
+                "Service zone '$zoneId' is missing required boundary geometry (minLat, maxLat, minLng, maxLng)."
+            )
+        }
+        if (minLat !in -90.0..90.0 || maxLat !in -90.0..90.0 || minLat > maxLat ||
+            minLng !in -180.0..180.0 || maxLng !in -180.0..180.0 || minLng > maxLng
+        ) {
+            return GeometryValidation.Malformed(
+                "Service zone '$zoneId' has structurally invalid boundary bounds (lat: $minLat..$maxLat, lng: $minLng..$maxLng)."
+            )
+        }
+        val polygonList = mutableListOf<GeoCoordinates>()
+        if (rawVertices != null && rawVertices.isNotEmpty()) {
+            if (rawVertices.size < 3) {
+                return GeometryValidation.Malformed(
+                    "Service zone '$zoneId' polygon must contain at least 3 vertices, had ${rawVertices.size}."
+                )
+            }
+            for ((index, item) in rawVertices.withIndex()) {
+                val vertexMap = item as? Map<*, *>
+                val vLat = (vertexMap?.get("latitude") as? Number)?.toDouble()
+                    ?: (vertexMap?.get("lat") as? Number)?.toDouble()
+                val vLng = (vertexMap?.get("longitude") as? Number)?.toDouble()
+                    ?: (vertexMap?.get("lng") as? Number)?.toDouble()
+                if (vLat == null || vLng == null || vLat !in minLat..maxLat || vLng !in minLng..maxLng) {
+                    return GeometryValidation.Malformed(
+                        "Service zone '$zoneId' polygon vertex #$index is invalid or outside bounding box."
+                    )
+                }
+                polygonList.add(GeoCoordinates(vLat, vLng))
+            }
+        }
+        return GeometryValidation.Valid(
+            ServiceZone(
+                zoneId = zoneId,
+                name = zoneName ?: zoneId,
+                minLat = minLat,
+                maxLat = maxLat,
+                minLng = minLng,
+                maxLng = maxLng,
+                polygonVertices = polygonList,
+                isActive = true
+            )
+        )
+    }
+
+    @VisibleForTesting
+    internal fun checkPayloadConflict(dto: WasteRequestDto, request: WasteRequest): Boolean {
+        val matchesCategory = dto.category == request.categoryId
+        val matchesVolumeTier = dto.volumeTier.equals(request.volumeTier.name, ignoreCase = true) ||
+            dto.volumeTier.equals(request.volumeTier.id, ignoreCase = true)
+        val matchesAddress = dto.pickupAddress == request.pickupAddress
+        val matchesCoords = kotlin.math.abs(dto.lat - request.coordinates.latitude) < 0.00001 &&
+            kotlin.math.abs(dto.lng - request.coordinates.longitude) < 0.00001
+        val matchesNotes = dto.notes == request.notes
+        val matchesGatePhoto = (dto.gatePhotoUrl ?: "") == (request.gatePhotoUrl ?: "")
+        val matchesPhone = (dto.residentPhoneNumber ?: "") == (request.residentPhoneNumber ?: "")
+
+        return !matchesCategory || !matchesVolumeTier || !matchesAddress || !matchesCoords ||
+            !matchesNotes || !matchesGatePhoto || !matchesPhone
     }
 }

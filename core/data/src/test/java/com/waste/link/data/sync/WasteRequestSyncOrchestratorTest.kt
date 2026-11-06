@@ -131,6 +131,8 @@ class WasteRequestSyncOrchestratorTest {
         assertNotNull(record)
         assertEquals(LocalSyncStatus.SYNCED, record!!.syncStatus)
         assertEquals("WL-2611-7X9F2B", record.requestRef)
+        assertEquals(1793869200000L, record.createdAtEpochMs)
+        assertEquals(1793869200000L, record.updatedAtEpochMs)
         assertNull(record.syncErrorMessage)
     }
 
@@ -192,6 +194,8 @@ class WasteRequestSyncOrchestratorTest {
         val record = localRepository.getLocalRecord(request.id, "resident_uid_1")
         assertEquals(LocalSyncStatus.SYNCED, record!!.syncStatus)
         assertEquals("WL-2611-7X9F2B", record.requestRef)
+        assertEquals(1793869200000L, record.createdAtEpochMs)
+        assertEquals(1793869200000L, record.updatedAtEpochMs)
     }
 
     // =========================================================================
@@ -219,7 +223,7 @@ class WasteRequestSyncOrchestratorTest {
     }
 
     // =========================================================================
-    // AC-06: Network failure -> SYNC_FAILED with retry scheduled
+    // AC-06: Network failure -> QUEUED_OFFLINE with retry scheduled (Finding 1)
     // =========================================================================
     @Test
     fun ac06_transientNetworkFailure_schedulesRetryAndBackoff() = runBlocking {
@@ -235,7 +239,8 @@ class WasteRequestSyncOrchestratorTest {
         assertTrue(result is SyncResult.QueuedOffline)
 
         val record = localRepository.getLocalRecord(request.id, "resident_uid_1")
-        assertEquals(LocalSyncStatus.SYNC_FAILED, record!!.syncStatus)
+        // Finding 1: Retryable failure remains in QUEUED_OFFLINE for subsequent worker attempt
+        assertEquals(LocalSyncStatus.QUEUED_OFFLINE, record!!.syncStatus)
         assertEquals(1, record.retryCount)
         assertEquals("Connection reset", record.syncErrorMessage)
     }
@@ -366,11 +371,98 @@ class WasteRequestSyncOrchestratorTest {
         val result = orchestrator.synchronizeSingleRequest("resident_uid_1", request.id)
 
         assertTrue(result is SyncResult.QueuedOffline)
-        assertEquals(1, fakeSyncScheduler.scheduledDelayed.size)
         val (scheduledUid, delayMs, retryAttempt) = fakeSyncScheduler.scheduledDelayed.first()
         assertEquals("resident_uid_1", scheduledUid)
         assertEquals(orchestrator.computeBackoffDelay(1), delayMs)
         assertEquals(1, retryAttempt)
+    }
+
+    @Test
+    fun finding3_unresolvedServerTimestamps_treatedAsTransientFailure() = runBlocking {
+        val request = sampleRequest()
+        localRepository.saveLocalRequest("resident_uid_1", request, LocalSyncStatus.QUEUED_OFFLINE)
+
+        // Server returns success but with unresolved 0L timestamps
+        fakeRemoteDataSource.nextOutcome = RemoteRequestOutcome.Success(
+            confirmedRequest = request.copy(requestRef = "WL-2611-TEST01"),
+            requestRef = "WL-2611-TEST01",
+            serverCreatedAtEpochMs = 0L,
+            serverUpdatedAtEpochMs = 0L
+        )
+
+        val result = orchestrator.synchronizeSingleRequest("resident_uid_1", request.id)
+
+        // Must NOT report success
+        assertTrue(result is SyncResult.QueuedOffline)
+        val record = localRepository.getLocalRecord(request.id, "resident_uid_1")
+        assertEquals(LocalSyncStatus.QUEUED_OFFLINE, record!!.syncStatus)
+        assertEquals(1, record.retryCount)
+        assertTrue(record.syncErrorMessage!!.contains("unresolved"))
+    }
+
+    @Test
+    fun finding1_backoffWindowRespected_skipsPrematureRetry() = runBlocking {
+        val request = sampleRequest()
+        val baseTime = 1793869200000L
+        orchestrator.clock = { baseTime }
+
+        localRepository.saveLocalRequest("resident_uid_1", request, LocalSyncStatus.QUEUED_OFFLINE)
+        localRepository.updateSyncStatus(
+            id = request.id,
+            clientUid = "resident_uid_1",
+            newStatus = LocalSyncStatus.QUEUED_OFFLINE,
+            attemptEpochMs = baseTime,
+            retryCount = 1
+        )
+
+        // Advance clock by only 500ms (backoff for retry 1 is 3000ms)
+        orchestrator.clock = { baseTime + 500L }
+
+        val result = orchestrator.synchronizeSingleRequest("resident_uid_1", request.id)
+
+        // Should skip remote write because backoff has not elapsed
+        assertTrue(result is SyncResult.QueuedOffline)
+        assertTrue((result as SyncResult.QueuedOffline).reason.contains("Retry backoff in progress"))
+        assertEquals(0, fakeRemoteDataSource.submissions.size)
+    }
+
+    @Test
+    fun finding1_synchronizeQueuedRequests_preservesRemainingBackoffs() = runBlocking {
+        val baseTime = 1793869200000L
+        orchestrator.clock = { baseTime }
+
+        // Request 1: in backoff (failed at baseTime, retry 1)
+        val req1 = sampleRequest(id = "req-1")
+        localRepository.saveLocalRequest("resident_uid_1", req1, LocalSyncStatus.QUEUED_OFFLINE)
+        localRepository.updateSyncStatus(
+            id = "req-1",
+            clientUid = "resident_uid_1",
+            newStatus = LocalSyncStatus.QUEUED_OFFLINE,
+            attemptEpochMs = baseTime,
+            retryCount = 1
+        )
+
+        // Request 2: new request, ready immediately (retryCount = 0)
+        val req2 = sampleRequest(id = "req-2")
+        localRepository.saveLocalRequest("resident_uid_1", req2, LocalSyncStatus.QUEUED_OFFLINE)
+
+        // Advance clock by 1000ms (less than 3000ms backoff for req1)
+        orchestrator.clock = { baseTime + 1000L }
+
+        val results = orchestrator.synchronizeQueuedRequests("resident_uid_1")
+
+        assertEquals(2, results.size)
+        // req1 skipped due to backoff
+        assertTrue(results[0] is SyncResult.QueuedOffline)
+        // req2 synced successfully
+        assertTrue(results[1] is SyncResult.Success)
+
+        // Delayed work must be re-scheduled for req1's remaining backoff (2000ms)
+        assertTrue(fakeSyncScheduler.scheduledDelayed.isNotEmpty())
+        val delayed = fakeSyncScheduler.scheduledDelayed.last()
+        assertEquals("resident_uid_1", delayed.first)
+        assertEquals(2000L, delayed.second)
+        assertEquals(1, delayed.third)
     }
 
     // =========================================================================

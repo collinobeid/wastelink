@@ -141,17 +141,23 @@ class LocalWasteRequestRepositoryImpl @Inject constructor(
         id: String,
         clientUid: String,
         requestRef: String,
+        serverCreatedAtEpochMs: Long,
+        serverUpdatedAtEpochMs: Long,
         attemptEpochMs: Long
     ): Boolean {
         validateUid(clientUid)
         require(id.isNotBlank()) { "Request ID must not be blank" }
         require(requestRef.isNotBlank()) { "requestRef must not be blank" }
+        require(serverCreatedAtEpochMs > 0L) { "serverCreatedAtEpochMs must be positive: $serverCreatedAtEpochMs" }
+        require(serverUpdatedAtEpochMs > 0L) { "serverUpdatedAtEpochMs must be positive: $serverUpdatedAtEpochMs" }
 
         val rowsUpdated = requestDao.updateSyncSuccess(
             id = id.trim(),
             clientUid = clientUid.trim(),
             syncStatus = LocalSyncStatus.SYNCED,
             requestRef = requestRef.trim(),
+            serverCreatedAtEpochMs = serverCreatedAtEpochMs,
+            serverUpdatedAtEpochMs = serverUpdatedAtEpochMs,
             lastSyncAttemptEpochMs = attemptEpochMs,
             retryCount = 0
         )

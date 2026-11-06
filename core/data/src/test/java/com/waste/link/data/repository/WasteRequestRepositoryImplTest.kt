@@ -171,7 +171,8 @@ class WasteRequestRepositoryImplTest {
         // Verify request was safely persisted in Room despite remote failure
         val record = localRepository.getLocalRecord(request.id, "resident_1")
         assertNotNull(record)
-        assertEquals(LocalSyncStatus.SYNC_FAILED, record!!.syncStatus)
+        // Finding 1: Retryable transient failure transitions to QUEUED_OFFLINE for subsequent worker attempt
+        assertEquals(LocalSyncStatus.QUEUED_OFFLINE, record!!.syncStatus)
         assertEquals(1, record.retryCount)
 
         // Finding 5: Background sync must be actually scheduled!

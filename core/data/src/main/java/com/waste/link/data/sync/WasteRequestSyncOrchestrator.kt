@@ -1,6 +1,7 @@
 package com.waste.link.data.sync
 
 import com.waste.link.data.auth.SessionStateProvider
+import com.waste.link.data.local.entity.LocalWasteRequestRecord
 import com.waste.link.data.local.model.LocalSyncStatus
 import com.waste.link.data.mapper.toDomainOrNull
 import com.waste.link.data.remote.RemoteRequestOutcome
@@ -111,6 +112,19 @@ class WasteRequestSyncOrchestrator @Inject constructor(
                 return SyncResult.Rejected(requestId, "MALFORMED_LOCAL_RECORD", "Record cannot be converted to domain model.")
             }
 
+            // Step 6b: Backoff window check (Finding 1)
+            if (record.retryCount > 0 && record.lastSyncAttemptEpochMs != null) {
+                val minDelay = computeBackoffDelay(record.retryCount)
+                val elapsed = clock() - record.lastSyncAttemptEpochMs
+                if (elapsed < minDelay) {
+                    val remainingMs = minDelay - elapsed
+                    return SyncResult.QueuedOffline(
+                        requestId,
+                        "Retry backoff in progress ($elapsed/${minDelay}ms elapsed; $remainingMs ms remaining)."
+                    )
+                }
+            }
+
             // Step 7: Transition to UPLOADING
             localRepository.updateSyncStatus(
                 id = requestId,
@@ -123,7 +137,7 @@ class WasteRequestSyncOrchestrator @Inject constructor(
             // Step 8: Remote submission
             val outcome = remoteDataSource.createRequest(authenticatedUid, domainRequest)
 
-            // Step 8b: Revalidate session post-submission before committing result (Finding 4)
+            // Step 8b: Revalidate session post-submission before committing result
             val postCallSession = sessionStateProvider.sessionState.value
             val isSessionStillValid = postCallSession is SessionState.Authenticated &&
                 postCallSession.isServerVerified &&
@@ -145,23 +159,80 @@ class WasteRequestSyncOrchestrator @Inject constructor(
 
             return when (outcome) {
                 is RemoteRequestOutcome.Success -> {
-                    localRepository.updateSyncSuccess(
+                    // Finding 3: Validate authoritative server timestamps are present
+                    if (outcome.serverCreatedAtEpochMs <= 0L || outcome.serverUpdatedAtEpochMs <= 0L) {
+                        return handleTransientFailure(
+                            requestId = requestId,
+                            authenticatedUid = authenticatedUid,
+                            record = record,
+                            errorMessage = "Remote request created but server timestamps are unresolved (${outcome.serverCreatedAtEpochMs}, ${outcome.serverUpdatedAtEpochMs}).",
+                            cause = IllegalStateException("Server timestamps unresolved on Success outcome.")
+                        )
+                    }
+
+                    // Finding 3 & Additional Review: Persist server timestamps and verify Room update succeeds
+                    val updated = localRepository.updateSyncSuccess(
                         id = requestId,
                         clientUid = authenticatedUid,
                         requestRef = outcome.requestRef,
+                        serverCreatedAtEpochMs = outcome.serverCreatedAtEpochMs,
+                        serverUpdatedAtEpochMs = outcome.serverUpdatedAtEpochMs,
                         attemptEpochMs = clock()
                     )
+
+                    if (!updated) {
+                        val errMsg = "Failed to persist SYNCED state and server timestamps to local Room persistence for request '$requestId'."
+                        _events.emit(
+                            SyncEvent.UploadFailed(
+                                requestId = requestId,
+                                errorMessage = errMsg,
+                                isRetryable = false,
+                                retryAttempt = record.retryCount,
+                                timestampEpochMs = clock()
+                            )
+                        )
+                        return SyncResult.Failure(requestId, IllegalStateException(errMsg))
+                    }
+
                     _events.emit(SyncEvent.UploadSucceeded(requestId, outcome.requestRef, clock()))
                     SyncResult.Success(requestId, outcome.requestRef)
                 }
 
                 is RemoteRequestOutcome.AlreadyExists -> {
-                    localRepository.updateSyncSuccess(
+                    // Finding 3: Validate authoritative server timestamps on reconciled duplicate
+                    if (outcome.serverCreatedAtEpochMs <= 0L || outcome.serverUpdatedAtEpochMs <= 0L) {
+                        return handleTransientFailure(
+                            requestId = requestId,
+                            authenticatedUid = authenticatedUid,
+                            record = record,
+                            errorMessage = "Existing remote document has unresolved timestamps (${outcome.serverCreatedAtEpochMs}, ${outcome.serverUpdatedAtEpochMs}).",
+                            cause = IllegalStateException("Server timestamps unresolved on AlreadyExists outcome.")
+                        )
+                    }
+
+                    val updated = localRepository.updateSyncSuccess(
                         id = requestId,
                         clientUid = authenticatedUid,
                         requestRef = outcome.requestRef,
+                        serverCreatedAtEpochMs = outcome.serverCreatedAtEpochMs,
+                        serverUpdatedAtEpochMs = outcome.serverUpdatedAtEpochMs,
                         attemptEpochMs = clock()
                     )
+
+                    if (!updated) {
+                        val errMsg = "Failed to persist reconciled SYNCED state to local Room persistence for request '$requestId'."
+                        _events.emit(
+                            SyncEvent.UploadFailed(
+                                requestId = requestId,
+                                errorMessage = errMsg,
+                                isRetryable = false,
+                                retryAttempt = record.retryCount,
+                                timestampEpochMs = clock()
+                            )
+                        )
+                        return SyncResult.Failure(requestId, IllegalStateException(errMsg))
+                    }
+
                     _events.emit(SyncEvent.DuplicateReconciled(requestId, outcome.requestRef, clock()))
                     _events.emit(SyncEvent.UploadSucceeded(requestId, outcome.requestRef, clock()))
                     SyncResult.Success(requestId, outcome.requestRef)
@@ -188,50 +259,13 @@ class WasteRequestSyncOrchestrator @Inject constructor(
                 }
 
                 is RemoteRequestOutcome.TransientFailure -> {
-                    val nextRetry = record.retryCount + 1
-                    if (nextRetry <= MAX_RETRIES) {
-                        val delayMs = computeBackoffDelay(nextRetry)
-                        localRepository.updateSyncStatus(
-                            id = requestId,
-                            clientUid = authenticatedUid,
-                            newStatus = LocalSyncStatus.SYNC_FAILED,
-                            errorMessage = outcome.message,
-                            attemptEpochMs = clock(),
-                            retryCount = nextRetry
-                        )
-                        _events.emit(
-                            SyncEvent.UploadFailed(
-                                requestId = requestId,
-                                errorMessage = outcome.message,
-                                isRetryable = true,
-                                retryAttempt = nextRetry,
-                                timestampEpochMs = clock()
-                            )
-                        )
-                        // Finding 5: Actually schedule delayed background retry via WorkManager
-                        syncScheduler.scheduleDelayedSync(authenticatedUid, delayMs, nextRetry)
-                        _events.emit(SyncEvent.RetryScheduled(requestId, nextRetry, delayMs, clock()))
-                        SyncResult.QueuedOffline(requestId, "Transient network failure; retry $nextRetry scheduled.")
-                    } else {
-                        localRepository.updateSyncStatus(
-                            id = requestId,
-                            clientUid = authenticatedUid,
-                            newStatus = LocalSyncStatus.SYNC_FAILED,
-                            errorMessage = "Max retries exceeded: ${outcome.message}",
-                            attemptEpochMs = clock(),
-                            retryCount = nextRetry
-                        )
-                        _events.emit(
-                            SyncEvent.UploadFailed(
-                                requestId = requestId,
-                                errorMessage = "Max retries exceeded: ${outcome.message}",
-                                isRetryable = false,
-                                retryAttempt = nextRetry,
-                                timestampEpochMs = clock()
-                            )
-                        )
-                        SyncResult.Failure(requestId, outcome.cause)
-                    }
+                    handleTransientFailure(
+                        requestId = requestId,
+                        authenticatedUid = authenticatedUid,
+                        record = record,
+                        errorMessage = outcome.message,
+                        cause = outcome.cause
+                    )
                 }
             }
         } finally {
@@ -239,12 +273,90 @@ class WasteRequestSyncOrchestrator @Inject constructor(
         }
     }
 
+    private suspend fun handleTransientFailure(
+        requestId: String,
+        authenticatedUid: String,
+        record: LocalWasteRequestRecord,
+        errorMessage: String,
+        cause: Throwable
+    ): SyncResult {
+        val nextRetry = record.retryCount + 1
+        return if (nextRetry <= MAX_RETRIES) {
+            val delayMs = computeBackoffDelay(nextRetry)
+            // Finding 1: Retryable transient failure transitions to QUEUED_OFFLINE so it remains eligible for worker attempts
+            localRepository.updateSyncStatus(
+                id = requestId,
+                clientUid = authenticatedUid,
+                newStatus = LocalSyncStatus.QUEUED_OFFLINE,
+                errorMessage = errorMessage,
+                attemptEpochMs = clock(),
+                retryCount = nextRetry
+            )
+            _events.emit(
+                SyncEvent.UploadFailed(
+                    requestId = requestId,
+                    errorMessage = errorMessage,
+                    isRetryable = true,
+                    retryAttempt = nextRetry,
+                    timestampEpochMs = clock()
+                )
+            )
+            syncScheduler.scheduleDelayedSync(authenticatedUid, delayMs, nextRetry)
+            _events.emit(SyncEvent.RetryScheduled(requestId, nextRetry, delayMs, clock()))
+            SyncResult.QueuedOffline(requestId, "Transient network failure; retry $nextRetry scheduled.")
+        } else {
+            // Finding 1: Exhausted retries transition permanently to SYNC_FAILED
+            localRepository.updateSyncStatus(
+                id = requestId,
+                clientUid = authenticatedUid,
+                newStatus = LocalSyncStatus.SYNC_FAILED,
+                errorMessage = "Max retries exceeded: $errorMessage",
+                attemptEpochMs = clock(),
+                retryCount = nextRetry
+            )
+            _events.emit(
+                SyncEvent.UploadFailed(
+                    requestId = requestId,
+                    errorMessage = "Max retries exceeded: $errorMessage",
+                    isRetryable = false,
+                    retryAttempt = nextRetry,
+                    timestampEpochMs = clock()
+                )
+            )
+            SyncResult.Failure(requestId, cause)
+        }
+    }
+
     suspend fun synchronizeQueuedRequests(authenticatedUid: String): List<SyncResult> {
         recoverInterruptedUploads(authenticatedUid)
         val queued = localRepository.getQueuedRecords(authenticatedUid)
-        return queued.map { record ->
+        val results = queued.map { record ->
             synchronizeSingleRequest(authenticatedUid, record.id)
         }
+
+        // Finding 1 Requirement 9: Ensure delayed sync is scheduled for any remaining records in backoff
+        val remainingQueued = localRepository.getQueuedRecords(authenticatedUid)
+        var earliestDelay: Long? = null
+        var earliestAttempt: Int = 1
+        for (rec in remainingQueued) {
+            val lastAttempt = rec.lastSyncAttemptEpochMs
+            if (rec.retryCount in 1..MAX_RETRIES && lastAttempt != null) {
+                val delay = computeBackoffDelay(rec.retryCount)
+                val elapsed = clock() - lastAttempt
+                val remaining = delay - elapsed
+                if (remaining > 0L) {
+                    if (earliestDelay == null || remaining < earliestDelay) {
+                        earliestDelay = remaining
+                        earliestAttempt = rec.retryCount
+                    }
+                }
+            }
+        }
+        if (earliestDelay != null) {
+            syncScheduler.scheduleDelayedSync(authenticatedUid, earliestDelay, earliestAttempt)
+        }
+
+        return results
     }
 
     suspend fun recoverInterruptedUploads(

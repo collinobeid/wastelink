@@ -40,7 +40,7 @@ class WorkManagerWasteRequestSyncScheduler @Inject constructor(
 
         WorkManager.getInstance(context).enqueueUniqueWork(
             WasteRequestSyncWorker.uniqueWorkName(authenticatedUid),
-            ExistingWorkPolicy.KEEP,
+            ExistingWorkPolicy.REPLACE,
             request
         )
     }

@@ -107,12 +107,15 @@ interface LocalWasteRequestRepository {
     ): Boolean
 
     /**
-     * Updates record on successful synchronization with server-allocated [requestRef].
+     * Updates record on successful synchronization with server-allocated [requestRef]
+     * and authoritative server timestamps.
      */
     suspend fun updateSyncSuccess(
         id: String,
         clientUid: String,
         requestRef: String,
+        serverCreatedAtEpochMs: Long,
+        serverUpdatedAtEpochMs: Long,
         attemptEpochMs: Long
     ): Boolean
 

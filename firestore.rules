@@ -604,10 +604,11 @@ service cloud.firestore {
     // 1. Resident owner (clientUid == request.auth.uid)
     // 2. Assigned approved active Collector (assignedTruckId == request.auth.uid)
     // 3. Trusted Administrator (isAdmin())
-    function canReadWasteRequest(reqData) {
-      return isAdmin()
-        || (isAuthenticated() && reqData.clientUid == request.auth.uid)
-        || (isApprovedActiveCollector(request.auth.uid) && reqData.assignedTruckId == request.auth.uid);
+    function canReadWasteRequest(res) {
+      return res == null
+        || isAdmin()
+        || (isAuthenticated() && res.data.clientUid == request.auth.uid)
+        || (isApprovedActiveCollector(request.auth.uid) && res.data.assignedTruckId == request.auth.uid);
     }
 
     // Resident Creation Rules:
@@ -725,14 +726,14 @@ service cloud.firestore {
 
     // Both canonical ("waste_requests") and legacy ("wasteRequests") paths enforce identical security rules
     match /waste_requests/{requestId} {
-      allow get, list: if canReadWasteRequest(resource.data);
+      allow get, list: if canReadWasteRequest(resource);
       allow create: if canCreateWasteRequest(requestId, request.resource.data);
       allow update: if canUpdateWasteRequest(resource.data, request.resource.data);
       allow delete: if false;
     }
 
     match /wasteRequests/{requestId} {
-      allow get, list: if canReadWasteRequest(resource.data);
+      allow get, list: if canReadWasteRequest(resource);
       allow create: if canCreateWasteRequest(requestId, request.resource.data);
       allow update: if canUpdateWasteRequest(resource.data, request.resource.data);
       allow delete: if false;
@@ -986,7 +987,20 @@ service cloud.firestore {
     }
 
     // =========================================================================
-    // 10. DEFAULT-DENY FALLBACK FOR ALL UNRECOGNIZED PATHS
+    // 10. SYSTEM CATALOGS: /waste_categories & /service_zones
+    // =========================================================================
+    match /waste_categories/{categoryId} {
+      allow get, list: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    match /service_zones/{zoneId} {
+      allow get, list: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // =========================================================================
+    // 11. DEFAULT-DENY FALLBACK FOR ALL UNRECOGNIZED PATHS
     // =========================================================================
     match /{document=**} {
       allow read, write: if false;

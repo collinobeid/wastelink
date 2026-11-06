@@ -55,6 +55,8 @@ interface LocalWasteRequestDao {
         UPDATE local_waste_requests
         SET syncStatus = :syncStatus,
             requestRef = :requestRef,
+            createdAtEpochMs = :serverCreatedAtEpochMs,
+            updatedAtEpochMs = :serverUpdatedAtEpochMs,
             lastSyncAttemptEpochMs = :lastSyncAttemptEpochMs,
             syncErrorMessage = NULL,
             retryCount = :retryCount
@@ -65,6 +67,8 @@ interface LocalWasteRequestDao {
         clientUid: String,
         syncStatus: LocalSyncStatus,
         requestRef: String,
+        serverCreatedAtEpochMs: Long,
+        serverUpdatedAtEpochMs: Long,
         lastSyncAttemptEpochMs: Long,
         retryCount: Int
     ): Int

@@ -92,13 +92,12 @@ class WasteRequestSyncWorker @AssistedInject constructor(
 
         val authUid = session.user.id
         return try {
-            val results = syncOrchestrator.synchronizeQueuedRequests(authUid)
-            val hasTransientFailures = results.any { it is SyncResult.QueuedOffline }
-            if (hasTransientFailures) {
-                Result.retry()
-            } else {
-                Result.success()
-            }
+            syncOrchestrator.synchronizeQueuedRequests(authUid)
+            // Finding 1 Requirement 8: Avoid duplicate or competing retry mechanisms between
+            // orchestrator-scheduled delayed work and WorkManager Result.retry().
+            // The orchestrator manages per-request exponential backoff delays and persists retry counts
+            // in Room, scheduling delayed work when needed. Thus, this worker completes successfully.
+            Result.success()
         } catch (e: Exception) {
             if (runAttemptCount < 3) {
                 Result.retry()
